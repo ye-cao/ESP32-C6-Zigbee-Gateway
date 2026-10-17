@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_partition.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -11,11 +12,13 @@
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_attribute.h"
 #include "esp_zigbee_endpoint.h"
+#include "zcl/esp_zigbee_zcl_on_off.h"
 #include "zb_gateway.h"
 #include "zb_ota_server.h"
 #include "ha_mqtt.h"
 #include "aps/esp_zigbee_aps.h"
 #include "esp_ieee802154.h"
+#include "esp_zigbee_secur.h"
 
 #define ZB_DEFAULT_CHANNEL  20
 #define ZB_FALLBACK_CHANNEL 25
@@ -31,6 +34,7 @@ typedef struct {
     uint16_t short_addr;
     uint8_t  ieee[8];
     bool     used;
+    bool     interviewed;   /* Interview (Bind/Reporting) schon durchgeführt */
     uint8_t  lqi;   /* letzte LQI vom APS-Layer */
     int8_t   rssi;  /* letzte RSSI vom IEEE 802.15.4 Layer (dBm) */
     char     mfr[33];   /* Basic 0x0004 ManufacturerName */
@@ -58,17 +62,387 @@ static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
     return NULL;
 }
 
-/* ── Basic-Cluster: Hersteller + Model beim Join lesen ─────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════ */
+/*  Interview nach Join: Active-EP → Simple-Desc → Bind → Configure-Reporting  */
+/*                                                                             */
+/*  Hintergrund: Ein „nackter“ Coordinator, der nach dem Join nichts weiter     */
+/*  tut, wird von vielen Endgeräten nach ~1 Minute aufgegeben – sie verlassen  */
+/*  das Netzwerk wieder (Symptom: „pairt erfolgreich, ist aber kurz darauf      */
+/*  wieder ungepairt“). Echte Gateways (Xiaomi / Hue / …) führen nach dem      */
+/*  Join die Standard-Sequenz aus: aktive Endpoints abfragen →                 */
+/*  Simple-Descriptor lesen → Bindings anlegen → Attribute-Reporting           */
+/*  konfigurieren. Genau das macht dieser Block.                                */
+/* ══════════════════════════════════════════════════════════════════════════ */
+
+#define IV_MAX_EPS      8
+#define IV_MAX_CLUSTERS 16
+
+/* Server-Cluster (Input) des Endgeräts → an den Coordinator binden und
+ * Reporting auf das Hauptattribut konfigurieren.
+ * ACHTUNG: attr == IV_NO_REPORT (0xFFFF) → nur binden. 0x0000 ist eine
+ * gültige Attribut-ID (On/Off, Temperatur, Feuchte, … primäres Attribut) –
+ * der frühere Check `if (attr)` hat alle diese Cluster nie gemeldet! */
+#define IV_NO_REPORT 0xFFFFu
+typedef struct {
+    uint16_t cluster;
+    uint16_t attr;
+    uint8_t  type;
+    uint16_t min_int;
+    uint16_t max_int;
+    uint16_t change;
+} iv_report_cfg_t;
+
+static const iv_report_cfg_t s_iv_input[] = {
+    { ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,                   0x0000, ESP_ZB_ZCL_ATTR_TYPE_BOOL,     1,  300, 1 },
+    { ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,         0x0000, ESP_ZB_ZCL_ATTR_TYPE_S16,      5,  300, 100 },
+    { ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT, 0x0000, ESP_ZB_ZCL_ATTR_TYPE_U16,     30, 300, 200 },
+    { ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT,  0x0000, ESP_ZB_ZCL_ATTR_TYPE_U16,     30, 300, 100 },
+    { ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING,        0x0000, ESP_ZB_ZCL_ATTR_TYPE_8BITMAP,  1, 300, 1 },
+    { ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,                 0x0000, ESP_ZB_ZCL_ATTR_TYPE_16BITMAP, 1, 300, 1 },
+    { ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,             0x0021, ESP_ZB_ZCL_ATTR_TYPE_U8,     300, 3600, 1 },
+    { ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,             0x0020, ESP_ZB_ZCL_ATTR_TYPE_U8,     300, 3600, 1 },
+};
+
+/* Client-Cluster (Output) des Endgeräts → nur binden (Tastenbefehle,
+ * Szenen, Gruppen landen dann als ZCL-Command beim Coordinator). */
+static const uint16_t s_iv_output[] = {
+    ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+    ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
+    ESP_ZB_ZCL_CLUSTER_ID_SCENES,
+    ESP_ZB_ZCL_CLUSTER_ID_GROUPS,
+};
+
+typedef struct {
+    bool     busy;
+    uint16_t short_addr;
+    uint8_t  ieee[8];
+    uint8_t  ep_count;
+    uint8_t  eps[IV_MAX_EPS];
+    uint8_t  ep_idx;
+} iv_ctx_t;
+
+static iv_ctx_t  s_iv;
+static uint8_t   s_coord_ieee[8];
+static uint16_t  s_iv_change;   /* reportable change – static, wird vom Stack gelesen */
+
+/* Letzter per APS empfangener Frame – die SET_ATTR_VALUE-Message (Tastenbefehl)
+ * enthält KEINE Quell-Adresse, daher nehmen wir sie aus dem unmittelbar
+ * vorher verarbeiteten APS-Frame (aps_data_ind_cb läuft im gleichen
+ * Stack-Durchlauf VOR dem ZCL-Callback). */
+static struct {
+    uint16_t addr;
+    uint8_t  ep;
+    uint16_t cluster;
+} s_last_aps;
+
+static void iv_active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count,
+                            uint8_t *ep_id_list, void *user_ctx);
+static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
+                              esp_zb_af_simple_desc_1_1_t *sd, void *user_ctx);
+static void iv_bind_cb(esp_zb_zdp_status_t status, void *user_ctx);
+
+/* Basic-Cluster-Read: Zustand + Callback (Definition weiter unten) */
 static uint16_t s_basic_pending_addr = 0xFFFF;
+static uint8_t  s_basic_pending_ep   = 1;   /* echte Geräte-EP (ep1-Hardcodewort repariert) */
+static void read_basic_cb(uint8_t param);
+/* Vorwärtdeklaration – start_basic_scan ist erst weiter unten definiert,
+ * wird aber schon beim Interview-Abschluss (oben) aufgerufen. */
+static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n);
+
+static void iv_ieee_str(const uint8_t *ieee, char *out, size_t len) {
+    snprintf(out, len, "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             ieee[7], ieee[6], ieee[5], ieee[4],
+             ieee[3], ieee[2], ieee[1], ieee[0]);
+}
+
+/* FIFO der ausgehenden Bind-Requests – nur für die Zuordnung der Responses
+ * beim Logging (ZBOSS liefert pro Response nur Status + ctx). */
+typedef struct { uint16_t addr; uint8_t ep; uint16_t cluster; } iv_bind_rec_t;
+static iv_bind_rec_t s_iv_bind_fifo[16];
+static uint8_t s_iv_bind_head = 0, s_iv_bind_tail = 0;
+
+static void iv_bind_fifo_push(uint16_t addr, uint8_t ep, uint16_t cluster) {
+    uint8_t next = (uint8_t)((s_iv_bind_tail + 1) % 16);
+    if (next == s_iv_bind_head) return;   /* voll – nur Logging, verwerfen */
+    s_iv_bind_fifo[s_iv_bind_tail].addr    = addr;
+    s_iv_bind_fifo[s_iv_bind_tail].ep      = ep;
+    s_iv_bind_fifo[s_iv_bind_tail].cluster = cluster;
+    s_iv_bind_tail = next;
+}
+
+static bool iv_bind_fifo_pop(uint16_t *addr, uint8_t *ep, uint16_t *cluster) {
+    if (s_iv_bind_head == s_iv_bind_tail) return false;
+    *addr    = s_iv_bind_fifo[s_iv_bind_head].addr;
+    *ep      = s_iv_bind_fifo[s_iv_bind_head].ep;
+    *cluster = s_iv_bind_fifo[s_iv_bind_head].cluster;
+    s_iv_bind_head = (uint8_t)((s_iv_bind_head + 1) % 16);
+    return true;
+}
+
+static void interview_start(uint16_t addr, const uint8_t *ieee) {
+    if (addr == 0x0000 || addr == 0xFFFF) return;
+
+    s_iv.busy       = true;
+    s_iv.short_addr = addr;
+    if (ieee) memcpy(s_iv.ieee, ieee, 8);
+    else      memset(s_iv.ieee, 0, 8);
+    s_iv.ep_count   = 0;
+    s_iv.ep_idx     = 0;
+    esp_zb_get_long_address(s_coord_ieee);
+
+    /* als interviewiert markieren – kein Re-Interview bei jedem Frame */
+    xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (s_devices[i].used && s_devices[i].short_addr == addr) {
+            s_devices[i].interviewed = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_dev_mutex);
+
+    char line[96];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"start\"}", addr);
+    ha_mqtt_emit_raw(line);
+    ESP_LOGI(TAG, "Interview 0x%04x: Active-EP …", addr);
+
+    esp_zb_zdo_active_ep_req_param_t req = { .addr_of_interest = addr };
+    esp_zb_zdo_active_ep_req(&req, iv_active_ep_cb, NULL);
+}
+
+static void iv_request_simple_desc(uint8_t idx) {
+    if (!s_iv.busy || idx >= s_iv.ep_count) {
+        char eps[48] = "";
+        size_t pos = 0;
+        for (uint8_t i = 0; i < s_iv.ep_count && pos < sizeof(eps) - 4; i++) {
+            pos += snprintf(eps + pos, sizeof(eps) - pos, "%s%u",
+                            i ? "," : "", s_iv.eps[i]);
+        }
+        char line[112];
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"done\",\"eps\":[%s]}",
+                 s_iv.short_addr, eps);
+        ha_mqtt_emit_raw(line);
+        ESP_LOGI(TAG, "Interview 0x%04x abgeschlossen (eps: %s)",
+                 s_iv.short_addr, eps);
+        /* Basic-Attribute (Hersteller/Modell) lesen – über alle Endpunkte */
+        if (s_iv.ep_count > 0) {
+            start_basic_scan(s_iv.short_addr, s_iv.eps, s_iv.ep_count);
+        }
+        s_iv.busy = false;
+        return;
+    }
+    s_iv.ep_idx = idx;
+    esp_zb_zdo_simple_desc_req_param_t req = {
+        .addr_of_interest = s_iv.short_addr,
+        .endpoint         = s_iv.eps[idx],
+    };
+    esp_zb_zdo_simple_desc_req(&req, iv_simple_desc_cb, NULL);
+}
+
+static void iv_active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count,
+                            uint8_t *ep_id_list, void *user_ctx) {
+    (void)user_ctx;
+    if (!s_iv.busy) return;
+
+    if (status != ESP_ZB_ZDP_STATUS_SUCCESS || ep_count == 0 || !ep_id_list) {
+        char line[96];
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"ep_failed\",\"status\":\"0x%02x\"}",
+                 s_iv.short_addr, (unsigned)status);
+        ha_mqtt_emit_raw(line);
+        ESP_LOGW(TAG, "Interview 0x%04x: Active-EP fehlgeschlagen (0x%02x)",
+                 s_iv.short_addr, (unsigned)status);
+        s_iv.busy = false;
+        return;
+    }
+
+    if (ep_count > IV_MAX_EPS) ep_count = IV_MAX_EPS;
+    memcpy(s_iv.eps, ep_id_list, ep_count);
+    s_iv.ep_count = ep_count;
+    s_iv.ep_idx   = 0;
+
+    char eps[48] = "";
+    size_t pos = 0;
+    for (uint8_t i = 0; i < ep_count && pos < sizeof(eps) - 4; i++) {
+        pos += snprintf(eps + pos, sizeof(eps) - pos, "%s%u", i ? "," : "", s_iv.eps[i]);
+    }
+    char line[112];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"ep_list\",\"eps\":[%s]}",
+             s_iv.short_addr, eps);
+    ha_mqtt_emit_raw(line);
+    ESP_LOGI(TAG, "Interview 0x%04x: %u Endpoint(s) [%s]",
+             s_iv.short_addr, (unsigned)ep_count, eps);
+
+    iv_request_simple_desc(0);
+}
+
+static void iv_bind(uint8_t ep, uint16_t cluster) {
+    esp_zb_zdo_bind_req_param_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.src_address, s_iv.ieee, sizeof(req.src_address));
+    req.src_endp      = ep;
+    req.cluster_id    = cluster;
+    req.dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED;
+    memcpy(req.dst_address_u.addr_long, s_coord_ieee, 8);
+    req.dst_endp      = ZB_ENDPOINT;
+    req.req_dst_addr  = s_iv.short_addr;
+
+    iv_bind_fifo_push(s_iv.short_addr, ep, cluster);
+    esp_zb_zdo_device_bind_req(&req, iv_bind_cb, NULL);
+
+    char line[112];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"interview\",\"act\":\"bind\",\"addr\":\"0x%04x\",\"ep\":%u,\"cluster\":\"0x%04x\"}",
+             s_iv.short_addr, (unsigned)ep, cluster);
+    ha_mqtt_emit_raw(line);
+}
+
+static void iv_bind_cb(esp_zb_zdp_status_t status, void *user_ctx) {
+    (void)user_ctx;
+    uint16_t addr = s_iv.short_addr;
+    uint8_t  ep = 0;
+    uint16_t cluster = 0;
+    bool known = iv_bind_fifo_pop(&addr, &ep, &cluster);
+
+    char line[128];
+    if (known) {
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"interview\",\"act\":\"bind_resp\",\"addr\":\"0x%04x\",\"ep\":%u,"
+                 "\"cluster\":\"0x%04x\",\"status\":\"0x%02x\"}",
+                 addr, (unsigned)ep, cluster, (unsigned)status);
+    } else {
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"interview\",\"act\":\"bind_resp\",\"status\":\"0x%02x\"}",
+                 (unsigned)status);
+    }
+    ha_mqtt_emit_raw(line);
+    if (known && status != ESP_ZB_ZDP_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Interview: Bind ep%u cluster 0x%04x → 0x%02x",
+                 (unsigned)ep, cluster, (unsigned)status);
+    }
+}
+
+/* ZCL unterscheidet ANALOGE und DISKRETE Datentypen. Nur bei analogen gehört
+ * das Feld "reportable change" in den Configure-Reporting-Record; bei
+ * diskreten (Bool, Bitmap, Enum, Strings …) ist es laut ZCL 2.5.7.1 NICHT
+ * enthalten. Wird es trotzdem mitgeschickt, ist der Record zu lang – manche
+ * Endgeräte (z. B. Feibit HGZB-043) quittieren ihn mit SUCCESS, speichern
+ * aber Unsinn und melden danach nie wieder eine Zustandsänderung. Genau das
+ * war der Grund, warum HA den Schalterzustand nie gesehen hat. */
+static bool iv_type_is_analog(uint8_t t) {
+    if (t >= ESP_ZB_ZCL_ATTR_TYPE_U8 && t <= ESP_ZB_ZCL_ATTR_TYPE_S64) return true;  /* 0x20–0x2f */
+    if (t >= ESP_ZB_ZCL_ATTR_TYPE_SEMI && t <= ESP_ZB_ZCL_ATTR_TYPE_DOUBLE) return true; /* 0x38–0x3a */
+    if (t >= ESP_ZB_ZCL_ATTR_TYPE_TIME_OF_DAY && t <= ESP_ZB_ZCL_ATTR_TYPE_UTC_TIME) return true; /* 0xe0–0xe2 */
+    return false;   /* Bool/Bitmap/Enum/String/Array/Struct/Set → diskret */
+}
+
+static void iv_config_report(uint8_t ep, uint16_t cluster, const iv_report_cfg_t *cfg) {
+    esp_zb_zcl_config_report_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.direction        = 0x00;   /* 0x00 = Attribut wird gemeldet (Server → Client) */
+    rec.attributeID      = cfg->attr;
+    rec.attrType         = cfg->type;
+    rec.min_interval     = cfg->min_int;
+    rec.max_interval     = cfg->max_int;
+    s_iv_change          = cfg->change;
+    rec.reportable_change = iv_type_is_analog(cfg->type) ? &s_iv_change : NULL;
+
+    esp_zb_zcl_config_report_cmd_t req;
+    memset(&req, 0, sizeof(req));
+    req.zcl_basic_cmd.dst_addr_u.addr_short = s_iv.short_addr;
+    req.zcl_basic_cmd.dst_endpoint = ep;
+    req.zcl_basic_cmd.src_endpoint = ZB_ENDPOINT;
+    req.address_mode   = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    req.clusterID      = cluster;
+    req.record_number  = 1;
+    req.record_field   = &rec;
+
+    esp_zb_zcl_config_report_cmd_req(&req);
+
+    char line[128];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"interview\",\"act\":\"config_report\",\"addr\":\"0x%04x\",\"ep\":%u,"
+             "\"cluster\":\"0x%04x\",\"attr\":\"0x%04x\"}",
+             s_iv.short_addr, (unsigned)ep, cluster, cfg->attr);
+    ha_mqtt_emit_raw(line);
+}
+
+static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
+                              esp_zb_af_simple_desc_1_1_t *sd, void *user_ctx) {
+    (void)user_ctx;
+    if (!s_iv.busy) return;
+
+    uint8_t ep = s_iv.eps[s_iv.ep_idx];
+    if (status != ESP_ZB_ZDP_STATUS_SUCCESS || !sd) {
+        ESP_LOGW(TAG, "Interview: Simple-Desc ep%u fehlgeschlagen (0x%02x)",
+                 (unsigned)ep, (unsigned)status);
+        iv_request_simple_desc((uint8_t)(s_iv.ep_idx + 1));
+        return;
+    }
+
+    uint8_t in_n  = sd->app_input_cluster_count;
+    uint8_t out_n = sd->app_output_cluster_count;
+    if (in_n  > IV_MAX_CLUSTERS) in_n  = IV_MAX_CLUSTERS;
+    if (out_n > IV_MAX_CLUSTERS) out_n = IV_MAX_CLUSTERS;
+
+    /* Simple-Descriptor dokumentieren */
+    {
+        char in_s[120] = "", out_s[120] = "";
+        size_t pos = 0;
+        for (uint8_t i = 0; i < in_n && pos < sizeof(in_s) - 8; i++) {
+            pos += snprintf(in_s + pos, sizeof(in_s) - pos, "%s0x%04x",
+                            i ? "," : "", (unsigned)sd->app_cluster_list[i]);
+        }
+        pos = 0;
+        const uint16_t *out = sd->app_cluster_list + sd->app_input_cluster_count;
+        for (uint8_t i = 0; i < out_n && pos < sizeof(out_s) - 8; i++) {
+            pos += snprintf(out_s + pos, sizeof(out_s) - pos, "%s0x%04x",
+                            i ? "," : "", (unsigned)out[i]);
+        }
+        char line[440];
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"ep\":%u,\"profile\":\"0x%04x\","
+                 "\"device\":\"0x%04x\",\"in\":[%s],\"out\":[%s]}",
+                 s_iv.short_addr, (unsigned)ep,
+                 (unsigned)sd->app_profile_id, (unsigned)sd->app_device_id, in_s, out_s);
+        ha_mqtt_emit_raw(line);
+    }
+
+    /* Input-Cluster (Server am Gerät) → binden + Reporting */
+    for (uint8_t i = 0; i < in_n; i++) {
+        uint16_t cl = sd->app_cluster_list[i];
+        for (size_t k = 0; k < sizeof(s_iv_input) / sizeof(s_iv_input[0]); k++) {
+            if (s_iv_input[k].cluster != cl) continue;
+            iv_bind(ep, cl);
+            if (s_iv_input[k].attr != IV_NO_REPORT) iv_config_report(ep, cl, &s_iv_input[k]);
+            break;
+        }
+    }
+
+    /* Output-Cluster (Client am Gerät) → nur binden */
+    const uint16_t *out = sd->app_cluster_list + sd->app_input_cluster_count;
+    for (uint8_t i = 0; i < out_n; i++) {
+        uint16_t cl = out[i];
+        for (size_t k = 0; k < sizeof(s_iv_output) / sizeof(s_iv_output[0]); k++) {
+            if (s_iv_output[k] != cl) continue;
+            iv_bind(ep, cl);
+            break;
+        }
+    }
+
+    iv_request_simple_desc((uint8_t)(s_iv.ep_idx + 1));
+}
+
+/* ── Basic-Cluster: Hersteller + Model beim Join lesen ─────────────────── */
 static uint16_t s_basic_attrs[2] = { 0x0004, 0x0005 };
 
-static void read_basic_cb(uint8_t param) {
-    (void)param;
-    if (s_basic_pending_addr == 0xFFFF) return;
+static void read_basic_at(uint16_t addr, uint8_t ep) {
     esp_zb_zcl_read_attr_cmd_t req = {
         .zcl_basic_cmd = {
-            .dst_addr_u  = { .addr_short = s_basic_pending_addr },
-            .dst_endpoint = 1,
+            .dst_addr_u  = { .addr_short = addr },
+            .dst_endpoint = ep,
             .src_endpoint = ZB_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
@@ -77,7 +451,122 @@ static void read_basic_cb(uint8_t param) {
         .attr_field   = s_basic_attrs,
     };
     esp_zb_zcl_read_attr_cmd_req(&req);
+}
+
+static void read_basic_cb(uint8_t param) {
+    (void)param;
+    if (s_basic_pending_addr == 0xFFFF) return;
+    read_basic_at(s_basic_pending_addr, s_basic_pending_ep);
     s_basic_pending_addr = 0xFFFF;
+}
+
+/* Modell-Scan: das Basic-Cluster sitzt je nach Hersteller auf ep1 oder auf
+ * jedem Schalter-Endpunkt (Feibit/Nue: ep16..18). Beim Interview wurde nur
+ * die erste EP probiert → „basic" kam nie zurück, das Modell blieb unbekannt.
+ * Deshalb hier nacheinander alle bekannten Endpunkte durchprobieren. */
+#define BASIC_SCAN_MAX 9
+static uint16_t s_scan_addr = 0xFFFF;
+static uint8_t  s_scan_eps[BASIC_SCAN_MAX];
+static uint8_t  s_scan_n = 0, s_scan_i = 0;
+
+static void read_basic_scan_cb(uint8_t param) {
+    (void)param;
+    if (s_scan_addr == 0xFFFF || s_scan_i >= s_scan_n) { s_scan_addr = 0xFFFF; return; }
+    read_basic_at(s_scan_addr, s_scan_eps[s_scan_i++]);
+    if (s_scan_i < s_scan_n) esp_zb_scheduler_alarm(read_basic_scan_cb, 0, 800);
+    else s_scan_addr = 0xFFFF;
+}
+
+static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n) {
+    s_scan_addr = addr;
+    s_scan_n    = 0;
+    s_scan_eps[s_scan_n++] = 1;          /* Basic liegt am häufigsten auf ep1 */
+    for (uint8_t k = 0; k < n && s_scan_n < BASIC_SCAN_MAX; k++) {
+        if (eps[k] != 1) s_scan_eps[s_scan_n++] = eps[k];
+    }
+    s_scan_i = 0;
+    esp_zb_scheduler_alarm(read_basic_scan_cb, 0, 500);
+}
+
+/* ── IEEE-Auflösung für „stille“ Rejoins ────────────────────────────────────
+ * Nach einem Coordinator-Reboot kommen viele Geräte ohne Device-Announce
+ * zurück: sie senden einfach wieder APS-Daten. Dann kennen wir ihre IEEE
+ * nicht, das Interview wurde bisher übersprungen („ohne IEEE kein Bind“) und
+ * damit wurde auch nie das Basic-Cluster gelesen → kein Modell in HA.
+ * Deshalb die IEEE hier per ZDO nachträglich auflösen und das Interview
+ * danach starten. Rate-Limit: maximal 1 Request pro 30 s im ganzen Netz. */
+static TickType_t s_ieee_last_tick = 0;
+
+static void ieee_resolved_cb(esp_zb_zdp_status_t zdo_status,
+                             esp_zb_ieee_addr_t ieee_addr, void *user_ctx) {
+    uint16_t addr = (uint16_t)(uintptr_t)user_ctx;
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "IEEE-Request 0x%04x fehlgeschlagen (0x%02x)", addr, zdo_status);
+        return;
+    }
+    xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+    zb_device_t *d = find_or_add(addr, ieee_addr);
+    bool need = d && !d->interviewed;
+    xSemaphoreGive(s_dev_mutex);
+    ESP_LOGI(TAG, "IEEE 0x%04x aufgelöst → Interview%s", addr, need ? "" : " (schon erfolgt)");
+    if (need) interview_start(addr, ieee_addr);
+}
+
+static void request_ieee(uint16_t addr) {
+    esp_zb_zdo_ieee_addr_req_param_t req = {
+        .dst_nwk_addr     = addr,
+        .addr_of_interest = addr,
+        .request_type     = 0x00,   /* Single device response */
+        .start_index      = 0,
+    };
+    esp_zb_zdo_ieee_addr_req(&req, ieee_resolved_cb, (void *)(uintptr_t)addr);
+}
+
+/* ── Keep-Alive-Test: liest nach Autorisierung periodisch Basic-Attribute ──
+ * These: TI-Geräte (Z-Stack) verlassen das Netz ~10 s nach "Device
+ * Authorized" (rejoin=0), obwohl Interview + Bind erfolgreich waren.
+ * Verdacht: Gerät erwartet aktive Kommunikation vom Coordinator.
+ * 12 Runden à 5 s = 60 s Abdeckung; jede Runde loggt {"t":"keepalive",...}. */
+static uint16_t s_ka_addr = 0xFFFF;   /* 0xFFFF = kein Keep-Alive aktiv */
+static uint8_t  s_ka_ep   = 1;
+static uint8_t  s_ka_n    = 0;
+#define KA_ROUNDS      12
+#define KA_INTERVAL_MS 5000
+
+static void keepalive_cb(uint8_t param) {
+    if (s_ka_addr == 0xFFFF) return;
+    s_ka_n = param;
+    char line[96];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"keepalive\",\"addr\":\"0x%04x\",\"ep\":%u,\"round\":%u}",
+             s_ka_addr, (unsigned)s_ka_ep, (unsigned)s_ka_n);
+    ha_mqtt_emit_raw(line);
+    /* Read-Attribute über read_basic_cb an die echte EP senden */
+    s_basic_pending_addr = s_ka_addr;
+    s_basic_pending_ep   = s_ka_ep;
+    esp_zb_scheduler_alarm(read_basic_cb, 0, 10);
+    if (s_ka_n < KA_ROUNDS) {
+        esp_zb_scheduler_alarm(keepalive_cb, (uint8_t)(s_ka_n + 1), KA_INTERVAL_MS);
+    } else {
+        s_ka_addr = 0xFFFF;
+    }
+}
+
+static void keepalive_start(uint16_t addr, uint8_t ep) {
+    s_ka_addr = 0xFFFF;               /* laufende Alarms entwerden */
+    s_ka_addr = addr;
+    s_ka_ep   = ep;
+    s_ka_n    = 0;
+    char line[96];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"keepalive\",\"addr\":\"0x%04x\",\"ep\":%u,\"round\":0}",
+             addr, (unsigned)ep);
+    ha_mqtt_emit_raw(line);
+    esp_zb_scheduler_alarm(keepalive_cb, 1, KA_INTERVAL_MS);
+}
+
+static void keepalive_stop(void) {
+    s_ka_addr = 0xFFFF;
 }
 
 /* ── ZCL-Attribut-Callback ──────────────────────────────────────────────── */
@@ -86,7 +575,26 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     /* Basic cluster read response */
     if (callback_id == ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID) {
         const esp_zb_zcl_cmd_read_attr_resp_message_t *m = message;
-        if (!m || m->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_BASIC) return ESP_OK;
+        if (!m) return ESP_OK;
+
+        /* On/Off aktiv zurückgelesen (nach einem Fernbefehl). Das Gerät
+         * schickt keinen Report, antwortet aber auf Read Attributes –
+         * damit wird die optimistische Annahme des Gateways korrigiert. */
+        if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+            uint16_t ra = m->info.src_address.u.short_addr;
+            for (esp_zb_zcl_read_attr_resp_variable_t *v = m->variables; v; v = v->next) {
+                if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS) continue;
+                if (v->attribute.id != ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) continue;
+                if (!v->attribute.data.value) continue;
+                uint8_t val = *(uint8_t *)v->attribute.data.value;
+                char pl[24];
+                snprintf(pl, sizeof(pl), "{\"v\":%u}", val ? 1u : 0u);
+                ha_mqtt_publish_zigbee_ep(ra, m->info.src_endpoint, "on_off", pl);
+            }
+            return ESP_OK;
+        }
+
+        if (m->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_BASIC) return ESP_OK;
         uint16_t addr = m->info.src_address.u.short_addr;
         xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
         zb_device_t *dev = find_or_add(addr, NULL);
@@ -134,8 +642,63 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         return ESP_OK;
     }
 
-    if (callback_id != ESP_ZB_CORE_REPORT_ATTR_CB_ID &&
-        callback_id != ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID)
+    /* Tastenbefehl eines gebundenen Schalters: Das On/Off-Server-Cluster am
+     * Coordinator setzt das OnOff-Attribut → landet hier (gleicher Pfad wie im
+     * HA-On/Off-Light-Beispiel). Die Message enthält keine Quell-Adresse, daher
+     * aus s_last_aps (wird von aps_data_ind_cb unmittelbar vorher gefüllt). */
+    if (callback_id == ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID) {
+        const esp_zb_zcl_set_attr_value_message_t *m = message;
+        if (m && m->info.status == ESP_ZB_ZCL_STATUS_SUCCESS &&
+            m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+            m->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
+            m->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL &&
+            m->attribute.data.value) {
+            bool v = *(const bool *)m->attribute.data.value;
+            uint16_t src = s_last_aps.addr;
+            uint8_t  ep  = s_last_aps.ep;
+            if (src != 0x0000 && src != 0xFFFF && ep != 0) {
+                char pl[24];
+                snprintf(pl, sizeof(pl), "{\"v\":%u}", v ? 1u : 0u);
+                ha_mqtt_publish_zigbee_ep(src, ep, "on_off", pl);
+                char line[112];
+                snprintf(line, sizeof(line),
+                         "{\"t\":\"cmd\",\"addr\":\"0x%04x\",\"ep\":%u,\"cluster\":\"on_off\",\"v\":%u}",
+                         src, (unsigned)ep, v ? 1u : 0u);
+                ha_mqtt_emit_raw(line);
+                ESP_LOGI(TAG, "Schalter 0x%04x ep%u → %s",
+                         src, (unsigned)ep, v ? "ON" : "OFF");
+            } else {
+                ha_mqtt_emit_raw("{\"t\":\"cmd\",\"cluster\":\"on_off\",\"src\":\"unknown\"}");
+            }
+        }
+        return ESP_OK;
+    }
+
+    /* Configure-Reporting-Response (Antwort des Endgeräts auf unser Interview) */
+    if (callback_id == ESP_ZB_CORE_CMD_REPORT_CONFIG_RESP_CB_ID) {
+        const esp_zb_zcl_cmd_config_report_resp_message_t *m = message;
+        if (m) {
+            unsigned ok = 0, bad = 0;
+            for (esp_zb_zcl_config_report_resp_variable_t *v = m->variables; v; v = v->next) {
+                if (v->status == ESP_ZB_ZCL_STATUS_SUCCESS) ok++;
+                else bad++;
+            }
+            char line[160];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"interview\",\"act\":\"config_report_resp\",\"addr\":\"0x%04x\",\"ep\":%u,"
+                     "\"cluster\":\"0x%04x\",\"status\":\"0x%02x\",\"ok\":%u,\"bad\":%u}",
+                     m->info.src_address.u.short_addr, (unsigned)m->info.src_endpoint,
+                     m->info.cluster, (unsigned)m->info.status, ok, bad);
+            ha_mqtt_emit_raw(line);
+        }
+        return ESP_OK;
+    }
+
+    /* Nur Attribut-Reports verarbeiten. Andere Callback-IDs (u. a.
+     * SET_ATTR_VALUE_CB_ID) liefern andere Struct-Typen – ein Cast auf
+     * report_attr_message_t würde falsche Offsets lesen (Müll-Publishes).
+     * SET_ATTR_VALUE wird oben separat mit korrektem Typ verarbeitet. */
+    if (callback_id != ESP_ZB_CORE_REPORT_ATTR_CB_ID)
         return ESP_OK;
 
     const esp_zb_zcl_report_attr_message_t *msg =
@@ -144,8 +707,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
     uint16_t addr = msg->src_address.u.short_addr;
 
-    ESP_LOGD(TAG, "ZCL 0x%04x cluster 0x%04x attr 0x%04x",
-             addr, msg->cluster, msg->attribute.id);
+    ESP_LOGD(TAG, "ZCL 0x%04x ep%u cluster 0x%04x attr 0x%04x",
+             addr, (unsigned)msg->src_endpoint, msg->cluster, msg->attribute.id);
 
     char payload[64];
 
@@ -153,37 +716,37 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF: {
         uint8_t v = *(uint8_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"v\":%u}", v);
-        ha_mqtt_publish_zigbee(addr, "on_off", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "on_off", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT: {
         int16_t raw = *(int16_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"raw\":%d}", raw);
-        ha_mqtt_publish_zigbee(addr, "temperature", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "temperature", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT: {
         uint16_t raw = *(uint16_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"raw\":%u}", raw);
-        ha_mqtt_publish_zigbee(addr, "humidity", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "humidity", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT: {
         uint16_t raw = *(uint16_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"raw\":%u}", raw);
-        ha_mqtt_publish_zigbee(addr, "illuminance", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "illuminance", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING: {
         uint8_t occ = *(uint8_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"occ\":%u}", occ);
-        ha_mqtt_publish_zigbee(addr, "occupancy", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "occupancy", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE: {
         uint16_t zs = *(uint16_t *)msg->attribute.data.value;
         snprintf(payload, sizeof(payload), "{\"zone_status\":%u,\"motion\":%u}", zs, (uint8_t)(zs & 1));
-        ha_mqtt_publish_zigbee(addr, "ias_zone", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "ias_zone", payload);
         break;
     }
     case ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG: {
@@ -198,14 +761,14 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
             uint8_t raw = *(uint8_t *)msg->attribute.data.value;
             snprintf(payload, sizeof(payload), "{\"attr\":\"0x%04x\",\"raw\":%u}", attr_id, raw);
         }
-        ha_mqtt_publish_zigbee(addr, "battery", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "battery", payload);
         break;
     }
     default: {
         snprintf(payload, sizeof(payload),
                  "{\"cluster\":\"0x%04x\",\"attr\":\"0x%04x\"}",
                  msg->cluster, msg->attribute.id);
-        ha_mqtt_publish_zigbee(addr, "raw", payload);
+        ha_mqtt_publish_zigbee_ep(addr, msg->src_endpoint, "raw", payload);
         break;
     }
     }
@@ -258,8 +821,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
 
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Zigbee bereit – Permit Join geschlossen");
-            esp_zb_bdb_open_network(0);   /* sofort schließen */
+            /* NICHT esp_zb_bdb_open_network(0) hier aufrufen!
+             * Das Boot-Steering-Signal kann NACH einem per BOOT-Taste/UI
+             * geöffneten Permit-Join-Fenster ankommen und es sofort wieder
+             * schließen (Bug: Fenster wurde ~1 s nach dem Öffnen gekillt).
+             * Nach dem Boot ist das Netzwerk ohnehin geschlossen. */
+            ESP_LOGI(TAG, "Zigbee bereit – Netzwerk wiederhergestellt");
         }
         break;
 
@@ -270,26 +837,41 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         ESP_LOGI(TAG, "Neues Gerät: 0x%04hx", a);
 
         xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+        /* Rejoin mit neuer Short-Adresse: alten Eintrag gleicher IEEE entfernen */
+        for (int i = 0; i < MAX_DEVICES; i++) {
+            if (s_devices[i].used && s_devices[i].short_addr != a &&
+                memcmp(s_devices[i].ieee, p->ieee_addr, 8) == 0) {
+                ESP_LOGI(TAG, "Gerät 0x%04hx → 0x%04hx (Rejoin, neue Adresse)",
+                         s_devices[i].short_addr, a);
+                memset(&s_devices[i], 0, sizeof(s_devices[i]));
+            }
+        }
         zb_device_t *dev = find_or_add(a, p->ieee_addr);
+        uint8_t dev_ieee[8] = { 0 };
+        if (dev) memcpy(dev_ieee, p->ieee_addr, 8);
         xSemaphoreGive(s_dev_mutex);
 
         /* IEEE-Adresse als String */
         char ieee_str[24] = "?";
-        if (dev) {
-            snprintf(ieee_str, sizeof(ieee_str),
-                     "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
-                     dev->ieee[7], dev->ieee[6], dev->ieee[5], dev->ieee[4],
-                     dev->ieee[3], dev->ieee[2], dev->ieee[1], dev->ieee[0]);
+        if (dev) iv_ieee_str(dev_ieee, ieee_str, sizeof(ieee_str));
+
+        /* Join-Event MIT Top-Level-IEEE (so kann der Pi alte Einträge nach
+         * Rejoin mit neuer Short-Adresse dedupen) */
+        {
+            char line[176];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"zigbee\",\"addr\":%u,\"sub\":\"join\","
+                     "\"p\":{\"event\":\"joined\",\"addr\":\"0x%04x\",\"ieee\":\"%s\"},"
+                     "\"ieee\":\"%s\"}",
+                     (unsigned)a, a, ieee_str, ieee_str);
+            ha_mqtt_emit_raw(line);
         }
 
-        char payload[80];
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"joined\",\"addr\":\"0x%04x\",\"ieee\":\"%s\"}",
-                 a, ieee_str);
-        ha_mqtt_publish_zigbee(a, "join", payload);
-        /* Basic-Attribute nach 500 ms lesen */
-        s_basic_pending_addr = a;
-        esp_zb_scheduler_alarm(read_basic_cb, 0, 500);
+        /* Basic-Attribute werden nach dem Interview mit echter EP gelesen
+         * (siehe iv_request_simple_desc – alter ep1-Pfad war fehlerhaft) */
+
+        /* Interview: Active-EP → Simple-Desc → Bind → Configure-Reporting */
+        if (dev) interview_start(a, dev_ieee);
         break;
     }
 
@@ -302,11 +884,90 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         break;
     }
 
-    default:
-        ESP_LOGD(TAG, "ZB-Signal: %s (0x%x) %s",
-                 esp_zb_zdo_signal_to_string(sig), sig,
-                 esp_err_to_name(err));
+    /* Gerät verlässt das Netzwerk (oder wird entfernt) – das ist das Signal,
+     * das unser Problem „pairt, ist aber ~1 min später wieder ungepairt“
+     * sichtbar macht. rejoin=1 heißt: Leave MIT Rejoin (Adresswechsel). */
+    case ESP_ZB_ZDO_SIGNAL_LEAVE_INDICATION: {
+        esp_zb_zdo_signal_leave_indication_params_t *p =
+            esp_zb_app_signal_get_params(sg_p);
+        if (p) {
+            keepalive_stop();
+            char ieee_str[24];
+            iv_ieee_str(p->device_addr, ieee_str, sizeof(ieee_str));
+            ESP_LOGW(TAG, "Gerät verlässt Netzwerk: 0x%04hx (%s) rejoin=%u",
+                     p->short_addr, ieee_str, (unsigned)p->rejoin);
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"zigbee\",\"addr\":%u,\"sub\":\"left\","
+                     "\"p\":{\"event\":\"left\",\"addr\":\"0x%04x\",\"ieee\":\"%s\",\"rejoin\":%u},"
+                     "\"ieee\":\"%s\"}",
+                     (unsigned)p->short_addr, p->short_addr, ieee_str,
+                     (unsigned)p->rejoin, ieee_str);
+            ha_mqtt_emit_raw(line);
+        }
         break;
+    }
+
+    /* 0x00 secured rejoin, 0x01 unsecured join, 0x02 Device left,
+     * 0x03 Trust-Center rejoin */
+    case ESP_ZB_ZDO_SIGNAL_DEVICE_UPDATE: {
+        esp_zb_zdo_signal_device_update_params_t *p =
+            esp_zb_app_signal_get_params(sg_p);
+        if (p) {
+            keepalive_stop();
+            ESP_LOGW(TAG, "Device-Update 0x%04hx status=%u",
+                     p->short_addr, (unsigned)p->status);
+            char line[112];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"zb_signal\",\"sig\":\"DEVICE_UPDATE\",\"addr\":\"0x%04x\",\"status\":%u}",
+                     p->short_addr, (unsigned)p->status);
+            ha_mqtt_emit_raw(line);
+        }
+        break;
+    }
+
+    /* Autorisierung durch Trust Center – type/status sind die Schlüssel-
+     * werte für die Leave-Ursache (0x01=TCLK, 0x02=SE-CBKE; status
+     * 0x00=ok, 0x01=timeout, 0x02=failed). Danach startet der Keep-Alive-
+     * Test (12 Runden Read-Attribute à 5 s). */
+    case ESP_ZB_ZDO_SIGNAL_DEVICE_AUTHORIZED: {
+        esp_zb_zdo_signal_device_authorized_params_t *p =
+            esp_zb_app_signal_get_params(sg_p);
+        if (p) {
+            char ieee_str[24];
+            iv_ieee_str(p->long_addr, ieee_str, sizeof(ieee_str));
+            char line[160];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"zb_signal\",\"sig\":\"DEVICE_AUTHORIZED\","
+                     "\"addr\":\"0x%04x\",\"ieee\":\"%s\",\"type\":%u,\"status\":%u}",
+                     p->short_addr, ieee_str,
+                     (unsigned)p->authorization_type,
+                     (unsigned)p->authorization_status);
+            ha_mqtt_emit_raw(line);
+            ESP_LOGW(TAG, "Device authorized 0x%04x type=%u status=%u",
+                     p->short_addr, (unsigned)p->authorization_type,
+                     (unsigned)p->authorization_status);
+            if (p->authorization_status == 0 && s_iv.ep_count > 0) {
+                keepalive_start(p->short_addr, s_iv.eps[0]);
+            }
+        }
+        break;
+    }
+
+    default: {
+        /* Alle übrigen Signale als JSON-Zeile ausgeben – so ist die komplette
+         * Signal-Kette (inkl. der Sekunden vor einem Leave) im Add-on-Log
+         * sichtbar. ESP_LOGD allein wäre unsichtbar (anderer UART). */
+        const char *name = esp_zb_zdo_signal_to_string(sig);
+        char line[128];
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"zb_signal\",\"sig\":\"%s\",\"id\":\"0x%02x\",\"err\":\"0x%x\"}",
+                 name ? name : "?", (unsigned)sig, (unsigned)err);
+        ha_mqtt_emit_raw(line);
+        ESP_LOGD(TAG, "ZB-Signal: %s (0x%x) %s",
+                 name ? name : "?", (unsigned)sig, esp_err_to_name(err));
+        break;
+    }
     }
 }
 
@@ -334,7 +995,7 @@ static void zb_task(void *arg) {
     esp_zb_cfg_t cfg = {
         .esp_zb_role        = ESP_ZB_DEVICE_TYPE_COORDINATOR,
         .install_code_policy = false,
-        .nwk_cfg.zczr_cfg   = { .max_children = 10 },
+        .nwk_cfg.zczr_cfg   = { .max_children = MAX_DEVICES },  /* 32 – gekoppelt an Geräte-DB */
     };
     esp_zb_init(&cfg);
     esp_zb_set_tx_power(20);   /* max TX-Power: 20 dBm */
@@ -376,6 +1037,15 @@ static void zb_task(void *arg) {
         esp_zb_on_off_cluster_create(&on_off_cfg),
         ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
+    /* On/Off zusätzlich als SERVER registrieren: so landen On/Off-Befehle
+     * gebundener Schalter (Tastendruck) als ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID
+     * bei uns – gleicher Pfad wie im HA-On/Off-Light-Beispiel. Die
+     * Client-Rolle bleibt für Attribut-Reports von Server-Geräten erhalten. */
+    esp_zb_on_off_cluster_cfg_t on_off_srv_cfg = { .on_off = false };
+    esp_zb_cluster_list_add_on_off_cluster(cl,
+        esp_zb_on_off_cluster_create(&on_off_srv_cfg),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
     /* Illuminance (0x0400) */
     esp_zb_illuminance_meas_cluster_cfg_t illum_cfg = {
         .measured_value = 0, .min_value = 0, .max_value = 0xfffe,
@@ -409,6 +1079,27 @@ static void zb_task(void *arg) {
     esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
     esp_zb_ep_list_add_ep(ep, cl, ZB_ENDPOINT,
         ESP_ZB_AF_HA_PROFILE_ID, ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID);
+
+    /* EP 0x0B (11) – Spiegelpunkt für Feibit FB56/ZSW1x (3A Nue HGZB-043):
+     * diese Schalter senden ihre On/Off-Attribut-Reports an die
+     * Coordinator-EP 0x0B (Ziel-Endpoint aus der Fremd-Gateway-Konfiguration,
+     * z. B. Xiaomi). Ohne diesen Endpunkt verwirft die ZCL-Schicht die
+     * Reports (beobachtet: dep=11, keine Callbacks).
+     * WICHTIG: Die Reports kommen mit Frame-Control 0x08 = direction
+     * to-client → ZBOSS sucht die CLIENT-Rolle. Deshalb beide Rollen
+     * registrieren (wie bei EP1). */
+    {
+        esp_zb_cluster_list_t *cl_b = esp_zb_zcl_cluster_list_create();
+        esp_zb_cluster_list_add_on_off_cluster(cl_b,
+            esp_zb_on_off_cluster_create(&on_off_srv_cfg),
+            ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+        esp_zb_cluster_list_add_on_off_cluster(cl_b,
+            esp_zb_on_off_cluster_create(&on_off_srv_cfg),
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+        esp_zb_ep_list_add_ep(ep, cl_b, 11,
+            ESP_ZB_AF_HA_PROFILE_ID, ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID);
+    }
+
     esp_zb_device_register(ep);
 
     esp_zb_core_action_handler_register(zb_action_handler);
@@ -416,6 +1107,16 @@ static void zb_task(void *arg) {
     esp_zb_set_secondary_network_channel_set(1U << fallback);
 
     esp_zb_aps_data_indication_handler_register(aps_data_ind_cb);
+
+    /* ★ 退网修复：TC 不强制要求终端做 TC-Link-Key 交换。
+     * ZBOSS 默认要求 r21 设备 join 后完成 TCLK(授权)交换；部分 TI Z-Stack
+     * 设备无法完成该交换，15 秒后 DEVICE_AUTHORIZED(type=1 R21_TCLK,
+     * status=1 TIMEOUT) → 设备被踢退网。设为 false 后允许设备不带
+     * TC-link-key 留在网内（APS 层用全局 link key，NWK 加密不变）。
+     * 依据：espressif/esp-zigbee-sdk issue #60 + arduino-esp32 #10868
+     * （Espressif 工程师确认的方案，须在 esp_zb_start 之前调用）。 */
+    esp_zb_secur_link_key_exchange_required_set(false);
+
     ESP_ERROR_CHECK(esp_zb_start(false));
     esp_zb_main_loop_iteration();
 }
@@ -503,6 +1204,50 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
         s_last_rssi = rssi;
     }
     xSemaphoreGive(s_dev_mutex);
+
+    /* Quell-Adresse/Endpoint des letzten Frames merken – die
+     * SET_ATTR_VALUE-Message (Tastenbefehl) führt keine Quell-Adresse. */
+    s_last_aps.addr    = ind.src_short_addr;
+    s_last_aps.ep      = ind.src_endpoint;
+    s_last_aps.cluster = ind.cluster_id;
+
+    /* Diagnose: jeden eingehenden APS-Frame roh mitschneiden.
+     * ASDU = ZCL-Frame (Frame-Control, TSN, Command-ID, …) – damit ist
+     * sichtbar, ob Tastenbefehle überhaupt ankommen und in welcher Form. */
+    if (ind.src_short_addr != 0x0000 && ind.asdu && ind.asdu_length > 0) {
+        char hex[64];
+        size_t hx = 0;
+        uint32_t n = ind.asdu_length < 24u ? ind.asdu_length : 24u;
+        for (uint32_t i = 0; i < n && hx + 2 < sizeof(hex); i++) {
+            hx += (size_t)snprintf(hex + hx, sizeof(hex) - hx, "%02x", ind.asdu[i]);
+        }
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"aps\",\"src\":\"0x%04x\",\"sep\":%u,\"dep\":%u,"
+                 "\"cl\":\"0x%04x\",\"sec\":%u,\"len\":%u,\"hex\":\"%s\"}",
+                 ind.src_short_addr, (unsigned)ind.src_endpoint,
+                 (unsigned)ind.dst_endpoint, ind.cluster_id,
+                 (unsigned)ind.security_status, (unsigned)ind.asdu_length, hex);
+        ha_mqtt_emit_raw(line);
+    }
+
+    /* Noch nicht interviewiert → Interview nachholen (Gerät, das schon vor
+     * dem Flash gepairt war und sich nicht neu anmeldet). */
+    if (d && !d->interviewed && ind.src_short_addr != 0x0000) {
+        bool have_ieee = false;
+        for (int i = 0; i < 8; i++) {
+            if (d->ieee[i]) { have_ieee = true; break; }
+        }
+        if (have_ieee) {
+            uint8_t ieee[8];
+            memcpy(ieee, d->ieee, 8);
+            interview_start(ind.src_short_addr, ieee);
+        } else if (xTaskGetTickCount() - s_ieee_last_tick > pdMS_TO_TICKS(30000)) {
+            /* IEEE unbekannt (stiller Rejoin) → per ZDO nachträglich holen */
+            s_ieee_last_tick = xTaskGetTickCount();
+            request_ieee(ind.src_short_addr);
+        }
+    }
     return false;   /* nicht konsumiert */
 }
 
@@ -512,7 +1257,9 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
     char *p = buf;
     size_t r = len;
     int n = snprintf(p, r, "[");
-    p += n; r -= (size_t)n;
+    if (n < 0) n = 0;
+    if ((size_t)n < r) { p += n; r -= (size_t)n; }
+    else               { p += r - 1; r = 1; }
     bool first = true;
     for (int i = 0; i < MAX_DEVICES && r > 4; i++) {
         if (!s_devices[i].used) continue;
@@ -521,7 +1268,9 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
                      s_devices[i].short_addr,
                      (unsigned)s_devices[i].lqi,
                      (int)s_devices[i].rssi);
-        p += n; r -= (size_t)n;
+        if (n < 0) break;
+        if ((size_t)n < r) { p += n; r -= (size_t)n; }
+        else               { r = 1; break; }   /* Puffer voll – Rest verwerfen */
         first = false;
     }
     snprintf(p, r, "]");
@@ -529,6 +1278,55 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
 }
 
 int8_t zb_gateway_get_last_rssi(void) { return s_last_rssi; }
+
+/* LQI-Momentaufnahme auf Anfrage.
+ *
+ * Im Heartbeat steckt dieselbe Liste, aber nur alle 60 s. Für den Vergleich
+ * von Sendeleistungen ist das zu langsam: der Wert gilt nur für den *letzten*
+ * empfangenen Frame, und der kann Minuten alt sein. Hier wird bewusst der
+ * Zeitstempel mitgeschickt (uptime_ms), damit man „Zustand von vor 3 Minuten"
+ * von „gerade eben gemessen" unterscheiden kann.
+ *
+ * ACHTUNG – beide Puffer MÜSSEN statisch sein:
+ * Diese Funktion läuft im uart_rx-Task, und der hat nur 2048 B Stack
+ * (ha_mqtt.c: xTaskCreate(rx_task, "uart_rx", 2048, ...)). Ein lokaler
+ * char[2048+128] hätte den Stack allein schon überschritten – Absturz beim
+ * ersten Aufruf des Befehls. Der Heartbeat-Task darf es sich leisten (8192 B),
+ * dieser hier nicht.
+ *
+ * Größe: 32 Geräte à maximal 41 Zeichen ("addr","lqi","rssi" + Komma) ≈ 1312 B
+ * plus Umschlag. Herzschlag und Abfrage teilen dieselbe Untergrenze. */
+#define LQI_JSON_MAX  1536
+#define LQI_LINE_MAX  (LQI_JSON_MAX + 64)
+void zb_gateway_report_lqi(void) {
+    static char buf[LQI_JSON_MAX];
+    static char line[LQI_LINE_MAX];
+    zb_gateway_lqi_json(buf, sizeof(buf));
+    uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    ESP_LOGI(TAG, "lqi-Snapshot gebaut (%u B, %llu ms)",
+             (unsigned)strlen(buf), (unsigned long long)ms);
+    snprintf(line, sizeof(line), "{\"t\":\"lqi\",\"ms\":%lu,\"dev\":%s}",
+             (unsigned long)ms, buf);
+    ha_mqtt_emit_raw(line);
+}
+
+/* ── Sendeleistung ──────────────────────────────────────────────────────── */
+/* Wunschwert und wirksamer Wert sind nicht dasselbe: esp_zb_set_tx_power()
+ * klemmt den Wert intern auf den PHY-Bereich. Deshalb wird nach dem Setzen
+ * über esp_ieee802154_get_txpower() zurückgelesen und mitgeschickt – sonst
+ * misst man beim Vergleich die Wunschzahl statt der Sendeleistung. */
+void zb_gateway_set_tx_power(int8_t dbm) {
+    esp_zb_set_tx_power(dbm);
+    int8_t eff = esp_ieee802154_get_txpower();
+    char line[96];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"txpower\",\"want\":%d,\"eff\":%d}", (int)dbm, (int)eff);
+    ha_mqtt_emit_raw(line);
+}
+
+int8_t zb_gateway_get_tx_power(void) {
+    return esp_ieee802154_get_txpower();
+}
 
 void zb_gateway_list_devices(void) {
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
@@ -609,6 +1407,177 @@ void zb_gateway_scan_channels(void) {
     }
     if (!s_scan_sem) s_scan_sem = xSemaphoreCreateBinary();
     xTaskCreate(scan_task, "chan_scan", 4096, NULL, 2, &s_scan_task_h);
+}
+
+/* ── Gerätesteuerung von HA/Pi (On/Off-Befehl an einen Endpoint) ───────── */
+void zb_gateway_probe_basic(uint16_t addr, uint8_t ep) {
+    if (addr == 0x0000 || addr == 0xFFFF) return;
+    s_basic_pending_addr = addr;
+    s_basic_pending_ep   = ep;
+    esp_zb_scheduler_alarm(read_basic_cb, 0, 100);
+}
+
+/* WICHTIG: esp_zb_zcl_*_cmd_req() darf nur im ZBOSS-Task-Kontext laufen.
+ * Der UART-RX-Task ist ein anderer Task – ein direkter Aufruf von dort wird
+ * vom Stack stillschweigend verworfen (kein Fehler, kein Frame on air).
+ * Deshalb wird der Request über den ZBOSS-Scheduler eingereiht. */
+static uint16_t s_dev_cmd_addr = 0xFFFF;
+static uint8_t  s_dev_cmd_ep   = 0;
+static uint8_t  s_dev_cmd_id   = 0;
+
+static void dev_cmd_send(uint8_t param) {
+    (void)param;
+    if (s_dev_cmd_addr == 0xFFFF) return;
+
+    esp_zb_zcl_on_off_cmd_t req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u   = { .addr_short = s_dev_cmd_addr },
+            .dst_endpoint = s_dev_cmd_ep,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode  = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .on_off_cmd_id = s_dev_cmd_id,      /* 0=off 1=on 2=toggle */
+    };
+    uint8_t tsn = esp_zb_zcl_on_off_cmd_req(&req);
+
+    char line[112];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"dev_cmd\",\"addr\":\"0x%04x\",\"ep\":%u,\"cmd\":%u,\"tsn\":%u}",
+             s_dev_cmd_addr, (unsigned)s_dev_cmd_ep, (unsigned)s_dev_cmd_id,
+             (unsigned)tsn);
+    ha_mqtt_emit_raw(line);
+    ESP_LOGI(TAG, "dev_cmd → 0x%04x ep%u cmd=%u (tsn %u)",
+             s_dev_cmd_addr, (unsigned)s_dev_cmd_ep, (unsigned)s_dev_cmd_id,
+             (unsigned)tsn);
+
+    s_dev_cmd_addr = 0xFFFF;
+}
+
+void zb_gateway_dev_cmd(uint16_t addr, uint8_t ep, uint8_t on_off_cmd) {
+    if (addr == 0x0000 || addr == 0xFFFF || ep == 0) return;
+    if (on_off_cmd > 2) on_off_cmd = 2;
+    s_dev_cmd_addr = addr;
+    s_dev_cmd_ep   = ep;
+    s_dev_cmd_id   = on_off_cmd;
+    esp_zb_scheduler_alarm(dev_cmd_send, 0, 10);
+}
+
+
+/* ── Node-Descriptor (ZDO 0x0002): Router (ZR) oder End Device (ZED)? ──────
+ * Nur Router leiten Fremdverkehr weiter – ein Wandschalter, der als ZED
+ * implementiert ist, obwohl er am Netz hängt, taugt NICHT als Repeater.
+ * Die MAC-Capability-Flags sind die einzige verlässliche Auskunft darüber:
+ *   bit1 = 1 → FFD / Router, bit2 = 1 → Netzbetrieb, bit3 = 1 → RX immer an. */
+static uint16_t s_nd_addr = 0xFFFF;
+
+static void node_desc_cb(esp_zb_zdp_status_t status, uint16_t addr,
+                         esp_zb_af_node_desc_t *nd, void *user_ctx) {
+    (void)user_ctx;
+    char line[192];
+    if (status != ESP_ZB_ZDP_STATUS_SUCCESS || nd == NULL) {
+        snprintf(line, sizeof(line),
+                 "{\"t\":\"node_desc\",\"addr\":\"0x%04x\",\"error\":\"0x%02x\"}",
+                 addr, (unsigned)status);
+        ha_mqtt_emit_raw(line);
+        return;
+    }
+    uint8_t cap     = nd->mac_capability_flags;
+    bool    router  = (cap & 0x02) != 0;
+    bool    mains   = (cap & 0x04) != 0;
+    bool    rx_idle = (cap & 0x08) != 0;
+    snprintf(line, sizeof(line),
+             "{\"t\":\"node_desc\",\"addr\":\"0x%04x\",\"cap\":%u,"
+             "\"role\":\"%s\",\"power\":\"%s\",\"rx_idle\":%s}",
+             addr, (unsigned)cap,
+             router  ? "router"     : "end_device",
+             mains   ? "mains"      : "battery",
+             rx_idle ? "true"       : "false");
+    ha_mqtt_emit_raw(line);
+}
+
+static void node_desc_send(uint8_t param) {
+    (void)param;
+    if (s_nd_addr == 0xFFFF) return;
+    esp_zb_zdo_node_desc_req_param_t req = { .dst_nwk_addr = s_nd_addr };
+    esp_zb_zdo_node_desc_req(&req, node_desc_cb, NULL);
+    s_nd_addr = 0xFFFF;
+}
+
+void zb_gateway_node_desc(uint16_t addr) {
+    if (addr == 0x0000 || addr == 0xFFFF) return;
+    s_nd_addr = addr;
+    esp_zb_scheduler_alarm(node_desc_send, 0, 10);
+}
+
+
+/* ── On/Off aktiv zurücklesen ─────────────────────────────────────────────
+ * Das HGZB-043 beantwortet einen Fernbefehl nur mit Default-Response und
+ * schickt KEIN Report-Attribut. Lesen geht aber: Read Attributes auf
+ * Cluster 0x0006, Attribut 0x0000. Damit bekommt HA den ECHTEN Zustand
+ * zurueck, statt sich auf die optimistische Annahme des Gateways zu
+ * verlassen (die z. B. daneben liegt, wenn das Geraet den Befehl ablehnt).
+ *
+ * Mehrere Slots, weil eine HA-Szene schnell zehn Geraete gleichzeitig
+ * schaltet: mit nur einer Adresse haette der letzte Aufruf die vorherigen
+ * ueberschrieben und die Anfrage waere beim falschen Geraet gelandet.
+ *
+ * ★ Feste Slots statt Ringpuffer (Bug vom 2026-10-17):
+ *   Der Ringpuffer hatte zwei Zeiger (head/tail) in zwei Tasks. Sobald sich
+ *   zwei Callbacks ueberschnitten – oder ein esp_zb_scheduler_alarm() im
+ *   Callback scheiterte – liefen head und tail auseinander und der Puffer
+ *   galt DAUERHAFT als "nicht leer". Jede weitere Anfrage fiel auf einen
+ *   vollen Puffer und wurde verworfen: das Zuruecklesen war stillschweigend
+ *   tot, bis der C6 neu startete. Von aussen sah es aus wie "Befehl kommt
+ *   nicht an" – MQTT zeigte weiter den angenommenen Zustand.
+ *   Jetzt bekommt jede Anfrage einen eigenen Slot, dessen Index als Parameter
+ *   in den Alarm geht. Kein gemeinsamer Zeiger, nichts kann sich verheddern;
+ *   geht ein Alarm verloren, fehlt genau eine Antwort. */
+#define RD_SLOTS 8
+
+static uint16_t s_rd_attr[1] = { ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID };
+static struct {
+    uint16_t addr;
+    uint8_t  ep;
+    volatile bool busy;          /* true = Alarm laeuft noch */
+} s_rd_slots[RD_SLOTS];
+
+static void read_onoff_send(uint8_t slot) {
+    if (slot >= RD_SLOTS) return;
+
+    uint16_t addr = s_rd_slots[slot].addr;
+    uint8_t  ep   = s_rd_slots[slot].ep;
+    s_rd_slots[slot].busy = false;      /* Slot sofort freigeben */
+
+    if (addr == 0xFFFF) return;
+
+    esp_zb_zcl_read_attr_cmd_t req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u   = { .addr_short = addr },
+            .dst_endpoint = ep,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID    = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        .attr_number  = 1,
+        .attr_field   = s_rd_attr,
+    };
+    esp_zb_zcl_read_attr_cmd_req(&req);
+}
+
+void zb_gateway_read_onoff(uint16_t addr, uint8_t ep) {
+    if (addr == 0x0000 || addr == 0xFFFF || ep == 0) return;
+
+    for (uint8_t i = 0; i < RD_SLOTS; i++) {
+        if (s_rd_slots[i].busy) continue;
+        s_rd_slots[i].addr = addr;
+        s_rd_slots[i].ep   = ep;
+        s_rd_slots[i].busy = true;
+        /* 45 ms Versatz je Slot: die Antworten kommen dann einzeln zurueck
+         * und nicht als Burst im Callback. */
+        esp_zb_scheduler_alarm(read_onoff_send, i, (uint32_t)(10 + i * 45));
+        return;
+    }
+    ESP_LOGW(TAG, "read_onoff: alle %d Slots belegt – Anfrage verworfen", RD_SLOTS);
 }
 
 

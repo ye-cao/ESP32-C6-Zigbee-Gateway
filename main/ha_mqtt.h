@@ -25,6 +25,13 @@ void ha_mqtt_set_cmd_cb(mqtt_cmd_cb_t cb);
 void ha_mqtt_publish_zigbee(uint16_t addr,
                              const char *subtopic,
                              const char *payload);
+/* Wie oben, aber mit Quell-Endpoint (Mehrfach-Geräte / Mehrkanal-Schalter).
+ * endpoint <= 1: Topic unverändert "<subtopic>"
+ * endpoint  > 1: Topic wird "<epN>/<subtopic>" (z.B. "ep2/on_off") */
+void ha_mqtt_publish_zigbee_ep(uint16_t addr,
+                               uint8_t endpoint,
+                               const char *subtopic,
+                               const char *payload);
 void ha_mqtt_publish_permit_join(bool open, uint8_t seconds);
 void ha_mqtt_publish_heartbeat(uint32_t uptime_s, uint8_t channel, uint16_t pan_id);
 

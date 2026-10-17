@@ -7,3 +7,22 @@ managed_components/
 *.elf
 *.map
 dependencies.lock
+*.pyc
+
+# Python-Bytecode – nichts davon gehoert ins Repo oder ins Add-on
+__pycache__/
+
+# Klon der Z2M-Converter – nur Eingabe fuer gen_device_db.py
+.zhc/
+
+# Klon von Koenkk/zigbee2mqtt – reine Referenz fuer die MQTT-Schicht (s. Report §19)
+.z2m/
+
+# Lokale Testumgebung (websockets fuer ha_ws.py)
+.mqttenv/
+
+# 项目工作数据（WorkBuddy 记忆/日志）——绝不上传
+.workbuddy/
+
+# HA 长期令牌只落在本地临时文件（ha_addon_log.py / ha_ws.py 读取）
+_ha_token.tmp

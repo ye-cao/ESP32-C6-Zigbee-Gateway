@@ -1,0 +1,62 @@
+abonniert 'gw/coordinator/zigbee/#' – sammle 75.0 s …
+
+[  0.05] gw/coordinator/zigbee/0x07da/ep17/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0x07da/basic
+         {"mfr": "Feibit Inc co.  ", "model": "FB56+ZSW1IKJ2.5"}
+[  0.05] gw/coordinator/zigbee/0x07da/ep18/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0x07da/ep16/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0x07da/join
+         {"event": "joined", "addr": "0x07da", "ieee": "00:12:4b:00:07:6b:f1:70"}
+[  0.05] gw/coordinator/zigbee/0xb2a2/join
+         {"event": "joined", "addr": "0xb2a2", "ieee": "00:12:4b:00:07:65:d4:df"}
+[  0.05] gw/coordinator/zigbee/0xb2a2/basic
+         {"mfr": "Feibit CO.,LTD  ", "model": "FTB56+ZSN18ZY1.1"}
+[  0.05] gw/coordinator/zigbee/0xb2a2/ep2/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0xb2a2/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0xb2a2/ep1/on_off
+         {"v": 1}
+[  0.05] gw/coordinator/zigbee/0x747d/join
+         {"event": "joined", "addr": "0x747d", "ieee": "00:12:4b:00:07:65:d4:df"}
+[  0.05] gw/coordinator/zigbee/0x747d/basic
+         {"mfr": "Feibit CO.,LTD  ", "model": "FTB56+ZSN18ZY1.1"}
+[  0.05] gw/coordinator/zigbee/0x747d/ep2/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0x747d/on_off
+         {"v": 0}
+[  0.05] gw/coordinator/zigbee/0x747d/ep1/on_off
+         {"v": 1}
+[  7.00] gw/coordinator/zigbee/0x07da/ep16/on_off
+         {"v": 1}
+[ 12.56] gw/coordinator/zigbee/0x07da/ep16/on_off
+         {"v": 0}
+[ 18.19] gw/coordinator/zigbee/0x07da/ep17/on_off
+         {"v": 1}
+[ 23.78] gw/coordinator/zigbee/0x07da/ep17/on_off
+         {"v": 0}
+[ 24.56] gw/coordinator/zigbee/0x07da/ep17/on_off
+         {"v": 1}
+[ 25.10] gw/coordinator/zigbee/0x07da/ep17/on_off
+         {"v": 1}
+[ 29.38] gw/coordinator/zigbee/0x07da/ep18/on_off
+         {"v": 1}
+[ 30.19] gw/coordinator/zigbee/0x07da/ep18/on_off
+         {"v": 1}
+[ 35.03] gw/coordinator/zigbee/0x07da/ep18/on_off
+         {"v": 0}
+[ 35.81] gw/coordinator/zigbee/0x07da/ep18/on_off
+         {"v": 0}
+[ 40.66] gw/coordinator/zigbee/0x747d/on_off
+         {"v": 1}
+[ 46.30] gw/coordinator/zigbee/0x747d/on_off
+         {"v": 0}
+[ 51.92] gw/coordinator/zigbee/0x747d/ep2/on_off
+         {"v": 1}
+[ 57.51] gw/coordinator/zigbee/0x747d/ep2/on_off
+         {"v": 0}
+
+29 Nachrichten in 75.0 s

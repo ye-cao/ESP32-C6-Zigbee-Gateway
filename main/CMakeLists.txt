@@ -4,6 +4,7 @@ idf_component_register(
         "ha_mqtt.c"
         "zb_gateway.c"
         "zb_ota_server.c"
+        "serial_ota.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
