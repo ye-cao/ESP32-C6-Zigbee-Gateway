@@ -29,3 +29,6 @@ __pycache__/
 
 # HA 长期令牌只落在本地临时文件（ha_addon_log.py / ha_ws.py 读取）
 _ha_token.tmp
+
+# 临时日志
+*.log
