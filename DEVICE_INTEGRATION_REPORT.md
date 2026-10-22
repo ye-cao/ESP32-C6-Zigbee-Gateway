@@ -2420,3 +2420,22 @@ test_mqtt 35/35、test_panel 55/55、test_ha_state、test_packaging 全过
    = 已重建网络，必须重新配对
 
 回退路径：`git revert` 本次提交 + `idf.py build`，旧的 `firmware/*.bin` 仍在仓库里。
+
+#### 23.6.1 实测结论（2026-10-22，已上机）
+
+- **OTA 成功**：应用层串口 OTA（`fw_ota_start/data/end`）写入 652 080 B，`done` 只在
+  `esp_ota_end()` + `esp_ota_set_boot_partition()` 均返回 ESP_OK 后才上报，随后自重启。
+- **NVRAM 不兼容，已证实**：设备重启后走的是 `Erster Start – Netzwerk wird gebildet`，
+  开关与情景开关**全部重新配对**才恢复 —— 即上面第 3 条的第二种结果。
+  ⇒ 跨大版本（1.0.9 → 1.6.x）升级的代价就是一次全网重配，升级前必须留出时间窗。
+- **升级后不会再重配**：重建之后的 NVRAM 已是 1.6 格式，后续同大版本内的 OTA 不受影响。
+- ⚠️ **上面第 3 条判据在实践中读不到**：`main/ha_mqtt.c:269` 在 `ha_mqtt_init()` 里
+  `esp_log_set_vprintf(null_vprintf)` 把整个 ESP_LOG 静音，且 `sdkconfig` 用
+  `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` / `CONFIG_ESP_CONSOLE_UART_NUM=-1`，
+  所以 `Netzgröße…` / `Neustart – Netzwerk wiederhergestellt` 这类日志**既不到 UART 也不到 USB**。
+  UART/USB 上只有 `emit()` 的纯 JSON（`{"t":"boot"}` / `heartbeat` / `zigbee` / …）。
+- ⇒ 实际可用的判据只有两条：
+  1. `[C6] boot` 出现 + 心跳 `uptime` 归零 → 设备重启成功、新镜像在跑；
+  2. PAN ID 是否变化、设备表是否清空 → 判断 NVRAM 兼容性（重建则 PAN 变、表清空）。
+  心跳里没有版本字段，因此无法从 host 侧直接读出"跑的是哪个固件版本"。
+  （改进项：在 `ha_mqtt.c:275` 的 boot 消息里加 `"fw":"sdk1.6.8","cap":64`。）

@@ -59,9 +59,13 @@ idf.py -p <COM口> flash
 | `firmware/zigbee-vital-sensor-sdk16.bin` | **当前版本**：esp-zigbee-lib 1.6.8 / 64 设备 / 设备表 NVS 持久化 |
 | `firmware/zigbee-vital-sensor-txpower.bin` | 旧栈（1.0.9）镜像，留作回退 |
 
-> ⚠️ 从旧栈升级到 SDK 1.6 时，NVRAM 数据集可能不兼容 —— 若首条日志是
-> `Erster Start – Netzwerk wird gebildet` 而非 `Neustart – Netzwerk wiederhergestellt`，
-> 说明网络被重建，设备需要重新配对（详见 `DEVICE_INTEGRATION_REPORT.md` §23.6）。
+> ⚠️ **从旧栈（1.0.9）升级到 SDK 1.6 会重建网络，设备必须重新配对一次** —— 已实测确认
+> （2026-10-22）：1.6 的 ZBOSS 不认旧 NVRAM 数据集。重建之后的 NVRAM 即为 1.6 格式，
+> 后续同大版本内的 OTA 不再需要重配。细节见 `DEVICE_INTEGRATION_REPORT.md` §23.6。
+>
+> 另：运行期 ESP_LOG 被静音（`ha_mqtt.c` 的 `null_vprintf` + console 走 USB-JTAG），
+> 所以 `Netzgröße…` / `Neustart – Netzwerk wiederhergestellt` 这类日志在 UART/USB 上
+> 都看不到；判断是否重启成功看 `[C6] boot` 与心跳 `uptime` 归零，判断网络是否重建看 PAN ID。
 终端节点固件在 `client/`（`idf.py build` 编译）。
 
 ### 2. 安装 HAOS Add-on
