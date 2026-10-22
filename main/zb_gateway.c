@@ -29,7 +29,12 @@
 #define ZB_ENDPOINT 1
 
 /* ── Gerätedatenbank (nur Adress-Tracking, kein Name) ───────────────────── */
-#define MAX_DEVICES 32
+/* Netzgröße = Tabellengröße. esp_zb_overall_network_size_set() (SDK ≥1.2.2)
+ * dimensioniert Nachbar- und Routing-Tabelle der ZBOSS-Stack-Lib auf diesen
+ * Wert; Default ist 64, vorher waren hier hart 32 verdrahtet – mehr ließ die
+ * Bibliothek (1.0.9, feste Tabellen) gar nicht zu. MUSS vor esp_zb_init()
+ * gesetzt werden, danach ist es wirkungslos. */
+#define MAX_DEVICES ZB_GATEWAY_MAX_DEVICES
 typedef struct {
     uint16_t short_addr;
     uint8_t  ieee[8];
@@ -60,6 +65,71 @@ static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
     }
     ESP_LOGW(TAG, "Gerätedatenbank voll (max %d)", MAX_DEVICES);
     return NULL;
+}
+
+/* ── Persistenz der Gerätetabelle ─────────────────────────────────────────
+ * ZBOSS legt Netzwerkschlüssel, PAN, Kanal und die Adresstabelle selbst im
+ * NVRAM ab (Partition zb_storage) und setzt das Netz beim Boot fort, solange
+ * niemand nvram_erase_at_start setzt. Unsere eigene Tabelle (Kurzadresse +
+ * IEEE für LQI-Snapshot und Interview) war dagegen reiner RAM: nach einem
+ * Neustart war sie leer, bis jedes Gerät erneut einen Device-Announce
+ * schickte – schlafende Endgeräte brauchen dafür Stunden.
+ * Deshalb hier eine kleine NVS-Kopie. interviewed wird beim Laden bewusst
+ * auf false gesetzt: das Interview läuft erst, wenn das Gerät wieder
+ * antwortet, sonst würden Bind/Reporting ins Leere gehen. */
+#define DEVTAB_MAGIC   0x44425531u   /* 'DBU1' */
+#define DEVTAB_KEY     "devtab"
+
+typedef struct {
+    uint32_t magic;
+    uint8_t  count;
+    struct { uint16_t addr; uint8_t ieee[8]; } e[MAX_DEVICES];
+} __attribute__((packed)) devtab_blob_t;
+
+/* Statisch, nicht auf dem Stack: Aufruf erfolgt im ZB-Task, aber die
+ * Stack-Budget-Regel dieses Projekts gilt einheitlich (s. LQI-Puffer). */
+static devtab_blob_t s_devtab;
+
+static void devtab_save(void) {
+    nvs_handle_t h;
+    if (nvs_open(ZB_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    s_devtab.magic = DEVTAB_MAGIC;
+    s_devtab.count = 0;
+    xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        /* IEEE 0 ist "noch nicht aufgelöst" – solche Einträge bringen nach
+         * dem Neustart nichts, weil ohne IEEE kein Interview möglich ist. */
+        if (!s_devices[i].used || s_devices[i].ieee[0] == 0) continue;
+        s_devtab.e[s_devtab.count].addr = s_devices[i].short_addr;
+        memcpy(s_devtab.e[s_devtab.count].ieee, s_devices[i].ieee, 8);
+        if (++s_devtab.count >= MAX_DEVICES) break;
+    }
+    xSemaphoreGive(s_dev_mutex);
+    nvs_set_blob(h, DEVTAB_KEY, &s_devtab, sizeof(s_devtab));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void devtab_load(void) {
+    nvs_handle_t h;
+    size_t len = sizeof(s_devtab);
+    if (nvs_open(ZB_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    esp_err_t err = nvs_get_blob(h, DEVTAB_KEY, &s_devtab, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len < sizeof(uint32_t) + 1 ||
+        s_devtab.magic != DEVTAB_MAGIC) return;
+
+    int n = 0;
+    for (int i = 0; i < s_devtab.count && i < MAX_DEVICES; i++) {
+        memset(&s_devices[i], 0, sizeof(s_devices[i]));
+        s_devices[i].used        = true;
+        s_devices[i].short_addr  = s_devtab.e[i].addr;
+        memcpy(s_devices[i].ieee, s_devtab.e[i].ieee, 8);
+        s_devices[i].interviewed = false;
+        n++;
+    }
+    ESP_LOGI(TAG, "%d Geräte aus NVS wiederhergestellt "
+                  "(Interview folgt, sobald sie sich melden)", n);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
@@ -497,19 +567,22 @@ static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n) {
  * danach starten. Rate-Limit: maximal 1 Request pro 30 s im ganzen Netz. */
 static TickType_t s_ieee_last_tick = 0;
 
+/* SDK ≥1.6.0 hat den Callback-Typ neu definiert: die Antwort kommt als
+ * esp_zb_zdo_ieee_addr_rsp_t* statt als rohes ieee_addr-Array. */
 static void ieee_resolved_cb(esp_zb_zdp_status_t zdo_status,
-                             esp_zb_ieee_addr_t ieee_addr, void *user_ctx) {
+                             esp_zb_zdo_ieee_addr_rsp_t *resp, void *user_ctx) {
     uint16_t addr = (uint16_t)(uintptr_t)user_ctx;
-    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS) {
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || resp == NULL) {
         ESP_LOGW(TAG, "IEEE-Request 0x%04x fehlgeschlagen (0x%02x)", addr, zdo_status);
         return;
     }
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
-    zb_device_t *d = find_or_add(addr, ieee_addr);
+    zb_device_t *d = find_or_add(addr, resp->ieee_addr);
     bool need = d && !d->interviewed;
     xSemaphoreGive(s_dev_mutex);
     ESP_LOGI(TAG, "IEEE 0x%04x aufgelöst → Interview%s", addr, need ? "" : " (schon erfolgt)");
-    if (need) interview_start(addr, ieee_addr);
+    if (d) devtab_save();
+    if (need) interview_start(addr, resp->ieee_addr);
 }
 
 static void request_ieee(uint16_t addr) {
@@ -850,6 +923,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         uint8_t dev_ieee[8] = { 0 };
         if (dev) memcpy(dev_ieee, p->ieee_addr, 8);
         xSemaphoreGive(s_dev_mutex);
+        /* Neu aufgenommene bzw. migrierte Adresse sofort sichern, damit ein
+         * Neustart die Tabelle nicht wieder verliert. */
+        if (dev) devtab_save();
 
         /* IEEE-Adresse als String */
         char ieee_str[24] = "?";
@@ -904,6 +980,21 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                      (unsigned)p->short_addr, p->short_addr, ieee_str,
                      (unsigned)p->rejoin, ieee_str);
             ha_mqtt_emit_raw(line);
+
+            /* Endgültiges Leave (rejoin=0): Eintrag aus der Tabelle und aus
+             * der NVS-Kopie entfernen. Bei rejoin=1 bleibt er stehen – das
+             * Gerät kommt mit neuer Kurzadresse zurück (ANNCE migriert). */
+            if (!p->rejoin) {
+                xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+                for (int i = 0; i < MAX_DEVICES; i++) {
+                    if (s_devices[i].used &&
+                        memcmp(s_devices[i].ieee, p->device_addr, 8) == 0) {
+                        memset(&s_devices[i], 0, sizeof(s_devices[i]));
+                    }
+                }
+                xSemaphoreGive(s_dev_mutex);
+                devtab_save();
+            }
         }
         break;
     }
@@ -992,13 +1083,27 @@ static void zb_task(void *arg) {
                                                     : ZB_FALLBACK_CHANNEL;
     ESP_LOGI(TAG, "Zigbee primär Kanal %d, Fallback Kanal %d", ch, fallback);
 
+    /* Tabellen dimensionieren – zwingend VOR esp_zb_init(). */
+    esp_err_t siz = esp_zb_overall_network_size_set(MAX_DEVICES);
+    ESP_LOGI(TAG, "Netzgröße %d Geräte (overall_network_size_set=%s)",
+             MAX_DEVICES, esp_err_to_name(siz));
+
     esp_zb_cfg_t cfg = {
         .esp_zb_role        = ESP_ZB_DEVICE_TYPE_COORDINATOR,
         .install_code_policy = false,
-        .nwk_cfg.zczr_cfg   = { .max_children = MAX_DEVICES },  /* 32 – gekoppelt an Geräte-DB */
+        .nwk_cfg.zczr_cfg   = { .max_children = MAX_DEVICES },
     };
     esp_zb_init(&cfg);
     esp_zb_set_tx_power(20);   /* max TX-Power: 20 dBm */
+
+    /* NVRAM NIE beim Start löschen: dort liegen Netzwerkschlüssel, PAN,
+     * Kanal und die Adresstabelle. Genau das hält die Pairings über einen
+     * Neustart – wer hier true setzt, verliert bei jedem Boot das Netz. */
+    esp_zb_nvram_erase_at_start(false);
+
+    /* Eigene Gerätetabelle aus der NVS-Kopie ergänzen, damit LQI-Snapshot
+     * und Keep-Alive die Geräte schon vor ihrem ersten Announce kennen. */
+    devtab_load();
 
     /* Endpoint manuell aufbauen: Basic + Identify + OTA-Server */
     esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
@@ -1077,8 +1182,14 @@ static void zb_task(void *arg) {
     esp_zb_cluster_list_add_custom_cluster(cl, sw_attr, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
     esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
-    esp_zb_ep_list_add_ep(ep, cl, ZB_ENDPOINT,
-        ESP_ZB_AF_HA_PROFILE_ID, ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID);
+    /* SDK ≥1.2.0: Endpunkt-Konfiguration als Struct statt Einzelparameter */
+    esp_zb_endpoint_config_t ep_cfg = {
+        .endpoint           = ZB_ENDPOINT,
+        .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id      = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep, cl, ep_cfg);
 
     /* EP 0x0B (11) – Spiegelpunkt für Feibit FB56/ZSW1x (3A Nue HGZB-043):
      * diese Schalter senden ihre On/Off-Attribut-Reports an die
@@ -1096,8 +1207,13 @@ static void zb_task(void *arg) {
         esp_zb_cluster_list_add_on_off_cluster(cl_b,
             esp_zb_on_off_cluster_create(&on_off_srv_cfg),
             ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-        esp_zb_ep_list_add_ep(ep, cl_b, 11,
-            ESP_ZB_AF_HA_PROFILE_ID, ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID);
+        esp_zb_endpoint_config_t ep_b_cfg = {
+            .endpoint           = 11,
+            .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
+            .app_device_id      = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
+            .app_device_version = 0,
+        };
+        esp_zb_ep_list_add_ep(ep, cl_b, ep_b_cfg);
     }
 
     esp_zb_device_register(ep);
@@ -1118,7 +1234,7 @@ static void zb_task(void *arg) {
     esp_zb_secur_link_key_exchange_required_set(false);
 
     ESP_ERROR_CHECK(esp_zb_start(false));
-    esp_zb_main_loop_iteration();
+    esp_zb_stack_main_loop();   /* SDK ≥1.5.0: ersetzt esp_zb_main_loop_iteration() */
 }
 
 /* ── Öffentliche API ────────────────────────────────────────────────────── */
@@ -1127,8 +1243,9 @@ void zb_gateway_start(void) {
     s_dev_mutex = xSemaphoreCreateMutex();
 
     esp_zb_platform_config_t pcfg = {
-        .radio_config = { .radio_mode = RADIO_MODE_NATIVE },
-        .host_config  = { .host_connection_mode = HOST_CONNECTION_MODE_NONE },
+        /* SDK ≥1.3.0: Enums mit ZB_-Präfix (vorher RADIO_MODE_NATIVE) */
+        .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
+        .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&pcfg));
     xTaskCreate(zb_task, "zb_main", 8192, NULL, 5, NULL);
@@ -1294,9 +1411,9 @@ int8_t zb_gateway_get_last_rssi(void) { return s_last_rssi; }
  * ersten Aufruf des Befehls. Der Heartbeat-Task darf es sich leisten (8192 B),
  * dieser hier nicht.
  *
- * Größe: 32 Geräte à maximal 41 Zeichen ("addr","lqi","rssi" + Komma) ≈ 1312 B
- * plus Umschlag. Herzschlag und Abfrage teilen dieselbe Untergrenze. */
-#define LQI_JSON_MAX  1536
+ * Größe: MAX_DEVICES Geräte à maximal ~41 Zeichen ("addr","lqi","rssi" +
+ * Komma), 48 als runde Obergrenze je Eintrag plus Umschlag. */
+#define LQI_JSON_MAX  (MAX_DEVICES * 48 + 128)
 #define LQI_LINE_MAX  (LQI_JSON_MAX + 64)
 void zb_gateway_report_lqi(void) {
     static char buf[LQI_JSON_MAX];

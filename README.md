@@ -20,7 +20,7 @@ Zigbee 设备 ──802.15.4──► ESP32-C6（协调器, main/）
 
 | 路径 | 说明 |
 |---|---|
-| `main/` | 协调器固件（ESP-IDF v5.5.x / ESP32-C6）：设备数据转发、运行时发射功率调节、LQI/RSSI 快照、串口 OTA |
+| `main/` | 协调器固件（ESP-IDF v5.5.1 / ESP32-C6，esp-zigbee-lib 1.6.8）：64 设备容量、配对信息跨重启保持、运行时发射功率调节、LQI/RSSI 快照、串口 OTA |
 | `client/` | 自研 Zigbee 终端节点固件（OnOff + 温度 + OTA client） |
 | `host/addon/esp32c6_gateway/` | **主线网关（HAOS Add-on）**：HA MQTT 自动发现、情景面板按键事件、设备型号库（4 882 型号）、发现去重与孤儿清理、Web 面板 |
 | `host/serial_gateway.py` | 旧版宿主机网关（systemd 路径），保留作对照 |
@@ -28,6 +28,9 @@ Zigbee 设备 ──802.15.4──► ESP32-C6（协调器, main/）
 
 ## 核心功能
 
+- **大容量与配对保持**：网络规模 64 设备（`esp_zb_overall_network_size_set` 扩表 +
+  `max_children` 同步），NVRAM 永不在启动时清除，网络密钥/PAN/信道/地址表跨重启
+  延续；自有设备表 {短址, IEEE} 也落 NVS，重启后 LQI/命令无需等设备重新播报
 - **HA MQTT 自动发现**：switch / event / sensor 实体自动生成；情景面板（genScenes
   / genOnOff 按键上报）自动识别为 event 实体，真开关与纯面板靠 Simple-Descriptor
   簇方向 + Read-Attributes 应答自动判定

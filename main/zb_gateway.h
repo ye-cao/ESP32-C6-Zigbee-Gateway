@@ -2,6 +2,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Maximale Gerätezahl = Netzgröße. Dieser Wert dimensioniert die ZBOSS-
+ * Tabellen (esp_zb_overall_network_size_set) und die eigene Geräte-DB.
+ * Puffer in main.c leiten ihre Größe davon ab – nicht unabhängig hochsetzen. */
+#define ZB_GATEWAY_MAX_DEVICES 64
+
 /* Zigbee-Koordinator starten */
 void zb_gateway_start(void);
 

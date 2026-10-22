@@ -114,8 +114,10 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
 #define HEARTBEAT_INTERVAL_MS 60000
 
 static void heartbeat_task(void *arg) {
-    char lqi_buf[2048];   /* max. 32 Geräte à ~40 B + Reserve */
-    char line[2048 + 192]; /* Heartbeat-JSON inkl. lqi_buf + Overhead (-Wformat-truncation) */
+    /* Größe folgt ZB_GATEWAY_MAX_DEVICES (48 B je Gerät + Umschlag) – sonst
+     * wird die LQI-Liste ab ~32 Geräten abgeschnitten. */
+    char lqi_buf[ZB_GATEWAY_MAX_DEVICES * 48 + 128];
+    char line[sizeof(lqi_buf) + 192]; /* Heartbeat-JSON inkl. lqi_buf + Overhead */
     vTaskDelay(pdMS_TO_TICKS(5000));  /* Zigbee Startup abwarten */
     while (1) {
         uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
@@ -169,5 +171,6 @@ void app_main(void) {
     zb_gateway_start();
 
     xTaskCreate(btn_task,       "btn",       2048, NULL, 3, NULL);
-    xTaskCreate(heartbeat_task, "heartbeat", 8192, NULL, 2, NULL);  /* lqi_buf+line = 4,3 KB Stack */
+    /* Stack: lqi_buf + line ≈ 6,6 KB bei 64 Geräten, plus snprintf/MQTT-Puffer */
+    xTaskCreate(heartbeat_task, "heartbeat", 12288, NULL, 2, NULL);
 }

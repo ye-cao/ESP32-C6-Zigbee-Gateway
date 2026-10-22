@@ -18,6 +18,9 @@ __pycache__/
 # Klon von Koenkk/zigbee2mqtt – reine Referenz fuer die MQTT-Schicht (s. Report §19)
 .z2m/
 
+# Klon von tostmann/esp-coordinator – Referenz fuer Kapazitaet/NVRAM (s. Report §23)
+.tostmann/
+
 # Lokale Testumgebung (websockets fuer ha_ws.py)
 .mqttenv/
 

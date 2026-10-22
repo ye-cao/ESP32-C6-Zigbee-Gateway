@@ -2284,3 +2284,139 @@ def _action_payload(act):
 `test_panel.py` 断言全部改为 JSON payload（55/55 仍过）；13 个测试文件全 exit=0。
 部署：**只需重建 add-on 到 v1.2.6**（纯 add-on 改动，固件没动）。
 重建后按一下按键 → 卡片状态应变成时间戳、日志簿出现触发记录。
+
+---
+
+## 二十三、容量与配对保持：对照 tostmann/esp-coordinator 重构到 SDK 1.6（2026-10-22）
+
+### 23.1 上游到底靠什么做到 200 节点
+
+源码出处：`tostmann/esp-coordinator` `master`（浅克隆在 `.tostmann/`）。
+关键只有三处，全部在 `main/zb_ncp.cpp`：
+
+```cpp
+// zb_ncp.h
+static constexpr uint16_t OVERALL_NETWORK_SIZE = 200;
+
+// init_int()
+zb_config_overall_network_size(OVERALL_NETWORK_SIZE); // 必须先于 ZB_INIT 扩表
+ZB_INIT();
+zb_set_max_children(OVERALL_NETWORK_SIZE);
+zb_set_nvram_erase_at_start(0);   // ★ 永不清 NVRAM
+```
+
+`zb_config_overall_network_size()` 在 `ZB_INIT()` **之前**把 ZBOSS 的邻居表 /
+路由表 / 地址表一起放大——只改 `max_children` 是没用的，表本身还是 32 条，
+超了会撞 `zb_address.c:395` 的表耗尽断言。上游在 `SET_MAX_CHILDREN` 命令里
+也做了同样防护：host 传的值大于 `OVERALL_NETWORK_SIZE` 直接返回
+`GENERIC_INVALID_PARAMETER_1`。
+
+### 23.2 配对信息保持的三层机制（上游）
+
+1. **NVRAM 不清**：`zb_set_nvram_erase_at_start(0)`。网络密钥、PAN、ExtPAN、
+   信道、帧计数器、地址表都在 `zb_storage` 分区里，启动时整包载入 → 设备不需要重配。
+2. **冷启动时序**：`NCP_RESET` 的应答**不能**在 `app::start_int()` 里立刻发。
+   ZBOSS 的 NVRAM 载入是在专用任务里跑的，早发的应答会让 host 读到默认值
+   `0xFFFF/0xFF`，host 以为"配置与设备网络不一致" → 调 `formNetwork()` →
+   **把已配对设备全部抹掉**（上游 issue #5 / #19、z2m#26152）。修法是等
+   `ZB_ZDO_SIGNAL_SKIP_STARTUP`（此刻数据集保证已载入）再发 boot-ready 帧。
+3. **结构化备份**：`GET/RESTORE_STRUCTURED_BACKUP`（0x009B/0x009C），
+   `backup_structured.h` 定义 `'ZBSB'` TLV：PAN、ExtPAN、Channel、UpdateID、
+   Coord IEEE、NWK Key + Seq、帧计数器、设备表（16 B/设备：IEEE+短址+关系+
+   类型+深度+LQI）。换芯片时整包搬到新板子，设备无需重配。
+
+另外还有一个独立组件：`boot_guard.h` —— RTC 面包屑数"启动后没走到 SKIP_STARTUP"
+的次数，30 s 死线强转重启，连续 3 次进 safe mode（栈不启动，只应答少数命令），
+避免"哑砖"只能返厂重刷。
+
+### 23.3 我们原来的差距（诊断）
+
+| 项 | 上游 | 我们（改前） |
+|---|---|---|
+| 容量 | 200，表随之扩 | **32 写死**；SDK 1.0.9 的 `zb_config.h` 里 `ZB_NEIGHBOR_TABLE_SIZE 32U`，且 ZBOSS 是**预编译 .a**，改宏只会造成 ABI 不一致 |
+| 扩容 API | `zb_config_overall_network_size()` | 1.0.9 库里**没有这个符号**（`nm` 验证过），`esp_zb_overall_network_size_set()` 到 1.2.2 才进 SDK |
+| 配对保持 | NVRAM + 冷启动时序 + 备份 | 默认不清 NVRAM（能保持），但**没有显式声明**，也没有备份/恢复手段 |
+| 自己的设备表 | 结构化备份含设备表 | `s_devices[]` **纯 RAM**：重启后要等设备发 Device-Announce；睡眠端设备可能几小时都不出现 → LQI 快照/Keep-Alive 空窗 |
+
+### 23.4 本次改法
+
+**① 升级运行时库**（`main/idf_component.yml`）
+`esp-zigbee-lib 1.0.9 → 1.6.8`、`esp-zboss-lib 1.0.9 → 1.6.4`。
+版本组合不是随便挑的：`esp-zboss-lib` **最高只有 1.6.4**（1.6.8 会版本求解失败）；
+1.6.8 基于 IDF **v5.5.1**，与本机一致（2.0.x 要 5.5.4，用不了）。
+
+**② API 迁移（编译期暴露的全部变更点，4 处）**
+
+| 变更 | 版本 | 处理 |
+|---|---|---|
+| `esp_zb_ep_list_add_ep()` 改结构体参数 | 1.2.0 | 两处调用改 `esp_zb_endpoint_config_t` |
+| `RADIO_MODE_NATIVE` / `HOST_CONNECTION_MODE_NONE` 加 `ZB_` 前缀 | 1.3.0 | 改 `ZB_RADIO_MODE_NATIVE` / `ZB_HOST_CONNECTION_MODE_NONE` |
+| `esp_zb_zdo_ieee_addr_req` 回调改 `(status, resp*, ctx)` | 1.6.0 | `ieee_resolved_cb` 改用 `resp->ieee_addr` |
+| `esp_zb_main_loop_iteration()` 弃用 | 1.5.0 | 改 `esp_zb_stack_main_loop()` |
+
+**③ 容量：单点定义 + 表随之扩**（`zb_gateway.h` / `zb_gateway.c`）
+
+```c
+#define ZB_GATEWAY_MAX_DEVICES 64          // 头文件，唯一真源
+...
+esp_zb_overall_network_size_set(MAX_DEVICES);  // 必须在 esp_zb_init() 之前
+esp_zb_cfg_t cfg = { .nwk_cfg.zczr_cfg = { .max_children = MAX_DEVICES } };
+```
+
+所有缓冲从该宏派生，避免"改一个忘另一个"：
+`LQI_JSON_MAX = MAX_DEVICES*48 + 128`、heartbeat 的 `lqi_buf/line` 同源，
+heartbeat 任务栈 8192 → 12288（64 设备时两个缓冲合计约 6.6 KB）。
+
+> 为什么选 64 而不是 200：64 是 SDK 缺省的网规尺寸，我们现场设备数只有个位数；
+> 200 要多付约 12 KB .bss + 每 60 s 一条 ~10 KB 的 LQI 报文。
+> 真需要 200，只改 `ZB_GATEWAY_MAX_DEVICES` 一个数（缓冲会自动跟上），
+> 但 heartbeat 栈要再核一遍。
+
+**④ 配对保持：显式 NVRAM 语义 + 设备表落 NVS**
+
+```c
+esp_zb_nvram_erase_at_start(false);  // 显式写出来，不再是"碰巧默认如此"
+devtab_load();                        // 从 NVS 取回 {短址, IEEE}
+```
+
+`devtab`（namespace `zb_gw`，key `devtab`，`DEVTAB_MAGIC` + count + 64×10 B
+≈ 645 B blob）：
+
+- **存**：Device-Announce 新增/迁移地址后、IEEE 解析成功后
+- **清**：收到 `LEAVE_INDICATION` 且 `rejoin=0`（`rejoin=1` 是换地址回来，保留）
+- **载**：启动时载入，`interviewed` 一律置 false —— 不假装已面试，
+  等设备真的应答再走 Bind/Reporting，否则只会发空请求
+
+这样重启后 LQI 快照与 Keep-Alive 立刻能看到已知设备，不必等它们播报；
+设备换了短地址时，ANNCE 的 IEEE 迁移逻辑照旧生效。
+
+**⑤ 明确对齐、但本次不做**（列出来避免以后重复讨论）
+
+- 结构化备份/恢复（换芯片免重配）：需要在 JSON 串口协议里新增两条命令，
+  且 add-on 侧要有存储入口，改动面比本次大，单独做
+- boot_guard 类保护：我们不是 NCP，启动时序简单，暂不需要
+- 200 节点：见上，一个宏的事
+
+### 23.5 验证
+
+```text
+idf.py build → EXIT=0，无 warning（main/ 五个源文件全部干净）
+镜像 652 080 B（旧版 792 880 B；新栈更小，app 分区 1.75 MB 仍充裕）
+DRAM 109 454 / 452 112 B 空闲（24.2%），.bss 36 264 B
+test_mqtt 35/35、test_panel 55/55、test_ha_state、test_packaging 全过
+```
+
+### 23.6 ⚠️ 部署风险（刷机前必读）
+
+**ZBOSS 运行时库跨大版本（1.0.9 → 1.6.4），NVRAM 数据集格式不保证兼容。**
+若新版不认旧数据集，表现是启动后 `esp_zb_bdb_is_factory_new() == true` →
+固件按原逻辑重建网络 → **所有设备丢失配对，需要重新入网**。
+
+因此刷机前请：
+1. 先确认 add-on 的 `/data/ha_nodes.json` 有备份（设备名/属性还在，重配后能对上号）
+2. 选一个方便重新配对的时间窗（面板开关要逐个按键入网）
+3. 刷完后看串口/日志第一条：出现 `Neustart – Netzwerk wiederhergestellt`
+   = 数据集兼容，设备不用动；出现 `Erster Start – Netzwerk wird gebildet`
+   = 已重建网络，必须重新配对
+
+回退路径：`git revert` 本次提交 + `idf.py build`，旧的 `firmware/*.bin` 仍在仓库里。
