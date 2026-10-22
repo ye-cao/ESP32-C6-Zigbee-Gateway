@@ -52,7 +52,16 @@ idf.py build
 idf.py -p <COM口> flash
 ```
 
-预编译镜像在 `firmware/zigbee-vital-sensor-txpower.bin`（可用 `esptool` 或 Web OTA）。
+预编译镜像（可用 `esptool` 或 Web OTA）：
+
+| 文件 | 说明 |
+|---|---|
+| `firmware/zigbee-vital-sensor-sdk16.bin` | **当前版本**：esp-zigbee-lib 1.6.8 / 64 设备 / 设备表 NVS 持久化 |
+| `firmware/zigbee-vital-sensor-txpower.bin` | 旧栈（1.0.9）镜像，留作回退 |
+
+> ⚠️ 从旧栈升级到 SDK 1.6 时，NVRAM 数据集可能不兼容 —— 若首条日志是
+> `Erster Start – Netzwerk wird gebildet` 而非 `Neustart – Netzwerk wiederhergestellt`，
+> 说明网络被重建，设备需要重新配对（详见 `DEVICE_INTEGRATION_REPORT.md` §23.6）。
 终端节点固件在 `client/`（`idf.py build` 编译）。
 
 ### 2. 安装 HAOS Add-on
