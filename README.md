@@ -58,6 +58,7 @@ idf.py -p <COM口> flash
 |---|---|
 | `firmware/zigbee-vital-sensor-sdk16.bin` | **当前版本**：esp-zigbee-lib 1.6.8 / 64 设备 / 设备表 NVS 持久化 |
 | `firmware/zigbee-vital-sensor-txpower.bin` | 旧栈（1.0.9）镜像，留作回退 |
+| `firmware/zigbee-repeater.bin` | 中继器（纯 Router）镜像，见 §1b |
 
 > ⚠️ **从旧栈（1.0.9）升级到 SDK 1.6 会重建网络，设备必须重新配对一次** —— 已实测确认
 > （2026-10-22）：1.6 的 ZBOSS 不认旧 NVRAM 数据集。重建之后的 NVRAM 即为 1.6 格式，
@@ -67,6 +68,34 @@ idf.py -p <COM口> flash
 > 所以 `Netzgröße…` / `Neustart – Netzwerk wiederhergestellt` 这类日志在 UART/USB 上
 > 都看不到；判断是否重启成功看 `[C6] boot` 与心跳 `uptime` 归零，判断网络是否重建看 PAN ID。
 终端节点固件在 `client/`（`idf.py build` 编译）。
+
+### 1b. 中继器固件（可选，扩展覆盖）
+
+`router/` 是一份**纯 Zigbee Router** 固件：常电 ESP32-C6 加入现有网络后只转发报文。
+只注册 Basic + Identify 两个簇、不挂任何业务端点，所以 HA 里**不会多出虚假的开关/温度实体**。
+
+```bash
+cd router
+idf.py build
+idf.py -p <COM口> flash
+```
+
+预编译镜像：`firmware/zigbee-repeater.bin`（569 KB，2026-10-25）
+
+| 操作 | 说明 |
+|---|---|
+| 上电 | 自动寻找网络；协调器需处于允许入网状态（网页 `permit_join`，或按网关 BOOT 键开 180 s 窗口） |
+| 短按 BOOT（GPIO9） | 再试一次入网 |
+| 长按 BOOT 5 秒 | 恢复出厂（退网 + 清 NVRAM），用于换网络 |
+
+⚠️ 两条硬约束：
+
+1. **必须常电**。一旦进入休眠省电，它就从 Router 退化成终端设备，不再转发。
+2. **发射功率**写在 `router/main/repeater.c:40` 的 `TX_POWER_DBM`，当前 **8 dBm**。
+   实测 20 dBm 时本项目的板子/线材会触发 Brownout 复位
+   （`E BOD: Brownout detector was triggered`，射频启动瞬间掉电重启）；
+   换到主板后置 USB 口 + 粗线后可改回 20，编译烧录约 2 分钟（增量）。
+   覆盖范围主要取决于**摆放位置**，功率不是唯一因素。
 
 ### 2. 安装 HAOS Add-on
 

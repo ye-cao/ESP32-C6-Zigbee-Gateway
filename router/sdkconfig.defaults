@@ -1,0 +1,28 @@
+# ESP32-C6 – reines Zigbee-Router-/Repeater-Firmware-Image
+#
+# Nur weiterleiten, keine Anwendungsdaten. Bewusst ohne WiFi, ohne MQTT,
+# ohne eigene Cluster außer Basic + Identify.
+
+# ── Zigbee ────────────────────────────────────────────────────────────────────
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ROUTER_ROLE=y
+CONFIG_ZB_GP_ENABLED=n
+
+# ── CPU / System ──────────────────────────────────────────────────────────────
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_FREERTOS_HZ=1000
+
+# ── Console → USB Serial JTAG (Logs beim Einrichten, sonst nur Strom) ─────────
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ── Flash / Partition Table ───────────────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ── NVS ───────────────────────────────────────────────────────────────────────
+CONFIG_NVS_ENCRYPTION=n
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
