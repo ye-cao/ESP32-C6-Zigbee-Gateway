@@ -12,25 +12,64 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "ha_mqtt.h"
 
-#define BUF_SIZE    1024
+#define BUF_SIZE    4096
 
 static mqtt_cmd_cb_t     s_cmd_cb   = NULL;
-static SemaphoreHandle_t s_tx_mutex = NULL;
+
+/* ★★★ 2026-10-25: Senden aus dem ZBOSS-Task entkoppeln.
+ *
+ * Vorher hat emit() direkt puts()+fflush() gemacht. Ein 4-KB-JSON (Topologie)
+ * blockiert bei 115200 Baud ~350 ms, der ganze Topo-Dump ~1,4 s – und das
+ * ALLES im ZBOSS-Task. Der MAC-Layer bekommt in der Zeit keine Iteration,
+ * ZBOSS läuft in seine Queues und stirbt:
+ *   Guru Meditation (Load access fault) in zb_mac_logic_iteration /
+ *   zb_sched_loop_iteration, danach rst:0xc (SW_CPU) – also Reboot.
+ * Auch jeder APS-Frame (aps_data_ind_cb) schrieb ~200 B blockierend.
+ *
+ * Jetzt: emit() kopiert die Zeile in ein Heap-Block und legt den Zeiger in
+ * eine Queue (nie blockierend, bei voller Queue wird verworfen und gezählt).
+ * Ein eigener tx_task macht das langsame Schreiben. Der Aufrufer – egal ob
+ * ZBOSS-, rx- oder heartbeat-Task – ist sofort wieder frei. */
+#define TX_Q_DEPTH      16
+static QueueHandle_t     s_tx_q      = NULL;
+static volatile uint32_t s_tx_drop   = 0;
 
 static int null_vprintf(const char *fmt, va_list args) {
     (void)fmt; (void)args;
     return 0;
 }
 
-static void emit(const char *line) {
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
-    puts(line);
-    fflush(stdout);
-    xSemaphoreGive(s_tx_mutex);
+static void tx_task(void *arg) {
+    (void)arg;
+    char *line = NULL;
+    while (1) {
+        if (xQueueReceive(s_tx_q, &line, portMAX_DELAY) != pdTRUE) continue;
+        if (line) {
+            fputs(line, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+            free(line);
+        }
+    }
 }
+
+/* ⚠️ 这个函数会被 ZBOSS-Task 调用 – darf NIEMALS blockieren. */
+static void emit(const char *line) {
+    if (!s_tx_q || !line) return;
+    size_t n = strlen(line) + 1;
+    char *c = malloc(n);
+    if (!c) { s_tx_drop++; return; }
+    memcpy(c, line, n);
+    if (xQueueSend(s_tx_q, &c, 0) != pdTRUE) {
+        free(c);
+        s_tx_drop++;              /* Queue voll: lieber verlieren als blockieren */
+    }
+}
+
 
 /* Liefert einen Zeiger auf den Wert hinter "key" – tolerant gegenüber
  * Leerzeichen nach dem Doppelpunkt. Notwendig, weil json.dumps() (Python)
@@ -191,6 +230,15 @@ static void rx_task(void *arg) {
             s_cmd_cb("set_channel", ch_str, strlen(ch_str));
         } else if (strstr(buf, "scan_chan")) {
             s_cmd_cb("scan_chan", "", 0);
+        } else if (strstr(buf, "topo")) {
+            /* 网络拓扑导出：{"cmd":"topo"} 或 {"cmd":"topo","delay":3000}
+             * delay 为空 ⇒ 立刻 dump 现有表；给了 ⇒ 等这么久再 dump
+             * （add-on 会在等待期间逐台发 node_desc 触发按需路由发现）。
+             * 输出见 main/zb_topo.c。 */
+            char val[12] = "";
+            char *pd = strstr(buf, "\"delay\":");
+            if (pd) snprintf(val, sizeof(val), "%d", atoi(pd + 8));
+            s_cmd_cb("topo", val, strlen(val));
         } else if (strstr(buf, "switch2wifi")) {
             s_cmd_cb("switch2wifi", "", 0);
         } else if (strstr(buf, "set_sleep")) {
@@ -198,6 +246,23 @@ static void rx_task(void *arg) {
             char val[16] = "600";
             if (p) snprintf(val, sizeof(val), "%d", atoi(p + 4));
             s_cmd_cb("set_sleep", val, strlen(val));
+        } else if (strstr(buf, "set_dev_power")) {
+            /* 中继发射功率：{"cmd":"set_dev_power","addr":"0x1234","ep":1,"dbm":14}
+             * payload = "ADDR,EP,DBM" → ZCL 写 0xFC00/0x0001（S8）。
+             * 与 set_tx_power（改网关自己的 PA）是两件事，别混。 */
+            char *pa = strstr(buf, "\"addr\":");
+            char *pe = strstr(buf, "\"ep\":");
+            char *pd = strstr(buf, "\"dbm\":");
+            char payload[32] = "";
+            if (pa) {
+                const char *q = pa + 7;
+                if (*q == '"') q++;
+                unsigned long addr = strtoul(q, NULL, 0);
+                int ep  = pe ? atoi(pe + 5) : 1;
+                int dbm = pd ? atoi(pd + 6) : 8;
+                snprintf(payload, sizeof(payload), "%lu,%d,%d", addr, ep, dbm);
+            }
+            s_cmd_cb("set_dev_power", payload, strlen(payload));
         } else if (strstr(buf, "set_tx_power")) {
             /* Sendeleistung zur Laufzeit: {"cmd":"set_tx_power","dbm":14}
              * payload = "14"  (dBm). Erlaubt, die Leistung ohne Neuflashen
@@ -213,26 +278,60 @@ static void rx_task(void *arg) {
              * unter Umständen längst überholt. */
             s_cmd_cb("lqi", "", 0);
         } else if (strstr(buf, "ota_start")) {
+            /* {"cmd":"ota_start","size":N,"ver":V,"type":0x0002}
+             * type 决定给哪一类设备推固件（0x0001 终端节点 / 0x0002 中继）；
+             * 缺省时固件侧按 0x0001 处理，保持对老 host 端兼容。 */
             char *ps = strstr(buf, "\"size\":");
             char *pv = strstr(buf, "\"ver\":");
-            char payload[32] = "";
+            char *pt = strstr(buf, "\"type\":");
+            char payload[48] = "";
             if (ps) {
                 long sz  = atol(ps + 7);
                 long ver = pv ? atol(pv + 6) : 1;
-                snprintf(payload, sizeof(payload), "%ld,%ld", sz, ver);
+                if (pt) {
+                    const char *q = pt + 7;
+                    if (*q == '"') q++;
+                    unsigned long ty = strtoul(q, NULL, 0);
+                    snprintf(payload, sizeof(payload), "%ld,%ld,%lu", sz, ver, ty);
+                } else {
+                    snprintf(payload, sizeof(payload), "%ld,%ld", sz, ver);
+                }
             }
             s_cmd_cb("ota_start", payload, strlen(payload));
         } else if (strstr(buf, "ota_data")) {
-            char *pd = strstr(buf, "\"data\":\"");
-            if (pd) {
-                pd += 8;
+            /* ★★ json_val statt strstr("\"data\":\"") (2026-10-26).
+             * Der Pi schickt die Blöcke mit json.dumps(), das erzeugt
+             *      {"cmd": "ota_data", "off": 0, "data": "1f8b..."}
+             * – mit Leerzeichen nach dem Doppelpunkt. Das starre Muster
+             * "\"data\":\"" findet darin NICHTS, der Block wurde also
+             * stillschweigend verworfen. Symptom: der Server schickt
+             * brav ota_req, der Pi antwortet brav, der C6 wartet 6 s
+             * und bekommt nie Daten → OTA steht bei 8 / 610976 Bytes,
+             * danach bricht der Client ab und fragt alle 45 s erneut. */
+            /* ★ payload wird "OFF,HEX" – das OFF braucht die Firmware, um den
+             * Block an der richtigen Stelle im Fenster abzulegen. Ohne Offset
+             * wurde stumpf angehängt: eine Wiederholung des Clients (gleicher
+             * Block nochmal) verschob damit alles Folgende, und der Client
+             * schrieb ein still kaputtes Image. */
+            char *pd = (char *)json_val(buf, "\"data\"");
+            const char *po = json_val(buf, "\"off\"");
+            if (pd && po && *pd == '"') {
+                pd++;
                 char *end = strchr(pd, '"');
-                if (end) {
+                if (end && end > pd) {
                     *end = '\0';
-                    uint8_t byte_count = (uint8_t)((end - pd) / 2);
-                    s_cmd_cb("ota_data", pd, byte_count);
+                    static char opayload[BUF_SIZE];
+                    int pre = snprintf(opayload, sizeof(opayload), "%ld,", atol(po));
+                    size_t hexlen = (size_t)(end - pd);
+                    if (pre > 0 && (size_t)pre + hexlen < sizeof(opayload)) {
+                        memcpy(opayload + pre, pd, hexlen);
+                        opayload[pre + hexlen] = '\0';
+                        s_cmd_cb("ota_data", opayload, (int)(pre + hexlen));
+                    }
                 }
             }
+        } else if (strstr(buf, "ota_stop")) {
+            s_cmd_cb("ota_stop", "", 0);
         } else if (strstr(buf, "\"cmd\"")) {
             /* Unbekanntes Kommando NICHT stillschweigend verwerfen.
              * Genau daran sind schon zwei Fehler stumm gestorben:
@@ -262,13 +361,21 @@ esp_err_t ha_mqtt_init(const char *broker_uri,
                        const char *password) {
     (void)broker_uri; (void)username; (void)password;
 
-    s_tx_mutex = xSemaphoreCreateMutex();
-    configASSERT(s_tx_mutex);
+    /* ★★★ 2026-10-25: Sendepfad entkoppeln (siehe Kommentar bei emit()).
+     * Reihenfolge ist wichtig: Queue MUSS vor dem ersten emit() existieren,
+     * sonst wird die Boot-Zeile stillschweigend verworfen. */
+    s_tx_q = xQueueCreate(TX_Q_DEPTH, sizeof(char *));
+    configASSERT(s_tx_q);
+    /* 4096 B reichen: tx_task hält nur einen Zeiger + libc-Puffer. */
+    xTaskCreate(tx_task, "uart_tx", 4096, NULL, 3, NULL);
 
     /* IDF-Log stummschalten – nur unser JSON auf ttyACM1 */
     esp_log_set_vprintf(null_vprintf);
 
-    xTaskCreate(rx_task, "uart_rx", 2048, NULL, 4, NULL);
+    /* ★ 2048 → 4096: rx_task läuft durch on_uart_cmd → zb_gateway_* und
+     * braucht für JSON-Zerlegung + snprintf mehr Luft als der reine
+     * fgets()-Pfad. Stack ist billig, ein Überlauf kostet einen Reboot. */
+    xTaskCreate(rx_task, "uart_rx", 4096, NULL, 4, NULL);
 
     /* Kurz warten bis USB-CDC bereit */
     vTaskDelay(pdMS_TO_TICKS(500));

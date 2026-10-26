@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "ha_mqtt.c"
         "zb_gateway.c"
+        "zb_topo.c"
         "zb_ota_server.c"
         "serial_ota.c"
     INCLUDE_DIRS "."

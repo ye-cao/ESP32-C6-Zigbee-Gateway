@@ -28,6 +28,17 @@
 #define TAG "zb_gw"
 #define ZB_ENDPOINT 1
 
+/* 厂商专有簇 0xFC00（与中继固件的发射功率簇同一个）：
+ *  属性 0x0001 = 中继发射功率 dBm（S8，网关写 → 中继）
+ *  属性 0x0002 = 中继自报的父节点短地址（uint16，中继写 → 网关）
+ * 两个方向走的是同一个簇，便于对照。 */
+#define REP_CLUSTER_INFO   0xFC00
+#define REP_ATTR_TX_POWER  0x0001
+#define REP_ATTR_PARENT    0x0002
+
+/* 中继上报的父节点。0xFFFF = 还没收到过。仅作展示/拓扑用。 */
+static uint16_t s_rep_parent = 0xFFFF;
+
 /* ── Gerätedatenbank (nur Adress-Tracking, kein Name) ───────────────────── */
 /* Netzgröße = Tabellengröße. esp_zb_overall_network_size_set() (SDK ≥1.2.2)
  * dimensioniert Nachbar- und Routing-Tabelle der ZBOSS-Stack-Lib auf diesen
@@ -40,8 +51,9 @@ typedef struct {
     uint8_t  ieee[8];
     bool     used;
     bool     interviewed;   /* Interview (Bind/Reporting) schon durchgeführt */
-    uint8_t  lqi;   /* letzte LQI vom APS-Layer */
+    uint8_t  lqi;   /* letzte LQI vom APS-Layer (0 = noch nie ein gültiger Wert) */
     int8_t   rssi;  /* letzte RSSI vom IEEE 802.15.4 Layer (dBm) */
+    uint32_t lqi_ms; /* wann lqi/rssi zuletzt aktualisiert wurden (ms seit Boot) */
     char     mfr[33];   /* Basic 0x0004 ManufacturerName */
     char     model[33]; /* Basic 0x0005 ModelIdentifier */
 } zb_device_t;
@@ -49,6 +61,11 @@ typedef struct {
 static zb_device_t  s_devices[MAX_DEVICES];
 static SemaphoreHandle_t s_dev_mutex;
 static volatile int8_t  s_last_rssi = 0;
+
+/* Erst true, wenn esp_zb_start() durch ist (siehe zb_task).
+ * Der uart_rx-Task läuft schon vorher → alle öffentlichen Einstiegspunkte
+ * müssen das abfragen, sonst NULL-Deref in ZBOSS. */
+static volatile bool s_zb_ready = false;
 
 static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
     for (int i = 0; i < MAX_DEVICES; i++) {
@@ -711,6 +728,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                  "{\"t\":\"ota_srv_status\",\"addr\":\"0x%04x\",\"status\":\"%s\"}",
                  m->zcl_addr.u.short_addr, st);
         ha_mqtt_emit_raw(line);
+        /* Session ist beendet oder abgebrochen → Nachlade-Task stilllegen,
+         * sonst fragt er weiter Blöcke beim Pi an, die niemand mehr braucht. */
+        if (m->server_status != ESP_ZB_ZCL_OTA_UPGRADE_SERVER_STARTED) {
+            zb_ota_server_stop();
+        }
         ESP_LOGI(TAG, "OTA srv 0x%04x: %s", m->zcl_addr.u.short_addr, st);
         return ESP_OK;
     }
@@ -721,6 +743,29 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
      * aus s_last_aps (wird von aps_data_ind_cb unmittelbar vorher gefüllt). */
     if (callback_id == ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID) {
         const esp_zb_zcl_set_attr_value_message_t *m = message;
+
+        /* ★ 中继自报父节点（0xFC00 / 0x0002，uint16）。
+         * 中继每 30 s 自检成功时写一次，值就是 zb_nwk_get_parent()。
+         * 这条比邻居表+BFS 推断可靠得多 —— 是设备自己说的。 */
+        if (m && m->info.status == ESP_ZB_ZCL_STATUS_SUCCESS &&
+            m->info.cluster == REP_CLUSTER_INFO &&
+            m->attribute.id == REP_ATTR_PARENT &&
+            m->attribute.data.value != NULL) {
+            uint16_t p = *(const uint16_t *)m->attribute.data.value;
+            /* SET_ATTR_VALUE 的 message 里没有源地址（和下面 On/Off 那条一样），
+             * 只能从 s_last_aps 取 —— 它由 aps_data_ind_cb 在紧邻之前填好。 */
+            uint16_t src = s_last_aps.addr;
+            uint8_t  sep = s_last_aps.ep;
+            s_rep_parent = p;
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "{\"t\":\"parent\",\"addr\":\"0x%04x\",\"p\":\"0x%04x\",\"ep\":%u}",
+                     src, p, (unsigned)sep);
+            ha_mqtt_emit_raw(line);
+            ESP_LOGI(TAG, "0x%04x 自报父节点 0x%04x", src, p);
+            return ESP_OK;
+        }
+
         if (m && m->info.status == ESP_ZB_ZCL_STATUS_SUCCESS &&
             m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
             m->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
@@ -1151,6 +1196,17 @@ static void zb_task(void *arg) {
         esp_zb_on_off_cluster_create(&on_off_srv_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+    /* ★ 中继上报父节点用的厂商专有簇（0xFC00，与中继的发射功率簇同一个）。
+     * 中继自己知道答案（zb_nwk_get_parent），每 30 s 自检成功时就把它写进
+     * 属性 0x0002 —— 这样拓扑上的「中继挂在谁下面」是**设备自报**，
+     * 不再靠邻居表 + BFS 推断。写进来会走 SET_ATTR_VALUE 回调。 */
+    esp_zb_attribute_list_t *rep_info = esp_zb_zcl_attr_list_create(REP_CLUSTER_INFO);
+    esp_zb_custom_cluster_add_custom_attr(rep_info, REP_ATTR_PARENT,
+        ESP_ZB_ZCL_ATTR_TYPE_U16, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
+        &s_rep_parent);
+    esp_zb_cluster_list_add_custom_cluster(cl, rep_info,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
     /* Illuminance (0x0400) */
     esp_zb_illuminance_meas_cluster_cfg_t illum_cfg = {
         .measured_value = 0, .min_value = 0, .max_value = 0xfffe,
@@ -1234,8 +1290,20 @@ static void zb_task(void *arg) {
     esp_zb_secur_link_key_exchange_required_set(false);
 
     ESP_ERROR_CHECK(esp_zb_start(false));
+
+    /* ★★ 2026-10-25: Ab hier dürfen andere Tasks ZBOSS-Aufrufe machen.
+     * Vorher NICHT – esp_zb_scheduler_alarm() dereferenziert eine noch nicht
+     * existierende Warteschlange und stirbt mit "Load access fault"
+     * (MTVAL=0xd). Genau das war die Reboot-Schleife: das Add-on schickt
+     * direkt nach dem Boot read_onoff, der uart_rx-Task läuft aber schon
+     * parallel zu diesem Task hier. */
+    s_zb_ready = true;
+    ESP_LOGI(TAG, "Zigbee-Stack bereit – UART-Befehle werden angenommen");
+
     esp_zb_stack_main_loop();   /* SDK ≥1.5.0: ersetzt esp_zb_main_loop_iteration() */
 }
+
+bool zb_gateway_is_ready(void) { return s_zb_ready; }
 
 /* ── Öffentliche API ────────────────────────────────────────────────────── */
 void zb_gateway_start(void) {
@@ -1248,10 +1316,20 @@ void zb_gateway_start(void) {
         .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&pcfg));
-    xTaskCreate(zb_task, "zb_main", 8192, NULL, 5, NULL);
+    /* ★ 2026-10-25: 8192 → 16384. Der Topologie-Dump (zb_topo.c) läuft im
+     * ZBOSS-Task und baut dort bis zu 4 KB JSON-Zeilen + snprintf + stdio.
+     * Panic landete reproduzierbar in zb_sched_loop_iteration /
+     * zb_mac_logic_iteration – klassisches Symptom für überlaufenden Stack
+     * im ZBOSS-Task. Der High-Water-Mark wird beim topo-Dump geloggt. */
+    xTaskCreate(zb_task, "zb_main", 16384, NULL, 5, NULL);
 }
 
 void zb_gateway_permit_join(uint8_t seconds) {
+    /* Boot-Taste kann vor dem Stack-Start gedrückt werden → sonst NULL-Deref */
+    if (!s_zb_ready) {
+        ha_mqtt_logf(TAG, "permit_join(%u) ignoriert – Zigbee-Stack startet noch", seconds);
+        return;
+    }
     ha_mqtt_logf(TAG, "esp_zb_bdb_open_network(%u) called", seconds);
     esp_err_t err = esp_zb_bdb_open_network(seconds);
     ha_mqtt_logf(TAG, "esp_zb_bdb_open_network(%u) = 0x%x", seconds, err);
@@ -1316,9 +1394,23 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
     zb_device_t *d = find_or_add(ind.src_short_addr, NULL);
     if (d) {
-        d->lqi  = (uint8_t)ind.lqi;
-        d->rssi = rssi;
-        s_last_rssi = rssi;
+        /* ★ LQI 只在**有效**时覆盖。802.15.4 的 LQI 有效范围是 1..255，
+         * 0 表示"这一帧没带有效 LQI"（弱链路 / 某些帧类型会这样）。
+         * 无条件赋值会把上一次的好值抹成 0 ⇒ 界面显示"信号 0"，用户以为
+         * 显示坏了（2026-10-26 中继在弱覆盖点上长期 LQI 0 就是因为这个）。
+         * 保留上一次的有效值，配合 JSON 里的 lqia（多久前测的）就既准确
+         * 又不骗人。 */
+        if (ind.lqi != 0) {
+            d->lqi    = (uint8_t)ind.lqi;
+            d->lqi_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        }
+        /* RSSI 同理：esp_ieee802154_get_recent_rssi() 是"radio 最近一帧"，
+         * 多设备并发上报时会串台（实测两台设备同时报 -81）。0 = 无效。 */
+        if (rssi != 0) {
+            d->rssi   = rssi;
+            d->lqi_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            s_last_rssi = rssi;
+        }
     }
     xSemaphoreGive(s_dev_mutex);
 
@@ -1327,6 +1419,26 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
     s_last_aps.addr    = ind.src_short_addr;
     s_last_aps.ep      = ind.src_endpoint;
     s_last_aps.cluster = ind.cluster_id;
+
+    /* ★ OTA: 客户端每次要块时会在 Image Block Request 里带上 fileOffset。
+     * 这是**唯一**能知道客户端进度的途径 —— SDK 的 next_data 回调根本不
+     * 给偏移（`index` 是镜像表序号，恒 0）。把偏移转给 OTA 服务端，
+     * 它就能在「协调器中途重启 / 块重传」时校正自己的读指针。
+     * 报文实测布局（2026-10-26，ASDU 27 B）：
+     *   [0]=FC 01  [1]=TSN  [2]=Cmd 03  [3]=03  [4..5]=Mfr 1b13
+     *   [6..7]=ImageType  [8..11]=FileVersion  [12..15]=FileOffset(LE)
+     *   [16]=MaxDataSize  ...
+     * 注：hex 里多出来的 [3] 是这一版协商报文的既有字节，别删 —— 删掉后
+     * 后面的 mfr/type/version 全部错位（已用三帧交叉验证）。 */
+    if (ind.cluster_id == 0x0019 && ind.asdu && ind.asdu_length >= 16 &&
+        ind.asdu[2] == 0x03 &&
+        (uint16_t)(ind.asdu[4] | (ind.asdu[5] << 8)) == 0x131b) {
+        uint32_t foff = (uint32_t)ind.asdu[12]
+                      | ((uint32_t)ind.asdu[13] << 8)
+                      | ((uint32_t)ind.asdu[14] << 16)
+                      | ((uint32_t)ind.asdu[15] << 24);
+        zb_ota_server_note_offset(foff);
+    }
 
     /* Diagnose: jeden eingehenden APS-Frame roh mitschneiden.
      * ASDU = ZCL-Frame (Frame-Control, TSN, Command-ID, …) – damit ist
@@ -1368,7 +1480,11 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
     return false;   /* nicht konsumiert */
 }
 
-/* LQI-JSON: [{"addr":"0x0684","lqi":220},...] */
+/* LQI-JSON: [{"addr":"0x0684","lqi":220,"rssi":-70,"lqia":3},...]
+ *
+ * lqia = 这个 lqi/rssi 是**多少秒前**测到的（0 = 本轮刚更新）。
+ * 为什么需要：LQI 现在只在有效时才覆盖（见 aps_data_ind_cb），所以一台
+ * 静默设备的 lqi 会一直保留旧值 —— 不带年龄就会把陈旧数据当成实时值。 */
 void zb_gateway_lqi_json(char *buf, size_t len) {
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
     char *p = buf;
@@ -1378,13 +1494,20 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
     if ((size_t)n < r) { p += n; r -= (size_t)n; }
     else               { p += r - 1; r = 1; }
     bool first = true;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
     for (int i = 0; i < MAX_DEVICES && r > 4; i++) {
         if (!s_devices[i].used) continue;
-        n = snprintf(p, r, "%s{\"addr\":\"0x%04x\",\"lqi\":%u,\"rssi\":%d}",
+        /* 还没测到过（lqi_ms == 0）→ 用一个大数表示"从未"
+         * （4294967295 秒 ≈ 136 年，前端显示成"—"）。 */
+        uint32_t age = (s_devices[i].lqi_ms == 0)
+                     ? 0xFFFFFFFFu
+                     : (now_ms - s_devices[i].lqi_ms) / 1000u;
+        n = snprintf(p, r, "%s{\"addr\":\"0x%04x\",\"lqi\":%u,\"rssi\":%d,\"lqia\":%lu}",
                      first ? "" : ",",
                      s_devices[i].short_addr,
                      (unsigned)s_devices[i].lqi,
-                     (int)s_devices[i].rssi);
+                     (int)s_devices[i].rssi,
+                     (unsigned long)age);
         if (n < 0) break;
         if ((size_t)n < r) { p += n; r -= (size_t)n; }
         else               { r = 1; break; }   /* Puffer voll – Rest verwerfen */
@@ -1395,6 +1518,23 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
 }
 
 int8_t zb_gateway_get_last_rssi(void) { return s_last_rssi; }
+
+/* Alle bekannten Kurzadressen (ohne 0x0000) in out[] kopieren.
+ * Für die Topologie: nur Geräte, mit denen wir schon gesprochen haben, haben
+ * eine Chance auf eine Mgmt_Lqi_rsp – tote Adressen aus der Nachbartabelle
+ * würden die Erfassung nur um Sekunden verzögern. Gibt die Anzahl zurück. */
+uint8_t zb_gateway_known_addrs(uint16_t *out, uint8_t max) {
+    if (!out || !max) return 0;
+    uint8_t n = 0;
+    xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_DEVICES && n < max; i++) {
+        if (!s_devices[i].used) continue;
+        if (s_devices[i].short_addr == 0x0000) continue;
+        out[n++] = s_devices[i].short_addr;
+    }
+    xSemaphoreGive(s_dev_mutex);
+    return n;
+}
 
 /* LQI-Momentaufnahme auf Anfrage.
  *
@@ -1411,9 +1551,9 @@ int8_t zb_gateway_get_last_rssi(void) { return s_last_rssi; }
  * ersten Aufruf des Befehls. Der Heartbeat-Task darf es sich leisten (8192 B),
  * dieser hier nicht.
  *
- * Größe: MAX_DEVICES Geräte à maximal ~41 Zeichen ("addr","lqi","rssi" +
- * Komma), 48 als runde Obergrenze je Eintrag plus Umschlag. */
-#define LQI_JSON_MAX  (MAX_DEVICES * 48 + 128)
+ * Größe: MAX_DEVICES Geräte à maximal ~53 Zeichen ("addr","lqi","rssi","lqia"
+ * + Komma), 64 als runde Obergrenze je Eintrag plus Umschlag. */
+#define LQI_JSON_MAX  (MAX_DEVICES * 64 + 128)
 #define LQI_LINE_MAX  (LQI_JSON_MAX + 64)
 void zb_gateway_report_lqi(void) {
     static char buf[LQI_JSON_MAX];
@@ -1500,7 +1640,14 @@ static void scan_task(void *arg) {
                  "{\"t\":\"scan\",\"state\":\"scanning\",\"ch\":%d}", ch);
         ha_mqtt_emit_raw(line);
 
-        esp_zb_zdo_active_scan_request(1U << ch, SCAN_DURATION, scan_cb);
+        /* ★ scan_task ist ein FREMDER Task ⇒ ZBOSS-Lock ist Pflicht
+         * (esp_zigbee_core.h / esp_zb_lock_acquire). Aber nur um den
+         * Request herum halten – das Warten auf den Callback (bis 12 s)
+         * darf den ZBOSS-Task nicht blockieren. */
+        if (s_zb_ready && esp_zb_lock_acquire(portMAX_DELAY)) {
+            esp_zb_zdo_active_scan_request(1U << ch, SCAN_DURATION, scan_cb);
+            esp_zb_lock_release();
+        }
 
         /* Auf Callback warten (Timeout 12 s) */
         xSemaphoreTake(s_scan_sem, pdMS_TO_TICKS(12000));
@@ -1577,6 +1724,65 @@ void zb_gateway_dev_cmd(uint16_t addr, uint8_t ep, uint8_t on_off_cmd) {
     s_dev_cmd_ep   = ep;
     s_dev_cmd_id   = on_off_cmd;
     esp_zb_scheduler_alarm(dev_cmd_send, 0, 10);
+}
+
+/* ── 中继发射功率（写厂商专有簇 0xFC00 / 属性 0x0001） ─────────────────────
+ * 中继固件把这个属性实现成「写入即生效 + 落 NVS」，所以改功率不再需要
+ * 重新刷固件。属性类型 S8（dBm，-24…20）。簇号/属性号的定义见文件头部。
+ * 同样受「esp_zb_zcl_*_cmd_req 只能在 ZBOSS 任务里调」的约束，走 scheduler。 */
+
+static uint16_t s_wr_addr = 0xFFFF;
+static uint8_t  s_wr_ep   = 0;
+static int8_t   s_wr_val  = 0;   /* 属性值的存储，必须活到命令发出去 */
+
+static void tx_power_send(uint8_t param) {
+    (void)param;
+    if (s_wr_addr == 0xFFFF) return;
+
+    esp_zb_zcl_attribute_t attr = {
+        .id   = REP_ATTR_TX_POWER,
+        .data = {
+            .type  = ESP_ZB_ZCL_ATTR_TYPE_S8,
+            .size  = sizeof(int8_t),
+            .value = &s_wr_val,
+        },
+    };
+    esp_zb_zcl_write_attr_cmd_t req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u   = { .addr_short = s_wr_addr },
+            .dst_endpoint = s_wr_ep,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID    = REP_CLUSTER_INFO,
+        .manuf_specific = 0,
+        .direction      = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .dis_default_resp = 0,
+        .manuf_code   = 0,
+        .attr_number  = 1,
+        .attr_field   = &attr,
+    };
+    uint8_t tsn = esp_zb_zcl_write_attr_cmd_req(&req);
+
+    char line[128];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"wr_power\",\"addr\":\"0x%04x\",\"ep\":%u,\"dbm\":%d,\"tsn\":%u}",
+             s_wr_addr, (unsigned)s_wr_ep, (int)s_wr_val, (unsigned)tsn);
+    ha_mqtt_emit_raw(line);
+    ESP_LOGI(TAG, "write 0xFC00/0x0001 → 0x%04x ep%u = %d dBm (tsn %u)",
+             s_wr_addr, (unsigned)s_wr_ep, (int)s_wr_val, (unsigned)tsn);
+
+    s_wr_addr = 0xFFFF;
+}
+
+void zb_gateway_write_tx_power(uint16_t addr, uint8_t ep, int8_t dbm) {
+    if (addr == 0x0000 || addr == 0xFFFF || ep == 0) return;
+    if (dbm > 20)  dbm = 20;
+    if (dbm < -24) dbm = -24;
+    s_wr_addr = addr;
+    s_wr_ep   = ep;
+    s_wr_val  = dbm;
+    esp_zb_scheduler_alarm(tx_power_send, 0, 10);
 }
 
 
@@ -1683,6 +1889,7 @@ static void read_onoff_send(uint8_t slot) {
 
 void zb_gateway_read_onoff(uint16_t addr, uint8_t ep) {
     if (addr == 0x0000 || addr == 0xFFFF || ep == 0) return;
+    if (!s_zb_ready) return;    /* zweite Sicherung – siehe main.c/on_uart_cmd */
 
     for (uint8_t i = 0; i < RD_SLOTS; i++) {
         if (s_rd_slots[i].busy) continue;
