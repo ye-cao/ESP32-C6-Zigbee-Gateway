@@ -18,6 +18,7 @@ WEB_PORT=$(get '.web_port')
 DB_HOST=$(get '.db_host')
 TZ_NAME=$(get '.timezone')
 FW_CHUNK=$(get '.fw_chunk')
+TOPO_INT=$(get '.topo_interval')
 
 : "${SERIAL:=/dev/ttyACM0}"
 : "${BAUD:=115200}"
@@ -27,6 +28,9 @@ FW_CHUNK=$(get '.fw_chunk')
 : "${WEB_PORT:=8082}"
 : "${TZ_NAME:=Asia/Shanghai}"
 : "${FW_CHUNK:=80}"
+# 0 = aus. Anders als bei den anderen Feldern ist "0" hier ein GUELTIGER Wert,
+# deshalb greift "${VAR:=60}" nicht (nur bei leer/unset) – genau so gewollt.
+: "${TOPO_INT:=60}"
 
 export WEB_PORT
 # Ohne TZ laeuft der Container in UTC – dann zeigt der Log-Zeitstempel 02:33
@@ -47,7 +51,9 @@ else
   echo "[addon] database: disabled"
 fi
 
-ARGS=(--port "$SERIAL" --baud "$BAUD" --broker "$MQTT_HOST" --mqport "$MQTT_PORT" --base "$BASE")
+echo "[addon] topo auto-collect: every ${TOPO_INT}s (0 = off)"
+
+ARGS=(--port "$SERIAL" --baud "$BAUD" --broker "$MQTT_HOST" --mqport "$MQTT_PORT" --base "$BASE" --topo-interval "$TOPO_INT")
 if [ -n "$MQTT_USER" ]; then
   ARGS+=(--user "$MQTT_USER" --pass "$MQTT_PASS")
 fi

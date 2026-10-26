@@ -1,6 +1,6 @@
 {
   "name": "ESP32-C6 Zigbee Gateway",
-  "version": "1.2.6",
+  "version": "1.5.3",
   "slug": "esp32c6_gateway",
   "description": "Bridges the ESP32-C6 Zigbee coordinator (JSON-Lines over USB-serial) to MQTT + Web UI",
   "url": "https://github.com/gerontec/esp32c6-zigbee-vital-gateway",
@@ -27,7 +27,8 @@
     "web_port": 8082,
     "db_host": "",
     "timezone": "Asia/Shanghai",
-    "fw_chunk": 80
+    "fw_chunk": 80,
+    "topo_interval": 60
   },
   "schema": {
     "serial_port": "device(subsystem=tty)",
@@ -40,6 +41,7 @@
     "web_port": "int(1,65535)",
     "db_host": "str",
     "timezone": "str",
-    "fw_chunk": "int(32,512)"
+    "fw_chunk": "int(32,512)",
+    "topo_interval": "int(0,3600)"
   }
 }

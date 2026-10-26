@@ -114,6 +114,8 @@ ap.add_argument("--user",   default=None)
 ap.add_argument("--pass",   default=None, dest="passwd")
 ap.add_argument("--base",   default="gw/c6serial",
                 help="MQTT base topic (z.B. gw/coordinator)")
+ap.add_argument("--topo-interval", default=60, type=int, dest="topo_interval",
+                help="自动采集网络拓扑的间隔秒数，0 = 关闭（拓扑页从此自动更新）")
 args = ap.parse_args()
 
 BASE   = args.base
@@ -121,7 +123,7 @@ DB_MAC = BASE.split("/")[-1][:8]
 
 # Muss zu config.json passen. Steht im Startbanner und im Web-UI – damit ist
 # sofort erkennbar, ob der Container wirklich den neuen Code fährt.
-GW_VERSION = "1.2.6"
+GW_VERSION = "1.5.3"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
 # Jedes Zigbee-Gerät/Endpoint wird beim ersten Daten-Telegramm automatisch als
@@ -129,6 +131,9 @@ GW_VERSION = "1.2.6"
 # werden (vorausgesetzt die HA-MQTT-Integration ist aktiv).
 HA_PREFIX  = os.getenv("HA_PREFIX", "homeassistant")
 HA_ENABLED = os.getenv("HA_DISCOVERY", "1").lower() not in ("0", "no", "off", "false")
+# 每台设备独立的 availability（见 _ha_avail / _avail_sync）。
+# 关掉就退回"只看网关在线"，出问题时可以一条环境变量回滚。
+DEVICE_AVAIL = os.getenv("DEVICE_AVAIL", "1").lower() not in ("0", "no", "off", "false")
 
 # Modell-Datenbank aus den Zigbee2MQTT-Convertern (von gen_device_db.py erzeugt).
 # Schlüssel = ZCL Basic 0x0005 (ModelIdentifier). Damit werden Endpunkte und
@@ -154,12 +159,41 @@ _state = {
     # zurückgelesene Istwert. Nur "eff" ist eine Messung (siehe §21).
     "tx_power":     {"want": None, "eff": None, "ts": ""},
     "devices":      {},   # addr → {ieee, name, last_seen, clusters: {name: value}}
+    # 中继自报的父节点：addr → 父节点地址。来自中继固件把
+    # zb_nwk_get_parent() 写进协调器 0xFC00/0x0002（设备自己说的，最权威）。
+    "parent":       {},
+    # 中继功率下发记录：addr → {dbm, ts, tsn}
+    "wr_power":     {},
+    # 网络拓扑（直连 / 经中继）。coordinator 的三张表直接镜像过来：
+    #   nbr = 邻居表（我直接听得到谁）  rt = 路由表（到某地址的下一跳）
+    #   rr  = 源路由（完整中继链路）    done = 本轮是否到齐
+    "topo": {
+        "pan": "", "ch": 0, "addr": "0x0000",
+        "nbr": [], "rt": [], "rr": [],
+        # mesh: addr → {"st":…, "tot":…, "nb":[…]}，每台设备**自己上报**的
+        # 邻居表（Mgmt_Lqi_rsp）。这是判父节点的权威数据。
+        "mesh": {},
+        # round: 本轮采集的序号。每轮 +1，设备自报表里记下自己是第几轮采到的，
+        # 收尾时把「不是本轮」的旧条目剔掉 —— 这样采集过程中图不会被清空
+        # （旧图一直用到新图到齐），又不会留下已经掉线的设备。
+        "round": 0,
+        "ts": "", "done": False,
+    },
     "ota": {
         "status":      "idle",   # idle | pending | transferring | done | error
         "bin_path":    "",
         "size":        0,
         "version":     1,
         "transferred": 0,
+        # image type: welche Geräteklasse bekommt dieses Image
+        #   0x0001 = Endgerät (client/, switch2wifi)
+        #   0x0002 = Repeater (router/)
+        "image_type":  0x0001,
+        # 网关侧 OTA server 的内部计数（窗口命中/未命中/超时）
+        "dbg":         {},
+        # 交付对账（见 _ota_handle_req 注释）
+        "sent":        0,
+        "sent_hash":   "0x%08x" % 2166136261,
     },
     "fw_ota": {
         "status":   "idle",   # idle | pending | transferring | done | error
@@ -171,6 +205,13 @@ _state = {
 
 # ── OTA state machine ───────────────────────────────────────────────────────
 _ota_file = None   # open file handle during transfer
+# ★ 交付对账：对「按顺序真正发出去的字节」算 FNV-1a，网关侧对「真正交给
+#   协议栈的字节」算同一个哈希。两边一致 ⇒ 中继收到的数据逐字节正确。
+#   只看 offset == _ota_next 的块，重复请求不会污染哈希。
+_OTA_FNV0   = 2166136261
+_ota_hash   = _OTA_FNV0
+_ota_sent   = 0
+_ota_next   = 0
 
 # ── Coordinator-Firmware-OTA über Serial ────────────────────────────────────
 # Bin liegt auf dem Pi; Blöcke gehen per UART an den C6, der sie via esp_ota
@@ -179,6 +220,16 @@ _ota_file = None   # open file handle during transfer
 _fw_ota_file = None
 _fw_ota_size = 0
 _fw_ota_off  = 0
+
+# ★ 2026-10-25: Zeitstempel des letzten {"t":"boot"}.
+# Der C6 startet den uart_rx-Task VOR esp_zb_start(); Befehle, die in diesem
+# Fenster ankommen, haben ihn in eine Reboot-Schleife geschickt
+# (Load access fault in zb_schedule_alarm). Firmware ist gefixt – dieses
+# Cooldown schützt zusätzlich alte Images und verhindert, dass der Transfer
+# durch einen Reboot mitten im OTA endgültig hängen bleibt.
+_gw_boot_ts = 0.0
+_GW_BOOT_COOLDOWN = 8.0
+_fw_ota_restarts = 0
 
 
 def _env_int(name, default, lo, hi):
@@ -226,12 +277,16 @@ def _fw_ota_close():
         _fw_ota_file = None
     _fw_ota_off = 0
 
-def _save_upload(ctype: str, body: bytes):
+def _save_upload(ctype: str, body: bytes, dst: str = None):
     """Speichert die erste Datei aus einem multipart/form-data-Body.
 
     Nötig, weil /data im Add-on-Container liegt und auf dem HA-Host nicht
     sichtbar ist – Hochladen im Browser ist der einzige Weg ohne Samba.
     Gibt den geschriebenen Pfad zurück (oder None).
+
+    dst: optionaler Zielpfad. Wichtig für OTA – jede Geräteklasse braucht ihr
+    eigenes Image, sonst überschreibt der Repeater-Upload das Endgerät-Image
+    (und umgekehrt), bevor irgendwer es geflasht hat.
     """
     import re as _re
     m = _re.search(r"boundary=([^;]+)", ctype)
@@ -248,12 +303,50 @@ def _save_upload(ctype: str, body: bytes):
             data = data[:-2]                       # abschließendes CRLF der Part
         if not data:
             continue
-        dst = "/data/fw_upload.bin" if os.path.isdir("/data") else "/tmp/fw_upload.bin"
+        if not dst:
+            dst = "/data/fw_upload.bin" if os.path.isdir("/data") else "/tmp/fw_upload.bin"
         with open(dst, "wb") as f:
             f.write(data)
         print(f"[OTA] Upload: {len(data)} Bytes → {dst}")
         return dst
     return None
+
+def _mp_field(ctype: str, body: bytes, name: str):
+    """Liest ein gewöhnliches Textfeld aus einem multipart/form-data-Body.
+
+    Nötig, weil do_POST bei multipart `params = {}` setzt (parse_qs würde die
+    Binärdaten verstümmeln) – damit sind aber auch die <select>-Felder im
+    selben Formular unsichtbar. Für /api/ota brauchen wir genau die (image type).
+    """
+    import re as _re
+    m = _re.search(r"boundary=([^;]+)", ctype)
+    if not m:
+        return None
+    boundary = b"--" + m.group(1).strip().strip('"').encode()
+    needle = ('name="%s"' % name).encode()
+    for part in body.split(boundary):
+        head, sep, data = part.partition(b"\r\n\r\n")
+        if not sep or needle not in head or b"filename=" in head:
+            continue
+        return data.rstrip(b"\r\n").decode("utf-8", "replace")
+    return None
+
+
+def _ota_image_type(raw_val, default=0x0001) -> int:
+    """Parst '0x0001' / '1' / None robust zu int."""
+    if raw_val is None:
+        return default
+    s = str(raw_val).strip()
+    if not s:
+        return default
+    try:
+        return int(s, 0)
+    except ValueError:
+        try:
+            return int(s, 16)
+        except ValueError:
+            return default
+
 
 def _fw_ota_watchdog():
     """Meldet, wenn der C6 die Datenframes nicht mehr quittiert.
@@ -673,6 +766,9 @@ def _noread_del(addr, ep):
 
 def _send_read_onoff(addr, ep):
     """Fragt den echten On/Off-Zustand beim Gerät ab (Read Attributes)."""
+    if time.monotonic() - _gw_boot_ts < _GW_BOOT_COOLDOWN:
+        # Gateway hat gerade gebootet, Zigbee-Stack ist evtl. noch nicht oben.
+        return
     try:
         msg = _js({"cmd": "read_onoff", "addr": addr, "ep": ep})
         ser.write(msg.encode())
@@ -913,6 +1009,23 @@ def on_message(client, userdata, msg):
             print(f"[→C6] {uart_msg.strip()}")
         except ValueError:
             print(f"[WARN] set_sleep: ungültiger Wert {payload}")
+    elif cmd == "set_dev_power":
+        # 中继发射功率：payload 是 JSON {"addr":"0x1234","ep":1,"dbm":14}
+        # 网关会翻成 ZCL Write Attribute 0xFC00/0x0001 发给那台中继；
+        # 中继收到即改 PA 并落自己的 NVS，所以以后不用重新刷固件。
+        try:
+            o = json.loads(payload)
+            addr = str(o.get("addr", "")).strip()
+            ep   = int(o.get("ep", 1) or 1)
+            dbm  = max(-24, min(20, int(o.get("dbm", 8))))
+            if not addr:
+                raise ValueError("addr fehlt")
+        except (ValueError, TypeError, json.JSONDecodeError):
+            print(f"[WARN] set_dev_power: ungültiger Payload {payload!r}")
+            return
+        uart_msg = _js({"cmd": "set_dev_power", "addr": addr, "ep": ep, "dbm": dbm})
+        ser.write(uart_msg.encode())
+        print(f"[→C6] {uart_msg.strip()}")
     elif cmd == "set_tx_power":
         # Sendepfad des C6 in dBm. Payload: "-4" oder "{\"dbm\":-4}"
         try:
@@ -926,6 +1039,7 @@ def on_message(client, userdata, msg):
         dbm = max(-24, min(20, dbm))
         uart_msg = _js({"cmd": "set_tx_power", "dbm": dbm})
         ser.write(uart_msg.encode())
+        _txp_save(dbm)          # überlebt C6-Neustart und Add-on-Neustart
         print(f"[→C6] {uart_msg.strip()}   (Rücklesewert folgt als {{\"t\":\"txpower\"}})")
     elif cmd == "lqi":
         # Momentaufnahme: sonst liefert nur der 60-s-Heartbeat LQI/RSSI.
@@ -953,6 +1067,9 @@ mq.on_connect = on_connect
 mq.on_message = on_message
 
 # ── Serial ─────────────────────────────────────────────────────────────────
+_write_err = 0        # 累计写失败次数（只用于限速日志，见 CoordinatorSerial.write）
+
+
 class CoordinatorSerial:
     """Persistente Serial-Verbindung ohne ESP32-C6 Reset-Trigger."""
     def __init__(self, port, baudrate):
@@ -974,7 +1091,26 @@ class CoordinatorSerial:
         print(f"[Serial] {port} @ {baudrate} offen (DTR/RTS=LOW, HUPCL=off)")
 
     def read(self, n):   return self.ser.read(n)
-    def write(self, d):  return self.ser.write(d)
+
+    def write(self, d):
+        """写串口。★ 异常必须在这里吞掉。
+
+        串口 EIO 时如果把 SerialException 抛出去，会顺着 paho 的 on_message
+        一路炸穿 MQTT 回调线程 —— 2026-10-26 实测日志：
+            _issue_cmd → ser.write → SerialException: write failed: [Errno 5]
+        之后 HA 发来的开关命令全部失灵，日志只刷 traceback，而真正的病根
+        （端口已死）没人处理。这里只记数，端口重开统一交给读循环的看门狗。
+        """
+        global _write_err
+        try:
+            return self.ser.write(d)
+        except Exception as e:                          # noqa: BLE001
+            _write_err += 1
+            if _write_err in (1, 10) or _write_err % 200 == 0:
+                print(f"[Serial] 写失败 {_write_err} 次: {e}"
+                      + ("  → 端口已死，等读循环重开" if _write_err == 1 else ""))
+            return 0
+
     def close(self):     self.ser.close()
 
     @property
@@ -994,6 +1130,100 @@ _serial_pause      = threading.Event()   # hält die Leseschleife an
 _flash_mutex       = threading.Lock()    # nur ein Flash gleichzeitig
 _flash_state_lock  = threading.Lock()
 _flash_state       = {"status": "idle", "bin": "", "tail": []}
+
+
+class _NullSerial:
+    """占位用的"死"串口：开机打不开端口时顶上，让 Web UI / MQTT 照常起来。
+
+    读一律抛 OSError，所以主循环的看门狗会自动走「重开」分支，等设备回来了
+    自己接上 —— 总比开机就 traceback 退出、被 Supervisor 反复重启好。
+    """
+    def read(self, n):   raise OSError("serial not open")
+    def write(self, d):  return 0
+    def close(self):     pass
+
+    @property
+    def in_waiting(self):
+        raise OSError("serial not open")
+
+
+def _serial_open(port, baud, attempts=3, first_delay=0.0):
+    """打开串口，失败就重试几次。全失败时返回 _NullSerial（不抛异常）。"""
+    delay = first_delay
+    for i in range(1, attempts + 1):
+        if delay:
+            time.sleep(delay)
+        try:
+            s = CoordinatorSerial(port, baud)
+            return s
+        except Exception as e:                          # noqa: BLE001
+            print(f"[Serial] 打开 {port} 失败（第 {i}/{attempts} 次）: {e}")
+            delay = min(max(delay * 2, 1.0), 10.0)
+    print(f"[Serial] !! {port} 打不开，先用占位串口顶着，稍后自动重试")
+    return _NullSerial()
+
+
+def _serial_reopen(reason: str = "") -> bool:
+    """掉线自愈：关掉旧 fd 重新打开端口。
+
+    ★ 为什么必须"重开"而不是"重试"：USB-CDC 端点在设备重新枚举后会失效，
+      **旧 fd 会永远返回 `[Errno 5] I/O error`**。2026-10-26 重建 add-on 后
+      实测：连续 100+ 次读全是 EIO，网关一台设备都收不到（页面空列表），
+      而 read() 里原来那句「sleep 0.5 继续」永远不会自己好 —— 只能换 fd。
+
+    返回 True 表示端口已恢复。与 esptool 刷机互斥：正在刷就让开。
+    """
+    global ser
+    if _serial_pause.is_set():
+        return False                       # esptool 正在用端口
+    if not _flash_mutex.acquire(blocking=False):
+        print("[Serial] 端口被刷机占用，本次不重开")
+        return False
+    try:
+        try:
+            ser.close()
+        except Exception:
+            pass
+        delay = 1.0
+        for i in range(1, 7):
+            time.sleep(delay)
+            try:
+                ser = CoordinatorSerial(args.port, args.baud)
+                global _write_err
+                _write_err = 0
+                print(f"[Serial] 端口已重开（{reason}）· 第 {i} 次尝试成功")
+                return True
+            except Exception as e:                      # noqa: BLE001
+                print(f"[Serial] 重开失败 第 {i} 次: {e}")
+                delay = min(delay * 2, 15.0)
+        print("[Serial] !! 端口连续 6 次打不开，稍后再试")
+        return False
+    finally:
+        _flash_mutex.release()
+
+
+def _serial_kick_reset(reason: str = "") -> bool:
+    """硬复位 C6：拉一下 RTS（=EN），让它重新启动。
+
+    什么时候用：端口能打开、但**一个字节都收不到**。这时问题在芯片侧
+    （固件挂了 / USB-JTAG 端点停了），重开 fd 没用，只能复位。
+
+    ★ RTS=True 拉低 EN、False 放开 —— 和 esptool 的默认复位序列一致。
+      DTR 保持 False，否则会被 strapping 带进下载模式（那样就再也收不到
+      JSON 上报了，只剩 bootloader）。
+    """
+    try:
+        s = getattr(ser, "ser", None)
+        if s is None:
+            return False
+        print(f"[Serial] 强制复位 C6（{reason}）")
+        s.rts = True
+        time.sleep(0.15)
+        s.rts = False
+        return True
+    except Exception as e:                              # noqa: BLE001
+        print(f"[Serial] 复位失败: {e}")
+        return False
 
 
 def _esptool_cmd(bin_path: str) -> list:
@@ -1054,11 +1284,10 @@ def flash_apply(bin_path: str) -> bool:
     except Exception as e:
         print(f"[FLASH] Fehler: {e}")
     finally:
-        try:
-            ser = CoordinatorSerial(args.port, args.baud)
-            print("[FLASH] Serial wieder offen – Brücke läuft weiter")
-        except Exception as e:
-            print(f"[FLASH] Port {args.port} konnte nicht neu geöffnet werden: {e}")
+        # 刷完恢复串口。用 _serial_open：刷机后设备正在重新枚举，一次打不开
+        # 很正常，别让整个 finally 抛异常（会把 _flash_state 卡在 running）。
+        ser = _serial_open(args.port, args.baud, attempts=5, first_delay=1.0)
+        print("[FLASH] Serial 恢复流程结束 – 桥接继续")
         with _flash_state_lock:
             _flash_state["status"] = "done" if ok else "error"
         _serial_pause.clear()
@@ -1119,23 +1348,164 @@ _GW_ORIGIN = {"name": "ESP32-C6 Gateway", "sw": _gw_version(),
               "url": "https://github.com/Koenkk/zigbee-herdsman-converters"}
 
 
-def _ha_avail():
+def _ha_avail(addr=None):
     """Verfügbarkeit im aktuellen Format (Liste) statt des alten Einzelfelds.
 
-    availability_mode "latest": die Entity gilt als verfügbar, sobald EIN
-    Topic 'online' meldet. Mit nur einem Topic ist das gleichbedeutend mit
-    dem alten Verhalten – aber die Form ist die, die HA weiterentwickelt
-    (mehrere Quellen, z. B. Gateway UND Gerät, lassen sich später ergänzen,
-    ohne alle Configs erneut zu schreiben).
+    ★ 2026-10-26: 以前只有网关自己这一个 Topic ⇒ 网关在线时，**已经掉线的
+      开关也照样显示 "关"**（HA 只是显示最后一次 payload），用户点了没反应
+      还以为是网络问题。现在每台设备再挂一个自己的 Topic，模式改 "all"：
+      网关在线 **并且** 这台设备在线，实体才可用。
+
+    为什么是 "all" 而不是原来的 "latest"：latest 是"最后收到的那个消息说了算"，
+    两个来源会互相覆盖，取决于到达顺序；all 是"所有来源都说 online 才算可用"，
+    结果确定的。只有一个 Topic 时两者等价。
     """
-    return {
+    av = {
         "availability": [{
             "topic": f"{BASE}/status",
             "payload_available":     "online",
             "payload_not_available": "offline",
         }],
-        "availability_mode": "latest",
+        "availability_mode": "all",
     }
+    if addr and DEVICE_AVAIL:
+        # 注意顺序：gateway 必须在 [0]。_disc_purge_orphans() 靠
+        # availability[0].topic 判断"这条 discovery 是不是我们发的"。
+        av["availability"].append({
+            "topic": _avail_topic(addr),
+            "payload_available":     "online",
+            "payload_not_available": "offline",
+        })
+    return av
+
+
+# ── 每台设备的可用性（device availability）──────────────────────────────────
+# 判活用"记分板"而不是单一时钟：任何能证明设备存在的证据都打一个时间戳，
+# 取最大值为"最后一次被证实存活"。
+#   · 它发来的任意 APS/ZCL 帧            → 最硬的证据
+#   · ZDO node_desc 探测成功              → 拓扑轮询每 60 s 就探一次，全覆盖
+#   · 出现在协调器邻居表里                → 协调器刚听见它
+#   · 自己上报邻居表（Mgmt_Lqi_rsp）
+# 反证只有一条：node_desc 探测**失败**（0x85 超时等），且比最后一次成功更晚。
+# ★ 为什么不用"多久没上报"这一条判：只在按键时才上报的开关（0x023b 那种）
+#   会长期没帧，但它们每 60 s 的探测都答得上 —— 靠超时会误杀。
+_avail_last_ok  = {}     # addr → 最后一次被证实存活的 time.time()
+_avail_last_bad = {}     # addr → 最后一次探测失败的 time.time()
+_avail_pub      = {}     # addr → 已发布的 "online"/"offline"（去抖）
+
+# 启动宽限：刚开机设备表/邻居表都还是空的，这时候判死必然是误杀。
+_AVAIL_GRACE   = 300.0
+_AVAIL_NBR_MAX = 600.0   # 邻居表超过这么久没更新，就不拿它当"看不见"的证据
+_avail_boot    = time.time()
+
+
+def _avail_topic(addr: str) -> str:
+    return f"{BASE}/dev/{addr}/status"
+
+
+def _avail_touch(addr) -> None:
+    """记下「这台设备刚刚被证实存活」。"""
+    if addr:
+        _avail_last_ok[addr] = time.time()
+
+
+def _avail_timeout(power) -> float:
+    """多久没有任何证据就判掉线。市电 30 min（探测每 60 s 一次）、电池 24 h。"""
+    p = (power or "").lower()
+    if "battery" in p or "batt" in p:
+        return 24 * 3600.0
+    if "mains" in p:
+        return 30 * 60.0
+    return 6 * 3600.0
+
+
+def _avail_vanished(addr) -> bool:
+    """历史上有实体，但本次启动以来毫无音讯，而且协调器也听不见它。
+
+    这是"设备真的不在了"的唯一可判定形态：
+      · 地址还在实体表里（有过 discovery）→ 说明不是陌生地址；
+      · 启动宽限期已过（设备表/邻居表都已建立）；
+      · 不在设备表里（没有任何上报、也没有被拓扑采集补进来）；
+      · 不在协调器邻居表里，而邻居表本身是新鲜的。
+    换过地址的设备不在这里：_purge_addr() 会把旧地址从 _addr_nodes 删掉。
+    """
+    if addr not in _addr_nodes:
+        return False
+    if time.time() - _avail_boot < _AVAIL_GRACE:
+        return False
+    if addr in (_state.get("devices") or {}):
+        return False
+    tp = _state.get("topo") or {}
+    if (time.time() - (tp.get("done_at") or 0.0)) > _AVAIL_NBR_MAX:
+        return False                        # 邻居表太旧，不敢据此判死
+    nbr = tp.get("nbr") or []
+    return not any(n.get("a") == addr for n in nbr)
+
+
+def _avail_online(addr) -> bool:
+    ok  = _avail_last_ok.get(addr, 0.0)
+    bad = _avail_last_bad.get(addr, 0.0)
+    if ok == 0.0 and bad == 0.0:
+        # 一点证据都没有（刚启动、设备表还没建立）→ **不主动判死**，
+        # 保持过去的行为（可用）。宁可不显示不可用，也不要误杀。
+        # 例外：实体还在、但启动后彻底没影的设备（见 _avail_vanished）。
+        return not _avail_vanished(addr)
+    if bad > ok:
+        return False
+    nd = (_state.get("node_desc") or {}).get(addr) or {}
+    return (time.time() - ok) <= _avail_timeout(nd.get("power"))
+
+
+def _avail_sync(addr, force: bool = False) -> None:
+    """按当前判断发布 availability（retained；状态没变就不发）。"""
+    if not HA_ENABLED or not addr or not DEVICE_AVAIL:
+        return
+    st = "online" if _avail_online(addr) else "offline"
+    if not force and _avail_pub.get(addr) == st:
+        return
+    was = _avail_pub.get(addr)
+    _avail_pub[addr] = st
+    mq_put(_avail_topic(addr), st, retain=True, qos=1)
+    if was != st:
+        print(f"[AVAIL] {addr} → {st}")
+
+
+def _avail_task(interval: float = 30.0):
+    """定期重算并发布每台设备的 availability。
+
+    探测结果由拓扑轮询（每 60 s 对每台设备发 node_desc）持续刷新，
+    这里只负责"把记分板换算成 online/offline 并推给 HA"。
+    """
+    while True:
+        try:
+            with _state_lock:
+                addrs = set((_state.get("devices") or {}).keys())
+                nbr = (_state.get("topo") or {}).get("nbr") or []
+            addrs |= {n.get("a") for n in nbr if n.get("a")}
+            # 历史上发过 discovery 的地址也要算进去：只有把它们纳进来，
+            # "设备已经不在网络上"才能从 online 翻成 offline（否则那条
+            # retained 的 online 永远没人去改，HA 里就是一条僵尸实体）。
+            addrs |= set(_addr_nodes.keys())
+            for a in sorted(addrs):
+                _avail_sync(a)
+        except Exception as e:                          # noqa: BLE001
+            print(f"[AVAIL] 循环出错: {e}")
+        time.sleep(interval)
+
+
+def _ago(ts) -> str:
+    """把 time.time() 时间戳说成「多久以前」。"""
+    if not ts:
+        return "—"
+    d = max(0, int(time.time() - ts))
+    if d < 60:
+        return f"{d} 秒前"
+    if d < 3600:
+        return f"{d // 60} 分钟前"
+    if d < 86400:
+        return f"{d // 3600} 小时前"
+    return f"{d // 86400} 天前"
+
 
 
 def _disc_begin_window():
@@ -1175,6 +1545,7 @@ def _disc_flush():
     print(f"[HA] Discovery-Abgleich: {neu} neu/geändert, {gleich} unverändert "
           f"({len(_disc_remote)} Configs im Broker)")
     _disc_purge_orphans()
+    _disc_upgrade_avail()
 
 
 def _disc_purge_orphans():
@@ -1243,6 +1614,87 @@ def _disc_purge_orphans():
         print(f"[HA] {weg} veraltete Discovery-Config(s) aufgeräumt")
 
 
+def _node_addr_map() -> dict:
+    """node-ID → aktuelle Kurzadresse (Umkehrung von _addr_nodes / _ieee_nodes)."""
+    m = {n: a for a, n in _addr_nodes.items() if n and a}
+    for ieee, node in _ieee_nodes.items():
+        if node and node not in m:
+            a = _ieee_addr.get(ieee)
+            if a:
+                m[node] = a
+    return m
+
+
+def _disc_upgrade_avail():
+    """Alte, stehengebliebene Discovery-Configs um die Geräte-Availability ergänzen.
+
+    Warum das nötig ist: eine Discovery-Config wird **nur dann** neu geschrieben,
+    wenn das Gerät wieder ein Telegramm schickt (_disc_send hängt am Datenpfad).
+    Ein Panel, das ausschließlich rohe APS-Tastenrahmen sendet (0x747d), oder ein
+    Gerät, das seit dem Update still ist, behält deshalb für immer die alte
+    Config mit nur EINEM Availability-Topic (Gateway). Folge: das Gerät ist
+    längst weg, in HA steht aber "aus" statt "nicht verfügbar" – eine
+    Karteileiche, die man von einem echten "aus" nicht unterscheiden kann.
+
+    Das Startfenster ist der einzige Moment, in dem _disc_remote **alle**
+    retained Configs des Brokers im Speicher hat. Genau hier nachziehen.
+
+    Reihenfolge: Gateway-Topic bleibt auf [0], weil _disc_purge_orphans() die
+    Zugehörigkeit daran festmacht.
+    """
+    if not HA_ENABLED or not DEVICE_AVAIL or not _disc_remote:
+        return
+    n2a  = _node_addr_map()
+    eigen = f"{BASE}/status"
+    gw = {"topic": eigen, "payload_available": "online",
+          "payload_not_available": "offline"}
+    auf = 0
+    for topic, payload in list(_disc_remote.items()):
+        parts = topic.split("/")
+        if len(parts) < 5 or parts[4] != "config":
+            continue
+        node = parts[2]
+        try:
+            cfg = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        av = cfg.get("availability")
+        if isinstance(av, list) and av and isinstance(av[0], dict):
+            if av[0].get("topic") != eigen:
+                continue                    # fremde Instanz – nicht anfassen
+        elif cfg.get("availability_topic") == eigen:
+            av = []                         # uralte Einzel-Topic-Fassung
+        else:
+            continue
+        addr = n2a.get(node)
+        if not addr:
+            continue                        # Adresse unbekannt – nichts raten
+        want = _avail_topic(addr)
+        if any(isinstance(x, dict) and x.get("topic") == want for x in av):
+            continue
+        rest = [x for x in av
+                if isinstance(x, dict) and x.get("topic") not in (eigen, want)]
+        cfg.pop("availability_topic", None)
+        cfg["availability"] = [gw] + rest + [
+            {"topic": want, "payload_available": "online",
+             "payload_not_available": "offline"}]
+        cfg["availability_mode"] = "all"
+        neu = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+        if neu == payload:
+            continue
+        mq_put(topic, neu, retain=True, qos=1)
+        _ha_sent[topic]    = neu
+        _disc_remote[topic] = neu
+        auf += 1
+        print(f"[HA] availability ergänzt: {topic} → {want}")
+    if auf:
+        print(f"[HA] {auf} Discovery-Config(s) auf Geräte-Availability umgestellt")
+    else:
+        print("[HA] availability: alle Discovery-Configs bereits aktuell")
+
+
 def _disc_send(comp, node, obj_id, cfg, addr=""):
     """Eine Discovery-Config setzen – aber nur, wenn sie sich geändert hat."""
     topic   = f"{HA_PREFIX}/{comp}/{node}/{obj_id}/config"
@@ -1273,6 +1725,77 @@ def _disc_send(comp, node, obj_id, cfg, addr=""):
 #   addr_ieee : {addr: ieee}   – gelernte Zuordnung
 _DATA_DIR   = "/data" if os.path.isdir("/data") else "/tmp"
 _NODES_FILE = os.path.join(_DATA_DIR, "ha_nodes.json")
+
+# ── Sendeleistung merken und nach einem C6-Boot wiederherstellen ───────────
+# `set_tx_power` wirkt in der Firmware nur zur LAUFZEIT (main.c schreibt keinen
+# NVS-Eintrag). Nach einem Stromausfall oder Reset steht die Leistung wieder auf
+# dem SDK-Default – und es fällt niemandem auf, weil `lqi`/`rssi` die
+# GEGENrichtung beschreiben und sich beim Ändern der Gateway-Leistung praktisch
+# nicht bewegen (§4). Genau so entsteht die Fehlannahme "das Gateway sendet mit
+# 20 dBm", während es längst mit 0 dBm läuft.
+# Deshalb: letzten Wunschwert in /data ablegen und nach jedem C6-Boot erneut
+# senden, bis der Rücklesewert (`eff`) ihn bestätigt.
+_TXP_FILE = os.path.join(_DATA_DIR, "gw_txpower.json")
+_TXP_DBM  = None
+_TXP_LOCK = threading.Lock()
+
+
+def _txp_load():
+    global _TXP_DBM
+    try:
+        with open(_TXP_FILE, "r", encoding="utf-8") as f:
+            _TXP_DBM = int(json.load(f).get("dbm"))
+        print(f"[TX] gemerkte Sendeleistung: {_TXP_DBM} dBm")
+    except FileNotFoundError:
+        _TXP_DBM = None
+    except Exception as e:                              # noqa: BLE001
+        _TXP_DBM = None
+        print(f"[TX] Sendeleistung nicht lesbar ({_TXP_FILE}): {e}")
+
+
+def _txp_save(dbm):
+    global _TXP_DBM
+    _TXP_DBM = int(dbm)
+    try:
+        tmp = _TXP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"dbm": _TXP_DBM}, f)
+        os.replace(tmp, _TXP_FILE)
+    except Exception as e:                              # noqa: BLE001
+        print(f"[TX] Sendeleistung nicht speicherbar: {e}")
+
+
+def _txp_reapply(delay: float = 3.0, versuche: int = 3):
+    """Nach einem C6-Boot den gemerkten Wunschwert erneut senden.
+
+    Mehrere Versuche, weil das Kommando direkt nach `boot` noch ins Leere
+    laufen kann (ZBOSS meldet erst danach "ZDO Config Ready"). Abgebrochen
+    wird, sobald der Rücklesewert den Wunsch bestätigt.
+    """
+    if _TXP_DBM is None:
+        return
+
+    def _go():
+        for i in range(versuche):
+            try:
+                with _TXP_LOCK:
+                    ser.write(_js({"cmd": "set_tx_power", "dbm": _TXP_DBM}).encode())
+            except Exception as e:                      # noqa: BLE001
+                print(f"[TX] Wiederherstellen fehlgeschlagen: {e}")
+                return
+            time.sleep(4.0)
+            with _state_lock:
+                tp = dict(_state.get("tx_power") or {})
+            if tp.get("eff") == _TXP_DBM:
+                print(f"[TX] Sendeleistung nach C6-Boot wiederhergestellt: "
+                      f"{_TXP_DBM} dBm (Versuch {i + 1})")
+                return
+        print(f"[TX] WARNUNG: {_TXP_DBM} dBm nach C6-Boot nicht bestätigt "
+              f"(eff={tp.get('eff')}) – bitte /api/tx_power prüfen")
+
+    threading.Thread(target=_go, daemon=True).start()
+
+
 _addr_nodes = {}
 _ieee_nodes = {}
 _addr_ieee  = {}
@@ -1502,6 +2025,11 @@ def _ha_publish(addr, sub, p):
     if not HA_ENABLED:
         return
 
+    # ★ discovery 里引用了 {BASE}/dev/<addr>/status 这条 availability 主题，
+    #   如果主题还没消息，availability_mode="all" 会让实体一开始就是不可用。
+    #   所以发 config 之前先把状态补上（retained；去抖，不会每帧都发）。
+    _avail_sync(addr)
+
     base_name = sub.rsplit("/", 1)[-1]
     epn       = sub.split("/", 1)[0] if "/" in sub else "ep1"
     node      = _ha_node(addr)
@@ -1520,7 +2048,7 @@ def _ha_publish(addr, sub, p):
     # "EP1" ist bei Einzel-Endpunkt-Geräten nur Rauschen im Namen
     ep_label  = _ha_ep_label(addr, epn)
     ep_part   = "" if ep_label == "EP1" else ep_label + " "
-    avail     = _ha_avail()
+    avail     = _ha_avail(addr)
 
     objects = []   # (component, object_id, config)
 
@@ -1743,6 +2271,7 @@ def _ha_publish_event(addr, ep):
     """Event-Entity (Taste) für einen Endpunkt anmelden."""
     if not HA_ENABLED:
         return
+    _avail_sync(addr)          # availability 主题要先存在，否则实体一开始不可用
     epn    = f"ep{ep}" if ep > 1 else "ep1"
     label  = _ha_ep_label(addr, epn)
     ep_part = "" if label == "EP1" else label + " "
@@ -1758,7 +2287,7 @@ def _ha_publish_event(addr, ep):
         "device": _ha_device(addr),
         "origin": _GW_ORIGIN,
         "default_entity_id": f"event.{_ha_slug(node)}_{_ha_slug(obj_id)}",
-        **_ha_avail(),
+        **_ha_avail(addr),
     }
     _disc_send("event", node, obj_id, cfg, addr)
 
@@ -1956,6 +2485,90 @@ def _probe_done(addr, ep):
     _noread_add(addr, ep, "OnOff-Attribut beim Join nicht lesbar")
 
 
+# ── 型号补读（ZCL Basic 0x0004 厂商 / 0x0005 型号）────────────────────────
+# ★ 为什么需要：型号**只在入网那一刻**（interview）读一次，读完网关就把
+#   interviewed=true 写进 NVS，之后永远不会再读。设备要是那一次没答上
+#   （休眠端点在睡、刚入网就抖、或者当年固件还没有「逐端点扫 Basic」这段），
+#   型号就**永久缺失**，而且没有任何重试。
+#   实测（2026-10-26）：经中继的 0x159e 就是这样 —— 它不是通讯不通，
+#   手动发一条 probe 型号立刻回来（Feibit Inc co. / FB56+ZSW1GKJ2.5），
+#   纯粹是当年那次没读到、之后没人再问。
+#   所以这里定期给「有 cluster 数据但没有 basic」的设备补一次 probe，
+#   指数退避（90 s 起，最长 6 h 一轮），读到就自动停。
+_MB_FIRST   = 90          # s，第一次失败后多久重试
+_MB_MAXWAIT = 6 * 3600    # 最长退避
+_MB_PER_ROUND = 3         # 每轮最多补几台，别把串口刷满
+_mb_next  = {}            # addr → 下次允许尝试的 ts
+_mb_tries = {}            # addr → 累计尝试次数
+
+
+def _eps_of(dev):
+    """从 cluster 键（`ep16/on_off`）抠出端点号；抠不到就按 ep1 试。"""
+    eps = []
+    for k in (dev.get("clusters") or {}):
+        if k.startswith("ep"):
+            try:
+                eps.append(int(k[2:].split("/")[0]))
+            except ValueError:
+                pass
+    return sorted(set(eps)) or [1]
+
+
+def _model_missing(dev):
+    b = (dev.get("clusters") or {}).get("basic")
+    if isinstance(b, dict):
+        if ((b.get("payload") or {}).get("model") or "").strip():
+            return False
+    return True
+
+
+def _probe_basic(addr, eps=None):
+    """让网关读一次 Basic（0x0004/0x0005）。逐端点、间隔 0.9 s 发。"""
+    with _state_lock:
+        dev = json.loads(json.dumps((_state.get("devices") or {}).get(addr) or {}))
+    eps = sorted(set(int(e) for e in (eps or _eps_of(dev))))
+    for i, ep in enumerate(eps):
+        threading.Timer(i * 0.9, lambda e=ep: mq_put(
+            f"{BASE}/cmd/probe", f"{addr},{e}", qos=1)).start()
+    print(f"[PROBE] {addr} 读 Basic（厂商/型号）@ ep{eps}")
+    return eps
+
+
+def _model_backfill_once():
+    now = time.time()
+    todo = []
+    with _state_lock:
+        for a, d in (_state.get("devices") or {}).items():
+            if not _model_missing(d):
+                _mb_next.pop(a, None)     # 读到了，清掉退避状态
+                _mb_tries.pop(a, None)
+                continue
+            if now < _mb_next.get(a, 0):
+                continue
+            todo.append(a)
+    for a in todo[:_MB_PER_ROUND]:
+        try:
+            _probe_basic(a)
+        except Exception as e:             # noqa: BLE001
+            print(f"[PROBE] {a}: {e}")
+            continue
+        n = _mb_tries.get(a, 0) + 1
+        _mb_tries[a] = n
+        _mb_next[a]  = now + min(_MB_MAXWAIT, _MB_FIRST * (2 ** (n - 1)))
+    if todo:
+        print(f"[PROBE] 缺型号 {len(todo)} 台，本轮补 {min(len(todo), _MB_PER_ROUND)} 台")
+
+
+def _model_backfill_task():
+    time.sleep(45)          # 等串口就绪、设备表从 NVS 载入完
+    while True:
+        try:
+            _model_backfill_once()
+        except Exception as e:             # noqa: BLE001
+            print(f"[PROBE] backfill: {e}")
+        time.sleep(180)
+
+
 def _classify_from_desc(addr, ep, in_cl, out_cl, dev_id=0):
     """Einstufung aus dem Simple-Descriptor (eindeutig, kommt beim Join).
 
@@ -2082,6 +2695,808 @@ def _ha_aps_action(msg):
     _ha_mark_controller(addr, sep)
 
 # ── Dispatcher ─────────────────────────────────────────────────────────────
+# ── 网络拓扑：直连还是经中继 ───────────────────────────────────────────────
+# 数据来自协调器的三张表（见 main/zb_topo.c）：
+#   nbr 邻居表  = 协调器直接听得到谁（含 LQI/RSSI/关系/深度）
+#   rt  路由表  = 到某地址的**下一跳**（最可靠的「经谁转发」证据）
+#   rr  源路由  = 从协调器到目的的完整路径（多级中继）
+#
+# ★ 判读优先级：rt.next_hop > rr.path[0] > nbr.relationship。
+#   原因：路由表是转发时真正用到的表项；邻居表只说明「听得到」，不代表
+#   那台设备的父节点就是协调器（路由器的邻居关系是 sibling，不等于父子）。
+#
+# ★ Zigbee 是按需建路，路由表只保留近期用过的路径（几十秒后过期）。
+#   所以刷新拓扑时要先给每台设备发一帧（node_desc）逼出路由，再 dump。
+
+_TOPO_MAXW = 980          # SVG 画布最大宽
+_TOPO_MINS = 440          # 节点很少时也别缩得太窄
+_TOPO_PAD  = 56           # 左右留白（圆半径 + 型号文字外扩）
+_TOPO_XGAP = 150          # 相邻同级节点的最小水平间距
+_TOPO_YGAP = 130          # 层间距
+
+
+def _topo_ingest(kind, msg):
+    """把网关发来的四类表 + 汇总头收进 _state["topo"]。
+
+    topo_mesh = 每台设备**自己上报**的邻居表（Mgmt_Lqi_rsp），这是拓扑的
+    主证据：里面 rel=0 那条就是它的父节点，lqi 是这一跳的链路质量。
+    其余三张表是协调器 NIB 的快照，只当兜底。
+    """
+    with _state_lock:
+        tp = _state["topo"]
+        if kind == "topo_nbr":
+            tp["nbr"] = msg.get("n") or []
+            # ★ 邻居表 = 协调器**刚刚听见的**名单。顺手在这里"种设备"：
+            #   进程重启后设备表是空的（只由上报驱动），用户会以为"设备没了"。
+            #   邻居表里有的先挂个占位，等它真上报再把 clusters 补齐。
+            coord = tp.get("addr") or "0x0000"
+            for n in tp["nbr"]:
+                a = n.get("a")
+                if not a or a == coord:
+                    continue
+                _avail_touch(a)          # 协调器刚听见它 = 存活的硬证据
+                dev = _state["devices"].setdefault(a, {
+                    "ieee": "", "name": a, "last_seen": "",
+                    "clusters": {}, "synthetic": True,
+                })
+                # 邻居表里的 lqi/rssi 是**这一条链路**的实测值，比心跳里那个
+                # "radio 最近一帧"可信。设备自己没有有效值时就用它补上。
+                if dev.get("lqi") in (None, 0) and "lqi" in n:
+                    dev["lqi"] = n["lqi"]
+                    dev["lqi_src"] = "nbr"
+                if dev.get("rssi") is None and "rssi" in n:
+                    dev["rssi"] = n["rssi"]
+        elif kind == "topo_rt":
+            tp["rt"] = msg.get("n") or []
+        elif kind == "topo_rr":
+            tp["rr"] = msg.get("n") or []
+        elif kind == "topo_mesh":
+            a = msg.get("a")
+            if a:
+                _avail_touch(a)              # 它自己答了 Mgmt_Lqi = 活着
+                tp.setdefault("mesh", {})[a] = {
+                    "st":  msg.get("st", 0),
+                    "tot": msg.get("tot", 0),
+                    "nb":  msg.get("nb") or [],
+                    "rd":  tp.get("round", 0),   # 本轮序号，收尾时用来淘汰旧条目
+                }
+        else:
+            tp["pan"]  = msg.get("pan", tp["pan"])
+            tp["ch"]   = msg.get("ch", tp["ch"])
+            tp["addr"] = msg.get("addr", tp["addr"])
+            if msg.get("done"):
+                # ★ 只在「设备真的不在了」时才剔掉自报表。以前按「本轮有没有
+                #   报到」剔，但 Mgmt_Lqi 的回包比汇总消息慢好几秒（实测 4 台
+                #   里有 3 台在 done 之后才到）⇒ 每轮都把 4 台砍成 1 台，
+                #   拓扑图上一半的连线来回闪。现在只清掉已经从设备表消失的地址。
+                mesh = tp.get("mesh") or {}
+                keep_addrs = set((_state.get("devices") or {}).keys())
+                kept = {a: e for a, e in mesh.items() if a in keep_addrs}
+                dropped = [a for a in mesh if a not in kept]
+                tp["mesh"] = kept
+                tp["done"] = True
+                tp["ts"]   = _now()
+                tp["done_at"] = time.time()   # 供拓扑页显示「几秒前采的」
+                print("[TOPO] 邻居 %d / 路由 %d / 源路由 %d / 设备自报 %d%s"
+                      % (len(tp["nbr"]), len(tp["rt"]), len(tp["rr"]),
+                         len(tp["mesh"]),
+                         ("（设备已不在表中、已剔除: %s）" % " ".join(dropped))
+                         if dropped else ""))
+
+
+def _topo_refresh(wait_per_dev=0.45):
+    """让网关逐台做 Mgmt_Lqi 采集（顺便先发 node_desc 触发路由发现）。
+
+    串口写不阻塞 HTTP 线程 → 整个流程放后台线程跑。
+    """
+    # ★ done=False 必须在**起线程之前**同步置好。自动采集靠轮询 done 判断
+    #   本轮是否结束；如果还留在 _run() 里异步置位，"刚起线程就去检查"会读到
+    #   上一轮遗留的 True，误判成本轮已完成 → 采集会越叠越多。
+    with _state_lock:
+        addrs = sorted(_state["devices"].keys())
+        # 新一轮采集：**不清空 mesh**，只把序号 +1。旧条目还留着（图不会闪成
+        # 空白），等本轮 done 时再淘汰没被重新采到的 —— 见 _topo_ingest()。
+        _state["topo"]["round"] = int(_state["topo"].get("round", 0)) + 1
+        _state["topo"]["done"] = False
+
+    def _run():
+        for a in addrs:
+            try:
+                ser.write(_js({"cmd": "node_desc", "addr": a}).encode())
+            except Exception as e:                     # noqa: BLE001
+                print(f"[TOPO] node_desc {a} 失败: {e}")
+                break
+            time.sleep(wait_per_dev)
+        try:
+            delay = int(len(addrs) * wait_per_dev * 1000) + 1200
+            ser.write(_js({"cmd": "topo", "delay": delay}).encode())
+            print(f"[TOPO] 已请求拓扑（{len(addrs)} 台，等 {delay} ms 后逐台采集）")
+        except Exception as e:                         # noqa: BLE001
+            print(f"[TOPO] topo 请求失败: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── 定时自动采集拓扑 ────────────────────────────────────────────────────────
+# 为什么放服务端、而不是页面里 setInterval：
+#   拓扑页自己有 15 s 整页重载，但重载只重新读 _state["topo"]，
+#   **不会触发新的采集** —— 所以图上永远是旧数据，除非人手点一次刷新。
+#   在前端放计时器也不行：15 s 的重载会把计时器一起清掉，永远到不了 60 s。
+#   放在服务端就没这个矛盾，页面照常重载就能看到新值（效果类似 HA 的 BLE 拓扑）。
+_topo_busy = threading.Lock()
+
+
+def _topo_refresh_blocking(timeout: float = 40.0) -> bool:
+    """触发一轮采集并等它结束；上一轮还没完就跳过，避免采集叠加。"""
+    if not _topo_busy.acquire(blocking=False):
+        print("[TOPO] 上一轮还没结束，跳过本轮自动采集")
+        return False
+    try:
+        _topo_refresh()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with _state_lock:
+                if _state["topo"].get("done"):
+                    return True
+            time.sleep(0.5)
+        print("[TOPO] 自动采集超时（done 没置位）")
+        return False
+    finally:
+        _topo_busy.release()
+
+
+def _topo_auto_ready() -> str:
+    """本轮能不能采。返回 "" = 可以，否则返回跳过原因（只用于日志）。"""
+    with _state_lock:
+        st    = _state.get("status")
+        coord = (_state.get("topo") or {}).get("addr") or "0x0000"
+        # 别把协调器自己算成"一台设备"
+        n     = len([a for a in (_state.get("devices") or {}) if a != coord])
+    if st != "online":
+        return f"网关状态 {st!r}，还没上线"
+    if n == 0:
+        return "还没有任何设备上报，扫了也是空图"
+    return ""
+
+
+def _topo_auto_loop(interval: int):
+    # 开机先等一轮心跳：否则 _state["devices"] 还是空的，会扫 0 台设备，
+    # 而且要等满一个 interval 才有第一张图。
+    time.sleep(min(interval, 30))
+    while True:
+        try:
+            why = _topo_auto_ready()
+            if why:
+                print(f"[TOPO] 本轮跳过：{why}")
+            elif _topo_refresh_blocking():
+                print(f"[TOPO] 自动采集完成，{interval} s 后再来一轮")
+        except Exception as e:                          # noqa: BLE001
+            print(f"[TOPO] 自动采集出错: {e}")
+        time.sleep(interval)
+
+
+def _topo_links(tp):
+    """把所有已知的「谁听得见谁」汇总成无向链路图。
+
+    返回 {(a, b)} → {"lqi": int|None, "n": 见到这条链路的次数}，地址对按
+    字典序归一（a < b），所以同一条链路从两端各报一次只会合并成一个键，
+    n == 2 就说明**双方互相都听得见**（比单方面汇报可信）。
+
+    来源：
+      · 协调器自己的邻居表（它直接听得到的设备）
+      · 每台设备自报的邻居表（Mgmt_Lqi_rsp）
+
+    ★ 为什么不用 rel / depth 直接读父节点：实测（2026-10-26）本网络的
+      Feibit 开关回 0x84 NOT_SUPPORTED（根本不支持 Mgmt_Lqi），而支持它的
+      ESP32-C6 中继虽然答了，但 rel 一律是 2(sibling)、depth 一律是 0 ——
+      ZBOSS 没维护这两个字段。所以只能退回「实测链路 + 图搜索」，
+      这条路不依赖任何设备自愿汇报父子关系。
+    """
+    coord = tp.get("addr") or "0x0000"
+    links = {}
+
+    def _add(x, y, lqi):
+        if not x or not y or x == y:
+            return
+        k = (x, y) if x < y else (y, x)
+        e = links.setdefault(k, {"lqi": None, "n": 0})
+        e["n"] += 1
+        if isinstance(lqi, int) and lqi > 0:
+            e["lqi"] = lqi if e["lqi"] is None else max(e["lqi"], lqi)
+
+    for n in tp.get("nbr") or []:
+        _add(coord, n.get("a"), n.get("lqi"))
+    for a, m in (tp.get("mesh") or {}).items():
+        for e in m.get("nb") or []:
+            _add(a, e.get("a"), e.get("lqi"))
+    return links
+
+
+def _topo_rel(tp, claims=None):
+    """算出 addr → 父节点。
+
+    返回 (parent, how, hop_lqi, depth, links)。
+
+    算法（每次刷新都重算，纯函数，没有隐藏状态）：
+      ① 在**实测链路图**上从协调器做 BFS：父节点 = 深度最小的可达邻居，
+         同一层里挑 **LQI 最高**的那条（链路越好越可能真的在用它转发）。
+      ② 设备**明确自报** rel==0 的父节点，只在「更靠近协调器」时才用来改写
+         ①的结果 —— 自报值不校验会造出环（实测用例：某路由器自报自己的
+         终端子节点是爹，整棵树倒挂）。
+      ③ 完全不可达的设备 → 不在 parent 里，页面显示「未定位」。
+      ④ `claims`（中继固件自报的父节点，0xFC00/0x0002）优先级最高，
+         直接改写 ①，只做防环校验。
+
+    ★ 都不依赖路由表。旧实现死磕路由表和邻居表，而这两张表按 Zigbee
+      的设计就拿不到父子关系：邻居表只装一跳，路由表按需建、直接邻居
+      根本不建表项（`rt` 常为 0）。
+    """
+    coord = tp.get("addr") or "0x0000"
+    parent, how, hop_lqi, depth = {}, {}, {}, {}
+    mesh = tp.get("mesh") or {}
+    links = _topo_links(tp)
+
+    # ① 建邻接表（LQI 高的在前 = 同层择优），从协调器 BFS 出生成树
+    adj = {}
+    for (x, y), e in links.items():
+        adj.setdefault(x, []).append((y, e))
+        adj.setdefault(y, []).append((x, e))
+    for v in adj.values():
+        v.sort(key=lambda t: (t[1].get("lqi") or 0), reverse=True)
+
+    depth[coord] = 0
+    queue = [coord]
+    seen = {coord}
+    while queue:
+        cur = queue.pop(0)
+        for nxt, e in adj.get(cur, []):
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            parent[nxt]  = cur
+            how[nxt]     = "链路图·直连" if cur == coord else "链路图·经中继"
+            hop_lqi[nxt] = e.get("lqi")
+            depth[nxt]   = depth.get(cur, 0) + 1
+            queue.append(nxt)
+
+    # ② 设备自报的父节点只能「改写」已测到的父节点，必须更靠近协调器
+    for a, m in mesh.items():
+        if not a or a == coord or a not in depth:
+            continue
+        for e in m.get("nb") or []:
+            p = e.get("a")
+            if (e.get("rel") == 0 and p and p != a
+                    and p in depth and depth[p] < depth[a]):
+                parent[a]  = p
+                how[a]     = "设备自报父节点"
+                hop_lqi[a] = e.get("lqi")
+                break
+
+    # ③ 中继固件**自己报**的父节点（zb_nwk_get_parent → 0xFC00/0x0002）。
+    #    这是最终裁决：设备自己说的，比任何推断都准。唯一要防的是成环。
+    def _cyc(a, p):
+        cur, n = p, 0
+        while cur and n < 32:
+            if cur == a:
+                return True
+            cur = parent.get(cur)
+            n += 1
+        return False
+
+    for a, p in sorted((claims or {}).items()):
+        if not a or a == coord or not p or p == "0xffff" or _cyc(a, p):
+            continue
+        parent[a]  = p
+        how[a]     = "设备自报父节点（中继自己报的）"
+        hop_lqi[a] = (links.get((a, p) if a < p else (p, a)) or {}).get("lqi")
+
+    # 改写后重算深度（沿 parent 链上溯，最多 32 层防环）
+    for a in list(parent):
+        d, cur, n = 1, parent.get(a), 0
+        while cur and cur != coord and n < 32:
+            d += 1
+            cur = parent.get(cur)
+            n += 1
+        depth[a] = d
+
+    parent.pop(coord, None)
+    depth.pop(coord, None)
+    return parent, how, hop_lqi, depth, links
+
+
+def _topo_svg(tp, names=None, meta=None, claims=None):
+    """把 parent 关系画成一棵树。返回 (svg, parent, how, hop_lqi, depth, links)。
+
+    边的标注用**子设备自己上报的**这一跳 LQI（Mgmt_Lqi_rsp），而不是协调器
+    邻居表里那条「最后一帧」的旧值 —— 后者只能反映协调器能不能听见它，
+    中间隔了一台路由器时完全不对。
+
+    names: {addr: 型号}，节点标签优先显示型号（短、能认人），没有就退回地址；
+           地址永远在鼠标悬停卡片里（和蓝牙设备列表一个习惯）。
+    meta:  {addr: {"ieee","rssi"}}，只给悬停卡片补充信息，缺了不影响画图。
+    """
+    names = names or {}
+    meta = meta or {}
+    coord = tp.get("addr") or "0x0000"
+    parent, how, hop_lqi, depth, links = _topo_rel(tp, claims)
+    nbr  = {n["a"]: n for n in (tp.get("nbr") or []) if n.get("a")}
+    mesh = tp.get("mesh") or {}
+
+    nodes = {coord} | set(parent) | set(nbr) | set(mesh)
+    for (x, y) in links:
+        nodes.add(x)
+        nodes.add(y)
+    # 完全不可达的设备（既不在协调器邻居表、也没被任何设备报过）：BFS 到不了它，
+    # parent 里没有它。旧实现直接 get(a, coord) 会把它画成协调器的直连子节点 ——
+    # 那是**编造出来的边**。这里单独标出来：只放位置、不画线。
+    orphan = {a for a in nodes if a != coord and a not in parent}
+    kids = {a: [] for a in nodes}
+    for a in sorted(nodes):
+        if a == coord:
+            continue
+        p = parent.get(a, coord)
+        if p not in kids:
+            p = coord
+        kids[p].append(a)
+
+    # 子树宽度（以「一个叶位」为单位）
+    width = {}
+
+    def _w(a):
+        ch = kids.get(a, [])
+        width[a] = sum(_w(c) for c in ch) if ch else 1
+        return width[a]
+
+    _w(coord)
+
+    scale = min(_TOPO_XGAP, (_TOPO_MAXW - 80) / max(1, width[coord]))
+    pos, maxdepth = {}, [0]
+
+    def _place(a, depth_, x0):
+        w = width[a]
+        pos[a] = (40 + (x0 + w / 2.0) * scale, 46 + depth_ * _TOPO_YGAP)
+        maxdepth[0] = max(maxdepth[0], depth_)
+        cx = x0
+        for c in kids.get(a, []):
+            _place(c, depth_ + 1, cx)
+            cx += width[c]
+
+    _place(coord, 0, 0)
+
+    # ★ 画布固定 980 宽、而小网络只占左边一小块（4 台设备仅 300 px），
+    #   右边全是大片空白、整张图缩在左上角。改成按实际跨度收窄画布并水平居中。
+    xs = [x for x, _ in pos.values()]
+    span = max(xs) - min(xs)
+    W = int(min(_TOPO_MAXW, max(_TOPO_MINS, span + 2 * _TOPO_PAD)))
+    shift = (W - span) / 2.0 - min(xs)
+    pos = {a: (x + shift, y) for a, (x, y) in pos.items()}
+
+    H = 46 + maxdepth[0] * _TOPO_YGAP + 70
+
+    def _type_of(a):
+        if a == coord:
+            return "coord"
+        n = nbr.get(a) or {}
+        if not n:
+            # 协调器邻居表里没有（隔了一台路由器），退回设备自报的类型
+            for e in (mesh.get(a) or {}).get("nb") or []:
+                if e.get("a") == a and isinstance(e.get("ty"), int):
+                    return {0: "coord", 1: "router", 2: "ed"}.get(e["ty"], "ed")
+        return {0: "coord", 1: "router", 2: "ed"}.get(n.get("ty"), "ed")
+
+    fill = {"coord": "#c0392b", "router": "#2980b9", "ed": "#6c7a89"}
+
+    parts = [
+        f'<svg viewBox="0 0 {W} {H}" width="100%" '
+        f'style="max-width:{W}px;background:#12121f;border-radius:6px" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+    ]
+
+    # 先画「额外链路」：两端都听得见、但不在生成树上的那条，画得很淡。
+    # 这是 mesh 的真实样子 —— 树只为了让层级看得懂，链路才是实测数据。
+    for (x, y), e in links.items():
+        if (parent.get(y) == x) or (parent.get(x) == y):
+            continue
+        if x not in pos or y not in pos:
+            continue
+        (x1, y1), (x2, y2) = pos[x], pos[y]
+        lqi = e.get("lqi")
+        parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                     f'stroke="#2e4a6a" stroke-width="1" '
+                     f'stroke-dasharray="2 5"/>')
+        if isinstance(lqi, int):
+            parts.append(f'<text x="{(x1 + x2) / 2:.1f}" y="{(y1 + y2) / 2 + 10:.1f}" '
+                         f'fill="#4a6a8a" font-size="9" text-anchor="middle">{lqi}</text>')
+
+    # 再画生成树的边，后画节点（节点盖住线头）
+    for a in sorted(nodes):
+        if a == coord:
+            continue
+        if a in orphan:
+            continue                      # 没有实测链路 → 不画线（不编造边）
+        p = parent.get(a, coord)
+        if p not in pos:
+            p = coord
+        x1, y1 = pos[p]
+        x2, y2 = pos[a]
+        relayed = (p != coord)
+        dash = ' stroke-dasharray="6 4"' if relayed else ""
+        col = "#e6b422" if relayed else "#4a6aaa"
+        lbl = hop_lqi.get(a)
+        # LQI 低于 40 连不成样子了，画细画红
+        w = "2"
+        if isinstance(lbl, int):
+            if lbl < 40:
+                col = "#e74c3c"
+            w = "3" if lbl >= 150 else ("2" if lbl >= 60 else "1.5")
+        parts.append(f'<line x1="{x1:.1f}" y1="{y1 + 20:.1f}" '
+                     f'x2="{x2:.1f}" y2="{y2 - 20:.1f}" '
+                     f'stroke="{col}" stroke-width="{w}"{dash}/>')
+        if isinstance(lbl, int):
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            parts.append(f'<text x="{mx:.1f}" y="{my:.1f}" fill="#8fa8c8" '
+                         f'font-size="10" text-anchor="middle">LQI {lbl}</text>')
+
+    # 标签最多能放几个字：相邻叶位间距就是 scale，等宽字体约 6.2 px/字
+    lbl_max = max(8, int(scale / 6.2))
+
+    for a in sorted(nodes):
+        x, y = pos[a]
+        ty = _type_of(a)
+        r = 20 if ty == "coord" else 17
+        # 标签：有型号显示型号（短、能认人），没型号就退回地址
+        model = (names.get(a) or "").strip()
+        if a == coord:
+            plain = "协调器"
+        elif model:
+            plain = model if len(model) <= lbl_max else model[:lbl_max - 1] + "…"
+        else:
+            plain = a
+        # 采集失败（st != 0）圈起来：0x84=不支持算「灰」，其它算真失败「暗红」
+        m = mesh.get(a) or {}
+        st = m.get("st") or 0
+        stroke = "#0d0d1f"
+        if a != coord:
+            if st == 0x84:
+                stroke = "#55556a"
+            elif st:
+                stroke = "#a03a3a"
+        if a in orphan:
+            stroke = "#5a3a5a"
+        mm = meta.get(a) or {}
+        via = parent.get(a)
+        if a == coord:
+            via_t = "—"
+        elif a in orphan:
+            via_t = "未知（没采到任何实测链路）"
+        elif via == coord:
+            via_t = "直连协调器"
+        else:
+            via_t = f"经中继 {via}"
+        coll_t = ("未采集" if a not in mesh else
+                  "不支持 Mgmt_Lqi" if st == 0x84 else
+                  f"失败 st=0x{st:02x}" if st else f"✓ {m.get('tot', 0)} 条")
+        tip = json.dumps({
+            "name": model or plain, "addr": a,
+            "ieee": mm.get("ieee") or "", "role": _DEV_TYPE.get(ty, ty),
+            "via": via_t,
+            "lqi": hop_lqi.get(a) if isinstance(hop_lqi.get(a), int) else
+                   (nbr.get(a) or {}).get("lqi") or "",
+            "depth": depth.get(a, 0),
+            "rssi": mm.get("rssi") if isinstance(mm.get("rssi"), int) else "",
+            "coll": coll_t,
+        }, ensure_ascii=False)
+        tip = (tip.replace("&", "&amp;").replace("<", "&lt;")
+                  .replace(">", "&gt;").replace('"', "&quot;"))
+        parts.append(f'<g class="tn" data-tip="{tip}" style="cursor:pointer">')
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" '
+                     f'fill="{fill[ty]}" stroke="{stroke}" stroke-width="2"/>')
+        parts.append(f'<text x="{x:.1f}" y="{y + r + 14:.1f}" fill="#dfe6f0" '
+                     f'font-size="11" text-anchor="middle">{plain}</text>')
+        if a in orphan:
+            parts.append(f'<text x="{x:.1f}" y="{y + r + 26:.1f}" '
+                         f'fill="#9a7a9a" font-size="9" '
+                         f'text-anchor="middle">未定位</text>')
+        elif a != coord and parent.get(a, coord) != coord:
+            parts.append(f'<text x="{x:.1f}" y="{y + r + 26:.1f}" '
+                         f'fill="#e6b422" font-size="9" '
+                         f'text-anchor="middle">中继</text>')
+        parts.append("</g>")
+
+    parts.append("</svg>")
+    return "".join(parts), parent, how, hop_lqi, depth, links
+
+
+_DEV_TYPE = {"coord": "协调器", "router": "路由器", "ed": "终端设备"}
+
+# 拓扑图悬停卡片。单独放成常量是为了不写进 f-string（里面全是花括号，转义太容易错）。
+_TOPO_TIP_JS = r"""
+<div id="tt"></div>
+<script>
+(function () {
+  var tt = document.getElementById('tt'), cur = null;
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function row(k, v) {
+    if (v === '' || v === null || v === undefined) return '';
+    return '<div><span class="k">' + k + '</span><span class="v">' + esc(v) + '</span></div>';
+  }
+  document.querySelectorAll('.tn').forEach(function (g) {
+    g.addEventListener('mouseenter', function () {
+      var d;
+      try { d = JSON.parse(g.dataset.tip); } catch (e) { return; }
+      cur = JSON.stringify(d);
+      tt.innerHTML = '<div class="h">' + esc(d.name || d.addr) + '</div>'
+        + row('地址：', d.addr)
+        + row('型号：', d.name && d.name !== d.addr ? d.name : '')
+        + row('IEEE：', d.ieee)
+        + row('角色：', d.role)
+        + row('连接：', d.via)
+        + row('该跳 LQI：', d.lqi)
+        + row('深度：', d.depth)
+        + row('RSSI：', d.rssi === '' ? '' : d.rssi + ' dBm')
+        + row('自报采集：', d.coll);
+      tt.style.display = 'block';
+    });
+    g.addEventListener('mousemove', function (ev) {
+      if (!tt.style.display || tt.style.display === 'none') return;
+      var x = ev.clientX + 16, y = ev.clientY + 16, r = tt.getBoundingClientRect();
+      if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 16;
+      if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 16;
+      tt.style.left = Math.max(4, x) + 'px';
+      tt.style.top = Math.max(4, y) + 'px';
+    });
+    g.addEventListener('mouseleave', function () { tt.style.display = 'none'; cur = null; });
+  });
+})();
+</script>
+"""
+
+
+def _dev_model(d):
+    """从设备状态里取 ZCL Basic.model（设备型号），取不到返回 ""。"""
+    cl = (d or {}).get("clusters") or {}
+    b = cl.get("basic")
+    if isinstance(b, dict):
+        return ((b.get("payload") or {}).get("model") or "").strip()
+    return ""
+
+
+def _lqi_cell(lqi, width: int = 50, ts=None) -> str:
+    """渲染 LQI。★ LQI == 0 不是「信号为 0」。
+
+    802.15.4 的 LQI 由收到的帧算相关性得到，取值范围 1..255；
+    **0 表示这一帧没带有效的 LQI 值**（网关的 `ind.lqi` 在弱链路 / 某些
+    帧类型下就是 0）。以前直接把 0 画成一个空 meter，用户看到「LQI 0」
+    会以为显示坏了 —— 这里明确标成"未测"，真实强度请看同一行的 RSSI。
+
+    `ts` = 这个值是**什么时候**测的（epoch 秒，来自固件心跳里的 `lqia`）。
+    固件现在只在 LQI 有效时才覆盖（不再被 0 抹掉），所以静默设备的 LQI
+    会一直保留旧值 —— 超过 2 分钟就标上年龄，别让人把陈旧值当实时值。
+    """
+    if not isinstance(lqi, int):
+        return "–"
+    if lqi == 0:
+        return ('<span style="color:#888" title="最后几帧没有带有效 LQI，'
+                '不是信号为 0；实际强度看 RSSI">– （未测）</span>')
+    col = "#f66" if lqi < 40 else ("#fc6" if lqi < 100 else "#7fff7f")
+    age = ""
+    if ts:
+        secs = int(time.time() - ts)
+        if secs >= 120:
+            age = (' <span style="color:#888;font-size:.85em" '
+                   f'title="固件只在 LQI 有效时更新，这个值是最后一次测到的">'
+                   f'（{_ago(ts)}测的）</span>')
+    return (f'<meter value="{lqi}" min="0" max="255" '
+            f'style="width:{width}px;vertical-align:middle"></meter> '
+            f'<span style="color:{col}">{lqi}</span>{age}')
+
+
+def _rssi_cell(rssi) -> str:
+    """渲染 RSSI。这个是实测 dBm，LQI 拿不到时它才是可信的强度指标。
+
+    顺手给个粗档位，省得用户自己把 dBm 换算成"到底算好不好"：
+    经验阈值（2.4 GHz、板载天线）≥-60 优 / ≥-70 良 / ≥-80 弱 / 更低很差。
+    """
+    if not isinstance(rssi, int):
+        return "–"
+    if rssi >= -60:
+        q, col = "优", "#7fff7f"
+    elif rssi >= -70:
+        q, col = "良", "#c8e06a"
+    elif rssi >= -80:
+        q, col = "弱", "#fc6"
+    else:
+        q, col = "很差", "#f66"
+    return f'<span style="color:{col}">{rssi} dBm · {q}</span>'
+
+
+def _topo_html():
+    with _state_lock:
+        tp = json.loads(json.dumps(_state.get("topo") or {}))
+        devs = json.loads(json.dumps(_state.get("devices") or {}))
+        # 中继自报的父节点（0xFC00/0x0002）—— 权威数据，判定优先级最高
+        tp["claims"] = json.loads(json.dumps(_state.get("parent") or {}))
+
+    # ★ 「这一轮是什么时候采的」必须显示出来：自动采集每 60 s 一轮，页面每
+    #   15 s 重载，图里的连线/数字其实一直在这两个节奏之间变；不写时间戳，
+    #   用户会觉得"刷新了也没变"，只能靠手动点。
+    if tp.get("done_at"):
+        topo_stamp = (f"本轮采集完成于 {tp.get('ts') or '?'}"
+                      f"（{_ago(tp.get('done_at'))}，第 {tp.get('round', 0)} 轮）")
+    elif tp.get("round"):
+        topo_stamp = f"第 {tp.get('round', 0)} 轮采集中……（上一轮的图先留着）"
+    else:
+        topo_stamp = "还没有采集过拓扑"
+    topo_iv = int(getattr(args, "topo_interval", 0) or 0)
+
+    # 节点标签用型号（认设备），地址放到悬停卡片里；没型号的节点标签就退回地址
+    names = {a: _dev_model(d) for a, d in devs.items() if _dev_model(d)}
+    meta  = {a: {"ieee": d.get("ieee") or "", "rssi": d.get("rssi")}
+             for a, d in devs.items()}
+    svg, parent, how, hop_lqi, depth, links = _topo_svg(
+        tp, names, meta, (tp.get("claims") or {}))
+    coord = tp.get("addr") or "0x0000"
+    nbr  = {n["a"]: n for n in (tp.get("nbr") or []) if n.get("a")}
+    mesh = tp.get("mesh") or {}
+
+    rows = ""
+    for a in sorted(set(list(parent) + list(nbr) + list(devs) + list(mesh))):
+        if a == coord:
+            continue
+        p = parent.get(a)
+        if p == coord:
+            way = '<span style="color:#7fff7f">直连</span>'
+            ptxt = "–"
+        elif p:
+            way = '<span style="color:#e6b422">经中继</span>'
+            ptxt = f'<a href="/device/{p}" style="color:#e6b422">{p}</a>'
+        else:
+            way = '<span style="color:#888">未知</span>'
+            ptxt = "–"
+        n = nbr.get(a) or {}
+        m = mesh.get(a) or {}
+        d = devs.get(a) or {}
+        model = _dev_model(d)
+        tyv = n.get("ty")
+        if tyv is None:
+            for e in m.get("nb") or []:
+                if e.get("a") == a and isinstance(e.get("ty"), int):
+                    tyv = e["ty"]
+                    break
+        ty = {0: "协调器", 1: "路由器", 2: "终端设备"}.get(tyv, "终端设备")
+        # 该跳 LQI：优先设备自报（隔了中继也准），否则协调器邻居表的旧值
+        hl = hop_lqi.get(a)
+        if not isinstance(hl, int):
+            hl = n.get("lqi")
+        rssi = n.get("rssi")
+        if a not in mesh:
+            coll = '<span style="color:#666">未采集</span>'
+        elif m.get("st") == 0x84:
+            coll = '<span style="color:#888">不支持</span>'
+        elif m.get("st"):
+            coll = f'<span style="color:#f66">失败 st=0x{m.get("st"):02x}</span>'
+        else:
+            coll = f'<span style="color:#7fff7f">✓ {m.get("tot", 0)} 条</span>'
+        # 这台设备总共被几条链路看到（含它自己报的和别人报的）
+        n_lnk = sum(1 for (x, y) in links if a in (x, y))
+        dv = depth.get(a)
+        rows += f"""
+        <tr>
+          <td><a href="/device/{a}" style="color:#7ecbff;text-decoration:none">{a}</a></td>
+          <td>{ty}</td>
+          <td>{model or "–"}</td>
+          <td>{way}</td>
+          <td>{ptxt}</td>
+          <td>{dv if isinstance(dv, int) else "–"}</td>
+          <td>{_lqi_cell(hl)}</td>
+          <td>{_rssi_cell(rssi)}</td>
+          <td>{coll}</td>
+          <td>{n_lnk}</td>
+          <td style="color:#888;font-size:.85em">{how.get(a, "")}</td>
+        </tr>"""
+
+    n_relay = sum(1 for a, p in parent.items() if p and p != coord)
+    n_mesh_ok  = sum(1 for m in mesh.values() if not m.get("st"))
+    n_mesh_bad = len(mesh) - n_mesh_ok
+    ts = tp.get("ts") or "（还没有数据，点下面的「刷新拓扑」）"
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<title>网络拓扑 – ESP32-C6 网关</title>
+<style>
+  body{{background:#1a1a2e;color:#e0e0e0;font-family:monospace;margin:2em}}
+  h1{{color:#00d4ff;font-size:1.4em}} h2{{color:#a0c4ff;border-bottom:1px solid #333;padding-bottom:.3em}}
+  table{{border-collapse:collapse;width:100%;margin:.5em 0}}
+  th,td{{border:1px solid #444;padding:.35em .7em;text-align:left}}
+  th{{background:#2a2a4a}} tr:nth-child(even){{background:#1e1e3a}}
+  button{{background:#2a4a7a;color:#e0e0e0;border:1px solid #4a6a9a;
+          padding:.4em 1em;cursor:pointer;border-radius:3px}}
+  button:hover{{background:#3a6aaa}}
+  .legend span{{display:inline-block;margin-right:1.2em;font-size:.9em}}
+  .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;
+        margin-right:.35em;vertical-align:middle}}
+  section{{background:#16213e;padding:1.2em;margin:1.2em 0;border-radius:6px}}
+  a{{color:#7ecbff}}
+  /* 悬停卡片：跟蓝牙设备列表一个习惯 —— 图上只写型号，地址等信息放这里 */
+  #tt{{position:fixed;z-index:50;pointer-events:none;display:none;
+       background:#20202e;border:1px solid #3d3d60;border-radius:8px;
+       padding:.65em .9em;font-size:.85em;line-height:1.65;
+       box-shadow:0 8px 24px #000c;max-width:340px;white-space:nowrap}}
+  #tt .h{{color:#fff;font-weight:bold;font-size:1.1em;margin-bottom:.15em}}
+  #tt .k{{color:#8a8aa8;display:inline-block;min-width:5.6em}}
+  #tt .v{{color:#dfe6f0}}
+  .tn:hover circle{{filter:brightness(1.35)}}
+</style></head>
+<body>
+<h1>网络拓扑 <small style="font-size:.6em;color:#666">
+  PAN {tp.get("pan") or "–"} · 信道 {tp.get("ch") or "–"} ·
+  邻居 {len(tp.get("nbr") or [])} · 路由 {len(tp.get("rt") or [])} ·
+  源路由 {len(tp.get("rr") or [])} ·
+  设备自报 {n_mesh_ok}/{len(mesh)}{(" · 失败 " + str(n_mesh_bad)) if n_mesh_bad else ""}</small></h1>
+<p><a href="/">← 返回仪表盘</a> &nbsp;|&nbsp;
+   <a href="/api/topo">JSON</a> &nbsp;|&nbsp;
+   采集时间 {ts}</p>
+
+<form method="POST" action="/api/topo">
+  <button type="submit">刷新拓扑（逐台 Mgmt_Lqi 采集，约 {max(3, len(devs) * 2)} 秒）</button>
+</form>
+<p style="color:#888;font-size:.85em">
+  <b>怎么算的</b>：先向每台设备发 <code>Mgmt_Lqi_Req</code>（ZDO 0x0031）收它的邻居表，
+  再把「协调器的邻居表 + 各设备自报的邻居表」合并成一张<b>实测链路图</b>
+  （每条边带 LQI），最后从协调器做 BFS 生成树：父节点 = 深度最小的可达邻居，
+  同层挑 LQI 最高的那条。<br>
+  <b>为什么不用设备自报的父子关系</b>：本网络的 Feibit 开关回
+  <code>0x84 NOT_SUPPORTED</code>（不支持 Mgmt_Lqi）；支持它的 ESP32-C6 中继虽然答了，
+  但 ZBOSS 把 <code>relationship</code> 一律填 2、<code>depth</code> 一律填 0，
+  不可用。所以只能靠实测链路推 —— 好处是不依赖设备配合。<br>
+  虚线 = 这台的流量要过一台中继；线越粗 LQI 越好，&lt;40 画红色。
+  <span style="color:#2e4a6a">点线</span> = 两端都听得见、但没用在生成树上的额外链路。<br>
+  <b>节点上写的是型号</b>（ZCL Basic.model，取不到型号就写地址）；
+  <b>鼠标悬停</b>看地址 / IEEE / 角色 / 连接方式 / 该跳 LQI / RSSI。
+  圈的颜色：<span style="color:#55556a">灰</span>=不支持 Mgmt_Lqi、
+  <span style="color:#a03a3a">暗红</span>=采集失败、
+  <span style="color:#5a3a5a">紫</span>=未定位（没采到任何实测链路）。
+</p>
+
+<section>
+<h2>拓扑图</h2>
+{svg}
+<p class="legend">
+  <span><i class="dot" style="background:#c0392b"></i>协调器</span>
+  <span><i class="dot" style="background:#2980b9"></i>路由器（可转发）</span>
+  <span><i class="dot" style="background:#6c7a89"></i>终端设备</span>
+  <span style="color:#e6b422">— — 虚线 = 经中继</span>
+  <span style="color:#2e4a6a">···· 点线 = 额外链路（实测能听见，未用于转发路径）</span>
+</p>
+<p style="color:#888;font-size:.85em">共 {n_relay} 台设备的流量经过中继 · 实测链路 {len(links)} 条。</p>
+</section>
+
+<section>
+<h2>明细</h2>
+<table>
+<tr><th>地址</th><th>类型</th><th>型号</th><th>连接方式</th><th>父节点/下一跳</th>
+    <th>深度</th><th>该跳 LQI</th><th>本机 RSSI</th><th>自报采集</th><th>链路</th><th>判定依据</th></tr>
+{rows or '<tr><td colspan="11"><em>还没有数据</em></td></tr>'}
+</table>
+</section>
+<footer style="margin-top:2em;color:#666;font-size:.85em">
+  <span id="rl" style="color:#666">自动刷新 15 秒</span> &nbsp;|&nbsp;
+  <a href="javascript:location.reload()">立即刷新</a> &nbsp;|&nbsp;
+  <a href="/api/topo">JSON</a>
+  <br>
+  <span style="color:#8ab4f8">{topo_stamp}</span>
+  &nbsp;·&nbsp; 服务端每 {topo_iv} 秒自动重采一轮（0 = 关闭）
+</footer>
+{_autoreload_js(15)}
+{_TOPO_TIP_JS}
+</body></html>"""
+
+
 def dispatch(line: str):
     mq_put(f"{BASE}/console", line, qos=0)
 
@@ -2095,11 +3510,29 @@ def dispatch(line: str):
         return
 
     if t == "boot":
+        global _gw_boot_ts, _fw_ota_restarts
+        _gw_boot_ts = time.monotonic()
         mq_put(f"{BASE}/status", "online", retain=True, qos=1)
         db_upsert_gateway("online")
         with _state_lock:
             _state["status"] = "online"
+            fw = dict(_state.get("fw_ota") or {})
         print("[C6] boot")
+        # Sendeleistung ist in der Firmware NICHT persistent (kein NVS) –
+        # nach jedem C6-Boot den gemerkten Wunschwert erneut setzen.
+        _txp_reapply()
+        # ★ Ist der C6 mitten im Firmware-Transfer neu gestartet, ist die
+        # OTA-Session weg – die restlichen Frames würden stumm verpuffen
+        # (genau das passierte: Transfer stand bei 30720/656560). Also von
+        # vorne, aber höchstens 3-mal.
+        if (fw.get("status") == "transferring"
+                and fw.get("bin_path")
+                and (fw.get("off") or 0) < (fw.get("size") or 0)
+                and _fw_ota_restarts < 3):
+            _fw_ota_restarts += 1
+            print(f"[OTA] C6-Neustart mitten im Transfer – starte neu "
+                  f"({_fw_ota_restarts}/3): {fw['bin_path']}")
+            threading.Timer(4.0, _fw_ota_start, (fw["bin_path"],)).start()
 
     elif t == "vitals":
         p = msg.get("p")
@@ -2172,7 +3605,21 @@ def dispatch(line: str):
                 if sub == "temperature" and isinstance(p, dict) and p.get("raw") == -32768:
                     p = dict(p); p["raw"] = None
                 dev["clusters"][sub] = {"payload": p, "ts": _now()}
-                dev["last_seen"] = _now()
+                dev["last_seen"] = _now()   # 固件心跳批次时间（整批一起刷，别当真）
+                dev["seen"]      = time.time()   # 这台设备**自己**最后一次说话的时刻
+                dev.pop("synthetic", None)       # 真上报了，占位标记可以摘了
+            _avail_touch(addr)
+            _avail_sync(addr)
+
+    elif t == "parent":
+        # 中继自报父节点（固件把 zb_nwk_get_parent() 写进 0xFC00/0x0002）。
+        # 这是**设备自己说的**，拓扑里优先级最高，不用再靠邻居表猜。
+        a = msg.get("addr")
+        p = msg.get("p")
+        if a and p and a != p:
+            with _state_lock:
+                _state.setdefault("parent", {})[a] = p
+            print(f"[PARENT] {a} 自报父节点 {p}")
 
     elif t == "heartbeat":
         mq_put(f"{BASE}/heartbeat", line, retain=True, qos=1)
@@ -2192,6 +3639,12 @@ def dispatch(line: str):
                     })
                     if "lqi"  in d: dev["lqi"]  = d["lqi"]
                     if "rssi" in d: dev["rssi"] = d["rssi"]
+                    # lqia = 固件说"这个 lqi 是几秒前测的"。换成绝对时刻存，
+                    # 之后页面自己算年龄，不用每轮刷新也能显示对不对。
+                    if "lqia" in d:
+                        _age = d["lqia"]
+                        dev["lqi_ts"] = (0 if _age is None or _age >= 0xFFFFFFFF
+                                         else time.time() - _age)
                     dev["last_seen"] = _now()
                     db_upsert_zigbee_device(addr)
         devs = msg.get("dev", [])
@@ -2253,6 +3706,23 @@ def dispatch(line: str):
 
     elif t == "aps":
         # Roher APS-Frame: enthält Tastendrücke (siehe _ha_aps_action).
+        # 能收到它的帧 = 这台设备刚刚真的发了东西，判活最硬的证据。
+        _src = msg.get("src")
+        if _src:
+            _avail_touch(_src)
+            with _state_lock:
+                _d = _state["devices"].get(_src)
+                if _d is None:
+                    # 纯面板只发按键的裸 APS 帧，永远不会有 zigbee/cluster
+                    # 上报。旧代码只给"已存在"的设备打时间戳，于是这类设备
+                    # 在网页设备表和可用性检查里**完全不存在**（0x747d 就是
+                    # 这么消失的）。这里给它建档，标 synthetic 等真上报来摘。
+                    _d = _state["devices"].setdefault(_src, {
+                        "ieee": "", "name": _src, "last_seen": "",
+                        "clusters": {}, "synthetic": True,
+                    })
+                _d["seen"] = time.time()
+            _avail_sync(_src)
         _ha_aps_action(msg)
 
     elif t == "txpower":
@@ -2284,6 +3754,10 @@ def dispatch(line: str):
                 })
                 if "lqi"  in d: dev["lqi"]  = d["lqi"]
                 if "rssi" in d: dev["rssi"] = d["rssi"]
+                if "lqia" in d:
+                    _age = d["lqia"]
+                    dev["lqi_ts"] = (0 if _age is None or _age >= 0xFFFFFFFF
+                                     else time.time() - _age)
         mq_put(f"{BASE}/lqi", line, retain=True, qos=1)
         if devs:
             print("[LQI] " + " ".join(
@@ -2299,14 +3773,26 @@ def dispatch(line: str):
     elif t == "node_desc":
         # Antwort auf ZDO Node-Descriptor (0x0002). Entscheidet, ob das Gerät
         # als Router (ZR) Fremdverkehr weiterleiten kann oder nur End Device ist.
+        # ★ 顺便当"活体探测"：拓扑轮询每 60 s 对每台设备发一次，答了就是活着，
+        #   回错误（0x85 超时等）就是掉线的**反证** —— 见 _avail_* 记分板。
         a = msg.get("addr", "?")
+        # 广播/组播地址永远不会有 node_desc 应答（0xffff 实测回 0x85 超时）。
+        # 若当成设备记录，会污染 node_desc 表、把"探测失败"计数抬高，
+        # 还会在可用性记分板上留下一条假的"掉线设备"。直接丢弃。
+        if str(a).lower() in ("0xffff", "0xfffe", "0xfffd", "0xfffc", "?"):
+            return
         if msg.get("error"):
             print(f"[ND] {a}: Abfrage fehlgeschlagen ({msg.get('error')})")
+            _avail_last_bad[a] = time.time()
         else:
             print(f"[ND] {a}: role={msg.get('role')} power={msg.get('power')} "
                   f"rx_idle={msg.get('rx_idle')} cap={msg.get('cap')}")
+            _avail_touch(a)
         with _state_lock:
-            _state.setdefault("node_desc", {})[a] = msg
+            nd = dict(msg)
+            nd["_ts"] = time.time()
+            _state.setdefault("node_desc", {})[a] = nd
+        _avail_sync(a)
 
     elif t == "fw_ota":
         st = msg.get("st")
@@ -2369,12 +3855,54 @@ def dispatch(line: str):
                 _state["ota"]["status"] = "done"
             _ota_close()
 
+    elif t == "ota_dbg":
+        # ★ 网关 OTA server 的内部计数（来自 main/zb_ota_server.c）。
+        #   命中/未命中/超时是判断「窗口缓存够不够、串口来不来得及」的唯一依据。
+        with _state_lock:
+            d = _state["ota"].setdefault("dbg", {})
+            for k in ("n", "hit", "miss", "to", "seq", "idx", "sz", "off",
+                      "win", "load", "len", "timeout", "stop", "src", "cmd"):
+                if k in msg:
+                    d[k] = msg[k]
+        loud = ("miss" in msg or "timeout" in msg or "stop" in msg)
+        if loud or (msg.get("load", -1) % 8192 == 0):
+            print("[OTA-gw] " + ", ".join(
+                f"{k}={msg[k]}" for k in msg if k != "t"))
 
-def _ota_start(bin_path: str):
-    """Startet OTA: öffnet Binary, sendet ota_start an Coordinator."""
+    elif t in ("topo_nbr", "topo_rt", "topo_rr", "topo_mesh", "topo"):
+        _topo_ingest(t, msg)
+
+    elif t == "wr_power":
+        # 网关已把 0xFC00/0x0001 写给了中继；中继是否真的改了，
+        # 只能看它自己的串口日志（属性写入不回读）。
+        addr = msg.get("addr", "?")
+        with _state_lock:
+            _state["wr_power"][addr] = {
+                "dbm": msg.get("dbm"),
+                "tsn": msg.get("tsn"),
+                "ts":  _now(),
+            }
+        print(f"[PWR] → {addr} ep{msg.get('ep')} {msg.get('dbm')} dBm "
+              f"(tsn {msg.get('tsn')})")
+
+
+def _ota_start(bin_path: str, image_type: int = 0x0001):
+    """Startet OTA: öffnet Binary, sendet ota_start an Coordinator.
+
+    image_type 决定这份 Image für welche Geräteklasse gilt:
+        0x0001 = Endgerät (client/)      0x0002 = Repeater (router/)
+    Der Coordinator schickt den Typ im Image-Notify mit; nur Clients mit
+    demselben Typ antworten überhaupt. Falscher Typ = niemand antwortet
+    (kein Schaden, aber auch kein Update).
+    """
     global _ota_file
     import os as _os
     if not bin_path:
+        if image_type == 0x0002:
+            print("[OTA] Repeater-Image ohne Pfad – Upload nötig")
+            with _state_lock:
+                _state["ota"]["status"] = "error"
+            return
         bin_path = _os.path.join(
             _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
             "client", "build", "zigbee-client.bin"
@@ -2385,10 +3913,32 @@ def _ota_start(bin_path: str):
             _state["ota"]["status"] = "error"
         return
     size = _os.path.getsize(bin_path)
+    # ★ Plausibilitätsprüfung: ein ESP-App-Image beginnt mit dem Magic-Byte 0xE9.
+    #   Fehlt es, ist die Datei verstümmelt (klassiker: multipart-Header im Image)
+    #   oder es ist ein .zip/.ota-Wrapper. Dann lieber laut abbrechen, statt
+    #   20 Minuten lang Blöcke zu schicken, die das Gerät am Ende verwirft.
+    try:
+        with open(bin_path, "rb") as _mf:
+            _magic = _mf.read(1)
+        if _magic != b"\xE9":
+            print(f"[OTA] ABBRUCH: {bin_path} beginnt mit 0x{_magic.hex() or '??'}, "
+                  f"erwartet 0xe9 (kein ESP-App-Image).")
+            with _state_lock:
+                _state["ota"]["status"] = "error"
+            return
+    except OSError as _e:
+        print(f"[OTA] ABBRUCH: {bin_path} nicht lesbar ({_e})")
+        with _state_lock:
+            _state["ota"]["status"] = "error"
+        return
     # Versionsnummer aus Datei-Mtime ableiten (Unix-Timestamp, 32-bit)
     version = int(_os.path.getmtime(bin_path)) & 0xFFFFFFFF
     _ota_close()
     _ota_file = open(bin_path, "rb")
+    global _ota_hash, _ota_sent, _ota_next
+    _ota_hash = _OTA_FNV0
+    _ota_sent = 0
+    _ota_next = 0
     with _state_lock:
         _state["ota"].update({
             "status":      "pending",
@@ -2396,32 +3946,49 @@ def _ota_start(bin_path: str):
             "size":        size,
             "version":     version,
             "transferred": 0,
+            "image_type":  image_type,
+            "sent":        0,
+            "sent_hash":   "0x%08x" % _OTA_FNV0,
         })
-    cmd = json.dumps({"cmd": "ota_start", "size": size, "ver": version})
-    ser.write((cmd + "\n").encode())
-    print(f"[OTA] gestartet: {bin_path} size={size} ver=0x{version:08x}")
+    ser.write(_j({"cmd": "ota_start", "size": size, "ver": version,
+                  "type": image_type}))
+    print(f"[OTA] gestartet: {bin_path} size={size} ver=0x{version:08x} "
+          f"type=0x{image_type:04x}")
 
 
 def _ota_handle_req(offset: int, size: int):
-    """Antwortet auf ota_req: liest Chunk aus Binärdatei und sendet hex-kodiert."""
-    global _ota_file
-    with _state_lock:
-        ota = _state["ota"]
-        active = ota["status"] in ("pending", "transferring")
+    """Antwortet auf ota_req: liest Chunk aus Binärdatei und sendet hex-kodiert。
 
-    if not active or _ota_file is None:
-        print(f"[OTA] ota_req off={offset} aber kein Transfer aktiv")
+    ★ 判「有没有在传」只看 _ota_file（打开着就说明 _ota_start 成功过）。
+      旧实现白名单只写了 pending/transferring，而网关在 ota_start 之后会先
+      发一条 status="started" —— 于是客户端第一次 Query Next Image 就被判
+      「kein Transfer aktiv」，10 秒后客户端 abort，**OTA 永远起不来**。
+      （实测 2026-10-26：中继每 45 s 问一次，每次都卡在这里。）"""
+    global _ota_file
+    if _ota_file is None:
+        print(f"[OTA] ota_req off={offset} 但当前没有打开的镜像（先上传/选择 bin）")
         return
 
+    global _ota_hash, _ota_sent, _ota_next
     try:
         _ota_file.seek(offset)
         data = _ota_file.read(size)
         hex_data = data.hex()
         cmd = json.dumps({"cmd": "ota_data", "off": offset, "data": hex_data})
         ser.write((cmd + "\n").encode())
+        # 只对「连续的、第一次发」的块累加，重发不重复计
+        if offset == _ota_next and data:
+            h = _ota_hash
+            for b in data:
+                h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+            _ota_hash = h
+            _ota_sent += len(data)
+            _ota_next = offset + len(data)
         with _state_lock:
             _state["ota"]["status"] = "transferring"
             _state["ota"]["transferred"] = offset + len(data)
+            _state["ota"]["sent"] = _ota_sent
+            _state["ota"]["sent_hash"] = "0x%08x" % _ota_hash
     except Exception as e:
         print(f"[OTA] Fehler beim Lesen: {e}")
         _ota_close()
@@ -2561,9 +4128,8 @@ def _html():
         clusters_html = clusters_html or "<em>–</em>"
         lqi  = d.get("lqi",  "–")
         rssi = d.get("rssi", "–")
-        lqi_html  = (f'<meter value="{lqi}" min="0" max="255" style="width:50px"></meter> {lqi}'
-                     if isinstance(lqi, int) else "–")
-        rssi_html = (f'{rssi} dBm' if isinstance(rssi, int) else "–")
+        lqi_html  = _lqi_cell(lqi, 50, d.get("lqi_ts"))
+        rssi_html = _rssi_cell(rssi)
         dev_rows += f"""
         <tr style="cursor:pointer" onclick="location.href='/device/{addr}'"
             title="查看详情">
@@ -2599,6 +4165,7 @@ def _html():
 <h1>ESP32-C6 Zigbee Gateway <small style="font-size:.5em;color:#666">v{GW_VERSION}</small></h1>
 <p><span id="rl" style="color:#666">自动刷新 10 秒</span> &nbsp;|&nbsp;
    <a href="javascript:location.reload()" style="color:#7ecbff">立即刷新</a> &nbsp;|&nbsp;
+   <a href="/topology" style="color:#7ecbff">🗺 网络拓扑</a> &nbsp;|&nbsp;
    <a href="/api/state" style="color:#7ecbff">JSON</a></p>
 <section>
   <h2>协调器 <code>{BASE}</code>
@@ -2633,16 +4200,35 @@ def _html():
   <form method="POST" action="/api/lqi">
     <button type="submit">📶 立即取一次 LQI/RSSI</button>
   </form>
-  <h3>OTA 固件升级</h3>
+  <h3>OTA 固件升级（Zigbee 无线推送）</h3>
   <table>
     <tr><th>Status</th><td>{s['ota']['status']}</td></tr>
     <tr><th>Binary</th><td>{s['ota']['bin_path'] or '–'}</td></tr>
+    <tr><th>Image type</th><td>0x{s['ota']['image_type']:04x}</td></tr>
     <tr><th>进度</th><td>{s['ota']['transferred']} / {s['ota']['size']} Byte</td></tr>
   </table>
-  <form method="POST" action="/api/ota">
-    <input name="path" value="{s['ota']['bin_path'] or default_bin}" size="60"
+  <p style="font-size:.85em;color:#888">
+    目标类型必须和设备的固件一致：<code>0x0001</code> 终端节点（client/）·
+    <code>0x0002</code> 中继器（router/）。选错不会刷坏，只是没人应答。<br>
+    设备页里也能单独上传 —— 每个 image type 各存一份，互不覆盖。
+  </p>
+  <form method="POST" action="/api/ota" enctype="multipart/form-data">
+    <select name="type" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
+      <option value="0x0001">0x0001 · 终端节点 (client)</option>
+      <option value="0x0002">0x0002 · 中继器 (router)</option>
+    </select>
+    <input type="file" name="file" accept=".bin"
            style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
-    <button type="submit">⬆ 开始 OTA</button>
+    <button type="submit">&#x2B06; 上传并开始 OTA</button>
+  </form>
+  <form method="POST" action="/api/ota">
+    <select name="type" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
+      <option value="0x0001">0x0001 · 终端节点</option>
+      <option value="0x0002">0x0002 · 中继器</option>
+    </select>
+    <input name="path" value="{s['ota']['bin_path'] or default_bin}" size="50"
+           style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
+    <button type="submit">⬆ 按路径开始 OTA</button>
   </form>
   <h3>协调器固件升级（串口 OTA）</h3>
   <p style="font-size:.85em;color:#888">帧 {FW_CHUNK} B ≈ {2*FW_CHUNK+50} 字符/行
@@ -2725,8 +4311,29 @@ def _device_html(addr):
 
     lqi  = dev.get("lqi",  "–")
     rssi = dev.get("rssi", "–")
-    lqi_bar = (f'<meter value="{lqi}" min="0" max="255" style="width:80px;vertical-align:middle"></meter> {lqi}'
-               if isinstance(lqi, int) else "–")
+    # 型号/厂商来自 Basic 簇（0x0005 / 0x0004）。只在入网那一刻读过一次，
+    # 那一次没读到的设备这里就是空的 —— 给个按钮再问一遍。
+    _bsc  = (dev.get("clusters") or {}).get("basic")
+    _bpl  = (_bsc.get("payload") or {}) if isinstance(_bsc, dict) else {}
+    model = (_bpl.get("model") or "").strip()
+    mfr   = (_bpl.get("mfr") or "").strip()
+    model_html = (model if model else
+                  '<span style="color:#f90">未读到</span> '
+                  '<span style="color:#888;font-size:.85em">（入网时那次 Basic 没答上，'
+                  '点下面「重新读型号」）</span>')
+    lqi_bar = _lqi_cell(lqi, 80, dev.get("lqi_ts"))
+
+    # 这台设备**自己**最后一次发帧的时刻（不是心跳批次时间）
+    _seen = dev.get("seen")
+    _seen_txt = (_ago(_seen) if _seen else
+                 '<span style="color:#888">—（还没有帧 / 刚重启）</span>')
+    if _avail_online(addr):
+        _avail_txt = ('<b style="color:#6f6">在线</b> '
+                      '<span style="color:#888">（HA 实体可用）</span>')
+    else:
+        _avail_txt = ('<b style="color:#f66">不可用</b> '
+                      '<span style="color:#888">（ZDO 探测失败或长时间没有证据，'
+                      'HA 里对应实体会变灰）</span>')
 
     # Node-Descriptor-Ergebnis (Router oder End Device?) – nur wenn schon abgefragt
     nd = (_state.get("node_desc") or {}).get(addr)
@@ -2740,6 +4347,42 @@ def _device_html(addr):
         role_html = f'<span style="color:#f66">Abfrage fehlgeschlagen ({nd.get("error")})</span>'
     else:
         role_html = '<span style="color:#888">未查询（下方“命令”里选 node_desc）</span>'
+
+    # 连接方式：直连还是经中继。数据来自 /topology 采集的三张表，
+    # 没采集过就提示去点一下（Zigbee 按需建路，不探测就查不到）。
+    _tp = s.get("topo") or {}
+    _parent, _how, _hlqi, _depth, _links = _topo_rel(_tp, s.get("parent") or {})
+    _coord = _tp.get("addr") or "0x0000"
+    _hl = _hlqi.get(addr)
+    _hl_txt = f" · 该跳 LQI {_hl}" if isinstance(_hl, int) else ""
+    if addr == _coord:
+        link_html = '<b style="color:#c0392b">协调器本身</b>'
+    elif _parent.get(addr) == _coord:
+        link_html = ('<b style="color:#6f6">直连协调器</b> '
+                     f'<span style="color:#888">（一跳，不经过中继{_hl_txt}）</span>')
+    elif _parent.get(addr):
+        _p = _parent[addr]
+        link_html = (f'<b style="color:#e6b422">经中继 {_p}</b> '
+                     f'<span style="color:#888">（依据：{_how.get(addr, "?")}{_hl_txt}）</span> '
+                     f'· <a href="/topology" style="color:#7ecbff">看拓扑图</a>')
+    else:
+        link_html = ('<span style="color:#888">未知 – 先到 '
+                     '<a href="/topology" style="color:#7ecbff">网络拓扑</a>'
+                     ' 点一次「刷新拓扑」</span>')
+
+    # Image-Typ vorbelegen:中继固件的 model 是 ESP32-C6-Repeater。
+    # 认不出来时默认终端节点（0x0001），用户可以自己改。
+    model_l = (dev.get("model") or "").lower()
+    default_type = 0x0002 if ("repeater" in model_l or "中继" in model_l) else 0x0001
+    sel_ed = "selected" if default_type == 0x0001 else ""
+    sel_rp = "selected" if default_type == 0x0002 else ""
+
+    wr = (s.get("wr_power") or {}).get(addr)
+    if wr:
+        last_wr = (f"{wr.get('ts','')} 已下发 <b>{wr.get('dbm')} dBm</b>"
+                   f"（tsn {wr.get('tsn','?')}；以中继自己的串口日志为准）")
+    else:
+        last_wr = '<span style="color:#888">本次运行还没下发过</span>'
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head>
@@ -2766,17 +4409,36 @@ def _device_html(addr):
 <table>
   <tr><th>地址</th><td>{addr}</td></tr>
   <tr><th>Name</th><td>{dev.get('name', addr)}</td></tr>
+  <tr><th>型号</th><td>{model_html}</td></tr>
+  <tr><th>厂商</th><td>{mfr or '–'}</td></tr>
   <tr><th>IEEE</th><td>{dev.get('ieee', '–')}</td></tr>
   <tr><th>LQI</th><td>{lqi_bar}</td></tr>
-  <tr><th>RSSI</th><td>{"" + str(rssi) + " dBm" if isinstance(rssi, int) else "–"}</td></tr>
+  <tr><th>RSSI</th><td>{_rssi_cell(rssi)}</td></tr>
   <tr><th>角色</th><td>{role_html}</td></tr>
-  <tr><th>最近通信</th><td>{dev.get('last_seen', '–')}</td></tr>
+  <tr><th>连接方式</th><td>{link_html}</td></tr>
+  <tr><th>最后上报</th><td>{_seen_txt}
+    <span style="color:#888;font-size:.85em">（这台设备<b>自己</b>最后一次发帧的时刻；
+    重启 add-on 会清零，所以重启后显示「—」是正常的，不代表掉线）</span></td></tr>
+  <tr><th>可用性</th><td>{_avail_txt}</td></tr>
+  <tr><th>状态刷新</th><td>{dev.get('last_seen', '–')}
+    <span style="color:#888;font-size:.85em">（固件心跳批次时间：整批设备一起刷新，
+    不是这台设备的通信时刻）</span></td></tr>
 </table>
 </section>
 <h2>Cluster 数据 ({len(dev["clusters"])})</h2>
 {clusters_html or "<em>暂无数据</em>"}
 <section>
   <h2>命令</h2>
+  <h3 style="color:#7ecbff;margin-top:.2em">重新读型号（ZCL Basic 0x0004 / 0x0005）</h3>
+  <p style="font-size:.85em;color:#888;line-height:1.6;margin:.2em 0 .5em">
+    型号<b>只在入网那一刻读一次</b>，网关随后把「已面试」写进 NVS，不会自动重读 ——
+    那次没答上（休眠端点 / 刚入网抖动 / 当年固件还没逐端点扫 Basic）就永久缺失。
+    这里手动补问一次；补读按端点逐个发，2~3 秒后刷新页面看结果。
+  </p>
+  <form method="POST" action="/api/device/{addr}/probe">
+    <button type="submit">重新读型号</button>
+  </form>
+  <h3 style="color:#7ecbff;margin-top:1em">其他命令</h3>
   <form method="POST" action="/api/device/{addr}/cmd">
     <select name="cmd" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
       <option value="switch2wifi">switch2wifi</option>
@@ -2797,12 +4459,60 @@ def _device_html(addr):
                   padding:.25em;width:80px"> 秒
     <button type="submit">设置</button>
   </form>
-  <h3 style="color:#7ecbff;margin-top:1em">OTA Firmware-Update</h3>
-  <form method="POST" action="/api/ota">
-    <input name="path" value="" placeholder="留空 = client/build/zigbee-client.bin" size="50"
-           style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
-    <button type="submit">&#x2B06; 开始 OTA</button>
+  <h3 style="color:#7ecbff;margin-top:1em">OTA 固件升级</h3>
+  <p style="font-size:.85em;color:#888;line-height:1.6">
+    不同设备跑的是不同固件，<b>必须先选对目标类型</b>：网关只把该 image type 的
+    镜像通知给对应设备，类型不符的设备不会应答（不会刷坏，但也没反应）。<br>
+    <code>0x0001</code> = 终端节点（client/，switch2wifi）&nbsp;·&nbsp;
+    <code>0x0002</code> = 中继器（router/）<br>
+    版本号取镜像文件的 mtime —— 重新编译出来的镜像自动就算是“更新”，不用手工填版本。
+  </p>
+  <form method="POST" action="/api/ota" enctype="multipart/form-data">
+    <p style="margin:.3em 0">
+      <select name="type" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
+        <option value="0x0001" {sel_ed}>0x0001 · 终端节点 (client)</option>
+        <option value="0x0002" {sel_rp}>0x0002 · 中继器 (router)</option>
+      </select>
+      <input type="file" name="file" accept=".bin"
+             style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
+    </p>
+    <button type="submit">&#x2B06; 上传并开始 OTA</button>
   </form>
+  <p style="font-size:.85em;color:#888;margin-top:.9em">或使用容器内已有的路径（<code>/share/…</code> 可由 Samba 访问）：</p>
+  <form method="POST" action="/api/ota">
+    <select name="type" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
+      <option value="0x0001" {sel_ed}>0x0001 · 终端节点</option>
+      <option value="0x0002" {sel_rp}>0x0002 · 中继器</option>
+    </select>
+    <input name="path" value="" placeholder="/share/zigbee-repeater.bin" size="40"
+           style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
+    <button type="submit">按路径开始</button>
+  </form>
+  <p style="font-size:.85em;color:#888;margin-top:.8em">
+    OTA 状态: <b>{s['ota']['status']}</b>
+    &nbsp;·&nbsp; image type 0x{s['ota']['image_type']:04x}
+    &nbsp;·&nbsp; {s['ota']['transferred']} / {s['ota']['size']} Byte<br>
+    {s['ota']['bin_path'] or '（尚未选择镜像）'}<br>
+    中继是常电 Router，不涉及休眠设备的轮询窗口；64 B/块的速度下
+    569 KB 大约 10~30 分钟，期间别断电也别关这个页面所在的 add-on。
+  </p>
+  <h3 style="color:#7ecbff;margin-top:1em">中继发射功率（运行时，不用重刷固件）</h3>
+  <p style="font-size:.85em;color:#888;line-height:1.6">
+    写入中继固件里的厂商专有簇 <code>0xFC00 / 0x0001</code>（S8，dBm）：
+    中继收到就立刻改 PA 并写进自己的 NVS，掉电再上电还是这个值。<br>
+    <b>只对中继固件有效</b>（普通开关没有这个簇，写了也不会有应答）。<br>
+    20 dBm 电流峰值最高，供电偏弱会触发 Brownout 反复复位 —— 遇到就降到 8/14。
+  </p>
+  <form method="POST" action="/api/device/{addr}/tx_power">
+    <button name="dbm" value="20">20（最大）</button>
+    <button name="dbm" value="14">14</button>
+    <button name="dbm" value="8">8</button>
+    <button name="dbm" value="2">2</button>
+    <button name="dbm" value="0">0</button>
+  </form>
+  <p style="font-size:.85em;color:#888;margin-top:.5em">
+    下发记录: {last_wr}
+  </p>
 </section>
 <footer style="margin-top:2em;color:#666;font-size:.85em">
   <span id="rl" style="color:#666">自动刷新 15 秒</span> &nbsp;|&nbsp;
@@ -2820,6 +4530,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", len(data))
+        # ★ 禁止浏览器缓存：拓扑页每 15 s 用 location.reload() 自刷新，
+        #   一旦被缓存就会"看起来一直不变"，非得手动点刷新才更新。
+        self.send_header("Cache-Control", "no-store, max-age=0")
         self.end_headers()
         self.wfile.write(data)
 
@@ -2838,12 +4551,26 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/state":
             with _state_lock:
                 self._send(200, "application/json", json.dumps(_state, indent=2))
+        elif path in ("/topology", "/topo"):
+            self._send(200, "text/html; charset=utf-8", _topo_html())
+        elif path == "/api/topo":
+            with _state_lock:
+                self._send(200, "application/json",
+                           json.dumps(_state.get("topo") or {}, indent=2))
         else:
             self._send(404, "text/plain", "Not Found")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        ctype  = (self.headers.get("Content-Type") or "").lower()
+        # ★ Content-Type NICHT für die Multipart-Auswertung klein schreiben:
+        #   der boundary-Parameter ist **case-sensitive**. Chrome und curl
+        #   schicken gemischte Namen (----WebKitFormBoundary…, ----2YSIdO…).
+        #   Mit .lower() findet body.split(boundary) nichts, der ganze Body
+        #   gilt dann als EIN Part – Folge: image_type fällt auf 0x0001 zurück
+        #   und in die Datei landen ~218 Byte Part-Header VOR dem Image
+        #   (OTA scheitert dann an der Image-Prüfung).
+        raw_ctype = self.headers.get("Content-Type") or ""
+        ctype  = raw_ctype.lower()
         raw    = self.rfile.read(length) if length else b""
         # Datei-Upload (multipart) nicht durch parse_qs schicken – das würde
         # die Binärdaten verstümmeln.
@@ -2851,7 +4578,32 @@ class _Handler(BaseHTTPRequestHandler):
             params = {}
         else:
             params = parse_qs(raw.decode("utf-8", errors="replace"))
+        # Query-String zusätzlich übernehmen: parse_qs(raw) liest nur den Body,
+        # dadurch fiel /api/device/x/tx_power?dbm=20 stillschweigend auf den
+        # Default (8 dBm) zurück – ohne Fehlermeldung.
+        for _k, _v in parse_qs(urlparse(self.path).query).items():
+            params.setdefault(_k, _v)
         path   = urlparse(self.path).path
+        if path == "/api/topo":
+            # 刷新拓扑：后台逐台探测 + dump，立即 303 回拓扑页
+            _topo_refresh()
+            self.send_response(303)
+            self.send_header("Location", "/topology")
+            self.end_headers()
+            return
+
+        if path.startswith("/api/device/") and path.endswith("/probe"):
+            # 手动补读型号：型号只在入网时读一次，错过就永久缺失，
+            # 这里给一次「再问一遍」的机会（读 Basic 0x0004/0x0005）。
+            addr = path[len("/api/device/"):-len("/probe")]
+            _mb_next.pop(addr, None)
+            _mb_tries.pop(addr, None)
+            _probe_basic(addr)
+            self.send_response(303)
+            self.send_header("Location", f"/device/{addr}")
+            self.end_headers()
+            return
+
         if path.startswith("/api/device/") and path.endswith("/cmd"):
             addr = path[len("/api/device/"):-len("/cmd")]
             cmd  = params.get("cmd", [""])[0]
@@ -2869,6 +4621,24 @@ class _Handler(BaseHTTPRequestHandler):
                 uart_msg = _js({"cmd": "leave"})
                 ser.write(uart_msg.encode())
             self.send_response(302)
+            self.send_header("Location", f"/device/{addr}")
+            self.end_headers()
+            return
+
+        if path.startswith("/api/device/") and path.endswith("/tx_power"):
+            addr = path[len("/api/device/"):-len("/tx_power")]
+            dbm = params.get("dbm", ["8"])[0].strip()
+            try:
+                dbm_i = int(dbm)
+            except ValueError:
+                dbm_i = 8
+            dbm_i = max(-24, min(20, dbm_i))
+            # 网关把它翻成 ZCL Write Attribute 0xFC00/0x0001 发给中继
+            mq_put(f"{BASE}/cmd/set_dev_power",
+                   json.dumps({"addr": addr, "ep": 1, "dbm": dbm_i},
+                              separators=(",", ":")), qos=1)
+            print(f"[Web] set_dev_power {addr} → {dbm_i} dBm")
+            self.send_response(303)
             self.send_header("Location", f"/device/{addr}")
             self.end_headers()
             return
@@ -2909,10 +4679,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/fw_ota":
             if ctype.startswith("multipart/form-data"):
-                bin_path = _save_upload(ctype, raw) or ""
+                bin_path = _save_upload(raw_ctype, raw) or ""
             else:
                 bin_path = params.get("path", [""])[0].strip()
             if bin_path:
+                # Manueller Start setzt das automatische Neustart-Budget zurück
+                globals()["_fw_ota_restarts"] = 0
                 _fw_ota_start(bin_path)
             else:
                 print("[OTA] kein Firmware-Pfad / Upload leer – abgebrochen")
@@ -2921,7 +4693,7 @@ class _Handler(BaseHTTPRequestHandler):
             # Notfall-Weg über den Bootloader (esptool), unabhängig davon,
             # ob die laufende Firmware fw_ota_data versteht.
             if ctype.startswith("multipart/form-data"):
-                bin_path = _save_upload(ctype, raw) or ""
+                bin_path = _save_upload(raw_ctype, raw) or ""
             else:
                 bin_path = params.get("path", [""])[0].strip()
             if bin_path and os.path.isfile(bin_path):
@@ -2932,9 +4704,38 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 print("[FLASH] kein Firmware-Pfad / Upload leer – abgebrochen")
 
+        elif path == "/api/ota/stop":
+            # ★ 中止 OTA：否则一次误点会白占一个多小时的无线带宽（~110 B/s）。
+            # 网关侧 zb_ota_server_stop() 会停掉预取任务，客户端等不到数据就自己放弃。
+            ser.write(_js({"cmd": "ota_stop"}).encode())
+            _ota_close()
+            with _state_lock:
+                _state["ota"]["status"] = "idle"
+            print("[OTA] 已中止（ota_stop 已下发）")
+
+        elif path == "/api/serial_reopen":
+            # 手动兜底：串口 EIO 卡住时不用重启整个 add-on。
+            # 先重开 fd；再硬复位一次 C6（端口活着但芯片挂了也一并治好）。
+            # ⚠ 最多阻塞 ~45 s（6 次指数退避重试），浏览器可能先超时，属正常。
+            print("[Serial] 收到手动重开请求")
+            ok = _serial_reopen("手动 /api/serial_reopen")
+            print(f"[Serial] 手动重开结果: {'成功' if ok else '失败（见上面的重试日志）'}")
+            if ok:
+                _serial_kick_reset("手动 /api/serial_reopen 配套复位")
+
         elif path == "/api/ota":
-            bin_path = params.get("path", [""])[0].strip()
-            _ota_start(bin_path)
+            # image type: 0x0001 终端节点 / 0x0002 中继器
+            if ctype.startswith("multipart/form-data"):
+                image_type = _ota_image_type(_mp_field(raw_ctype, raw, "type"))
+                # 每个类型独立的落盘文件：否则上传中继镜像会覆盖终端节点镜像
+                base = "/data" if os.path.isdir("/data") else "/tmp"
+                dst = f"{base}/ota_0x{image_type:04x}.bin"
+                bin_path = _save_upload(raw_ctype, raw, dst=dst) or ""
+            else:
+                image_type = _ota_image_type(params.get("type", [None])[0])
+                bin_path = params.get("path", [""])[0].strip()
+            print(f"[OTA] /api/ota type=0x{image_type:04x} path={bin_path or '(leer)'}")
+            _ota_start(bin_path, image_type)
 
         self.send_response(303)
         self.send_header("Location", "/")
@@ -2953,21 +4754,49 @@ def _run_web():
 db_init()
 
 print(f"[Serial] öffne {args.port} @ {args.baud} …")
-ser = CoordinatorSerial(args.port, args.baud)
+# ★ 开机打不开端口时**不要**直接抛异常退出：那会被 Supervisor 判定成
+#   "启动失败" 反复重启（2026-10-26 重建后就是这样）。先用占位串口把
+#   Web UI / MQTT 拉起来，主循环的看门狗会自己重连。
+ser = _serial_open(args.port, args.baud)
 
 # Persistente Knoten-Zuordnung laden – noch VOR dem ersten Discovery-Publish,
 # sonst entstehen nach einem Neustart neue Node-IDs und damit neue Entities.
 _nodes_load()
+_txp_load()
 
 print(f"[MQTT] verbinde {args.broker}:{args.mqport} …")
 mq.connect(args.broker, args.mqport, keepalive=60)
 mq.loop_start()
 
 threading.Thread(target=_run_web, daemon=True).start()
+# 型号补读：入网那次没读到 Basic 的设备，定期补问（指数退避，读到就停）
+threading.Thread(target=_model_backfill_task, daemon=True).start()
+# 拓扑自动采集：让拓扑页像 HA 的 BLE 图那样自己更新，不用手点刷新
+if args.topo_interval and int(args.topo_interval) > 0:
+    threading.Thread(target=_topo_auto_loop,
+                     args=(int(args.topo_interval),), daemon=True).start()
+    print(f"[TOPO] 自动采集已开启：每 {int(args.topo_interval)} s 一轮")
+else:
+    print("[TOPO] 自动采集已关闭（--topo-interval 0）")
+# 每台设备的可用性：把"记分板"换算成 online/offline 推给 HA
+if DEVICE_AVAIL and HA_ENABLED:
+    threading.Thread(target=_avail_task, daemon=True).start()
+    print("[AVAIL] 设备级可用性已开启（掉线设备的 HA 实体会变灰）")
+else:
+    print("[AVAIL] 设备级可用性已关闭（所有实体只看网关在线）")
+
+# ★ 只在 boot 时重发还不够：如果 C6 没重启、只有 add-on 重启了，C6 那边
+#   其实还留着上次设的功率，但 `_state["tx_power"]` 是空的、网页显示 "—"。
+#   这里补一发：功率本来就在，属于幂等操作；顺便把回读值填上。
+_txp_reapply(8.0)
 
 # ── Hauptschleife ───────────────────────────────────────────────────────────
 print("[Bridge] läuft – Ctrl+C zum Beenden")
 buf = b""
+read_err  = 0        # 连续读失败次数（成功一次就归零）
+err_since = 0.0      # 第一连败的时刻，用来限速日志
+last_rx   = time.time()   # 最后一次收到任意字节的时刻（判断"端口活着但没数据"）
+last_kick = 0.0      # 上一次强制复位的时刻（限速，别把 C6 反复复位）
 try:
     while True:
         # Während eines esptool-Flashs ist der Port geschlossen bzw. vom
@@ -2975,15 +4804,38 @@ try:
         if _serial_pause.is_set():
             time.sleep(0.2)
             continue
+        # ★ 饿死看门狗：端口不报错但**一个字节都没有**。协调器正常情况下
+        #   每几秒就有心跳/上报，连续 45 s 静默 = 芯片侧挂了（固件卡死、
+        #   USB-JTAG 端点停了），重开 fd 治不好，只能硬复位。见 _serial_kick_reset。
+        if time.time() - last_rx > 45 and time.time() - last_kick > 90:
+            last_kick = time.time()
+            _serial_kick_reset(f"已 {int(time.time() - last_rx)} s 没收到任何字节")
+            last_rx = time.time()      # 给它 45 s 重新起来
         try:
             raw = ser.read(ser.in_waiting or 1)
         except Exception as e:
-            # Port wurde unter uns geschlossen/neu geöffnet → kurz warten
-            if not _serial_pause.is_set():
-                print(f"[Serial] Lese-Fehler: {e} – versuche weiter")
+            # ★ 关键：**重试同一个 fd 是没用的**。USB-CDC 端点失效后旧 fd
+            #   永远返回 EIO（实测 100+ 次连败），必须关掉重开。见 _serial_reopen。
+            read_err += 1
+            now = time.time()
+            if read_err == 1:
+                err_since = now
+                print(f"[Serial] Lese-Fehler: {e} – 累计到 10 次就重开端口")
+            elif read_err == 10 or (read_err % 60 == 0):
+                print(f"[Serial] 读失败 {read_err} 次 / {now - err_since:.0f} s"
+                      f"（最后一次: {e}）→ 重开端口")
+            if read_err >= 10 and not _serial_pause.is_set():
+                if _serial_reopen(f"连续 {read_err} 次读失败: {e}"):
+                    buf = b""       # 半行必须丢掉，否则和下一行粘成非法 JSON
+                    read_err = 0
+                    last_rx  = time.time()
             time.sleep(0.5)
             continue
+        if read_err:
+            print(f"[Serial] 读取恢复正常（此前连续失败 {read_err} 次）")
+            read_err = 0
         if raw:
+            last_rx = time.time()
             buf += raw
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
