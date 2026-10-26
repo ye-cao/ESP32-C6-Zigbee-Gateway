@@ -2439,3 +2439,103 @@ test_mqtt 35/35、test_panel 55/55、test_ha_state、test_packaging 全过
   2. PAN ID 是否变化、设备表是否清空 → 判断 NVRAM 兼容性（重建则 PAN 变、表清空）。
   心跳里没有版本字段，因此无法从 host 侧直接读出"跑的是哪个固件版本"。
   （改进项：在 `ha_mqtt.c:275` 的 boot 消息里加 `"fw":"sdk1.6.8","cap":64`。）
+
+## 二十四、中继器无线升级 + 运行时可调功率（2026-10-25）
+
+### 24.1 三个提出来才知道的问题
+
+1. 中继器能不能走 Zigbee OTA？
+2. Web 管理端设备页只能填「容器内路径」，**不能自己选固件上传** —— 而不同设备装的是
+   不同固件，选错类型等于白推。
+3. 改功率要重新编译刷机，太麻烦。
+
+### 24.2 链路核对：断点只在最末端
+
+Zigbee OTA 的四段链路，前三段早就写好并上过机：
+
+| 环节 | 位置 | 状态 |
+|---|---|---|
+| Web 触发 | `serial_gateway.py` `POST /api/ota` | 已有 |
+| host 喂数据 | `_ota_start()` / `_ota_handle_req()`（应答 `ota_req`） | 已有 |
+| 网关 OTA 服务端 | `main/zb_ota_server.c`（`MFR 0x131B`、`notify_on=1`） | 已有 |
+| **中继端点** | `router/main/repeater.c` 原先只有 Basic + Identify | **缺 OTA client** |
+
+没有 OTA client 簇 → 中继不会发 Query Next Image Request → 网关的 Image Notify 广播
+无人应答，超时后什么都不会发生。所以中继原先只能 USB 刷。
+
+★ 另一条容易忽略的事实：add-on 里的**版本号取镜像文件的 mtime**
+（`_ota_start()` 里 `int(os.path.getmtime(path)) & 0xFFFFFFFF`），不是手工版本号。
+所以每次重新编译出来的镜像自动就算「更新」，不需要维护版本表。
+
+### 24.3 ★ 关键设计约束：image type 必须分家
+
+原来 `ota_start` 的 payload 只有 `SIZE,VERSION`，服务端硬编码 `OTA_IMAGE_TYPE 0x0001`，
+终端节点（`client/`）的 OTA client 也是 `0x0001`。
+
+如果中继沿用 `0x0001`，网关一次广播会让**两类设备同时来抢同一份镜像**，
+镜像内容不匹配的那个照样往自己的 ota 分区写 —— 这不是理论风险。
+
+所以本次把 image type 提升为一等参数：
+
+| image type | 设备 | 目录 |
+|---|---|---|
+| `0x0001` | 终端节点（switch2wifi） | `client/` |
+| `0x0002` | 中继器（纯 Router） | `router/` |
+
+改动分布（全链路透传）：
+
+- `main/zb_ota_server.c`：`zb_ota_server_start(size, ver, image_type)`，`type == 0` 时
+  回落 `0x0001`（老 host 端不受影响）；`ota_status` 行里多一个 `"type":"0x…"`
+- `main/main.c`：`ota_start` payload 变 `"SIZE,VERSION[,IMAGETYPE]"`（第三段可选）
+- `main/ha_mqtt.c`：解析 JSON 的 `"type"` 字段（数字或带引号的 `"0x0002"` 都吃）
+- host `_ota_start(bin_path, image_type)`：`ota_start` 行里带 `"type"`；
+  上传落盘按类型分文件（`/data/ota_0x0001.bin` / `/data/ota_0x0002.bin`），
+  **不会互相覆盖**
+
+### 24.4 中继固件新增的东西
+
+1. **OTA client**（`router/main/zb_ota_client.c`，从 `client/` 移植）
+   - image type `0x0002`
+   - 去掉全部 `ha_mqtt_publish_ota_status()`（中继没有 MQTT），进度只走 `ESP_LOGI`
+   - **版本号存 NVS**（`rep/ota_ver`）：否则客户端永远自称 version=1，
+     网关每次广播都会让它把同一版重下一遍
+2. **厂商专有簇 `0xFC00` / 属性 `0x0001`**（S8，dBm，READ_WRITE）
+   - 写入 → `esp_zb_set_tx_power()` 立刻生效 + 写 NVS（`rep/txp`，存 `dbm + 24`）
+   - 掉电重启后从 NVS 恢复，不再是编译期常量
+3. **按键分级**（同一个 BOOT 键，`btn_task()`）
+   - 短按 <1 s → 循环 8 / 14 / 20 dBm（网络不通时的兜底）
+   - 长按 1~5 s → rejoin
+   - 长按 ≥5 s → 恢复出厂
+
+### 24.5 网关侧新增写属性能力
+
+`zb_gateway.c` 里新增 `zb_gateway_write_tx_power(addr, ep, dbm)`：
+组 `esp_zb_zcl_write_attr_cmd_t`（cluster `0xFC00`、attr `0x0001`、`S8`）→
+`esp_zb_zcl_write_attr_cmd_req()`。
+
+★ 沿用 `dev_cmd_send()` 那条老规矩：`esp_zb_zcl_*_cmd_req()` **只能在 ZBOSS 任务里调**，
+UART-RX 任务里直接调会被静默丢弃。所以走 `esp_zb_scheduler_alarm()` 排队。
+
+链路：Web 设备页按钮 → `POST /api/device/<addr>/tx_power` →
+MQTT `{BASE}/cmd/set_dev_power`（JSON `{"addr","ep","dbm"}`）→ add-on `on_message`
+翻成 UART `{"cmd":"set_dev_power",…}` → 网关 `zb_gateway_write_tx_power()`。
+网关回一行 `{"t":"wr_power","addr":…,"dbm":…,"tsn":…}`，Web 页显示「已下发」。
+**属性写入不会自动回读**，中继是否真的改了，以它自己的串口日志为准。
+
+### 24.6 Web 管理端
+
+- 仪表盘 + 设备页的 OTA 区块都改成「**类型下拉 + 文件上传**」，另留「按容器内路径」的兜底表单
+- 设备页会按 `model` 自动预选类型（含 `Repeater` → `0x0002`，否则 `0x0001`），可手动改
+- 新增「中继发射功率」区块（20 / 14 / 8 / 2 / 0），显示上次下发记录
+- 新增 `_mp_field()`：multipart 表单里 `parse_qs` 用不了（会把二进制搅碎），
+  单独从 body 里取 `type` 字段；`_save_upload()` 增加 `dst` 参数
+
+### 24.7 编译出来的坑（都是编译器先发现的）
+
+1. `esp_zb_set_tx_power()` 在 1.6.8 里返回 **void**，不能 `esp_err_t err = …`
+2. `zb_ota_client.c` 需要 `esp_ota_ops.h` → `router/main/CMakeLists.txt`
+   的 `REQUIRES` 必须加 **`app_update`**（`esp_partition` 也补上）
+3. ★ `"\x10ESP32-C6-Repeater"` 是**错的**：编译器把 `\x10E` 当成一个十六进制转义
+   （`E` 也是十六进制数字）→ 报 `hex escape sequence out of range`，ZCL 字符串的
+   长度字节就废了。必须拆开写：`"\x10" "ESP32-C6-Repeater"`。
+   —— 这一条在**旧固件里就存在**（只是没人读 model），本次顺手修掉。
