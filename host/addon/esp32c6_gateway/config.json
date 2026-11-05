@@ -1,6 +1,6 @@
 {
   "name": "ESP32-C6 Zigbee Gateway",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "slug": "esp32c6_gateway",
   "description": "Bridges the ESP32-C6 Zigbee coordinator (JSON-Lines over USB-serial) to MQTT + Web UI",
   "url": "https://github.com/gerontec/esp32c6-zigbee-vital-gateway",

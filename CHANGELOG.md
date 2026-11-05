@@ -5,6 +5,46 @@ Format orientiert sich an *Keep a Changelog*, Versionierung an der Add-on-Versio
 (`host/addon/esp32c6_gateway/config.json`), weil das die einzige Versionsnummer ist,
 die Nutzer in der Oberfläche sehen.
 
+## [1.5.4] – 2026-11-05
+
+Schwerpunkt: **Geräte wirklich löschen können**. Ein Knoten, der in ein
+anderes Netz umgezogen ist, blieb bisher als Karteileiche stehen – in der
+Weboberfläche, in MQTT (retained) und in Home Assistant.
+
+### Added – Firmware (Koordinator, `main/`)
+
+- **`zb_gateway_remove_device()`** (`zb_gateway.c`) plus Serienbefehl
+  `{"cmd":"dev_remove","addr":"0x…"}`: entfernt den Eintrag aus der
+  Gerätetabelle **und** der NVS-Kopie (`devtab_save()`) und schickt
+  anschließend in einem eigenen Task ein ZDO `Mgmt_Leave_req` hinterher
+  (`rejoin = 0`, nur wenn die IEEE bekannt ist). Antwort:
+  `{"t":"dev_removed","addr":…,"ieee":…,"found":…,"leave":…}`.
+- Der Befehl ist in **beiden** Hälften verdrahtet – `main.c` (Dispatch) und
+  `ha_mqtt.c` (JSON→payload). Fehlt eine davon, antwortet der Koordinator
+  `{"t":"error","why":"unknown_cmd"}`; genau das passierte beim ersten
+  Versuch, obwohl die Funktion längst kompiliert war.
+- Grenze, bewusst so dokumentiert: ZBOSS' eigene Nachbar-/Routing-Tabelle
+  räumt der Aufruf nicht auf (keine API in `esp-zigbee-lib`); tote Nachbarn
+  fallen dort über das Link-Status-Aging von selbst heraus.
+
+### Added – Add-on (`host/addon/esp32c6_gateway/`)
+
+- **`_device_remove()`**: ein Pfad für „Gerät ist endgültig weg“.
+  Löscht retained Zustands-Topics, die HA-Discovery-Configs (auch die aus
+  dem Broker-Stand `_disc_remote`, nicht nur die in dieser Sitzung
+  publizierten), die Adress-/IEEE-Zuordnungen, `_noread`/`_ctrl`, die
+  Verfügbarkeits-Zettel und die retained `dev/<addr>/status`; danach
+  `_nodes_save()`. Erst dann geht `dev_remove` an den Koordinator.
+- `POST /api/device/<addr>/delete` nutzt diesen Pfad (vorher: nur
+  `_state["devices"].pop()` + DB-Zeile – die Kachel war nach 60 s zurück,
+  weil der Heartbeat die Gerätetabelle erneut schickt und `t=="lqi"` sie
+  per `setdefault` wieder anlegt).
+- Neue Nachricht `{"t":"dev_removed"}`: bestätigt das Löschen und räumt
+  Reste nach, falls die Adresse hier noch bekannt war.
+- Geräteseite: Knopf heißt jetzt „从网关彻底移除（含 HA 实体）“ und nennt
+  in der Rückfrage die vier Wirkungen. Der wirkungslose Eintrag `leave`
+  im Befehls-Dropdown ist entfernt (die Firmware kannte ihn nie).
+
 ## [1.5.3] – 2026-10-26
 
 Erste getaggte Version. Schwerpunkt: **Netzwerktopologie sichtbar machen,

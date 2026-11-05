@@ -123,7 +123,7 @@ DB_MAC = BASE.split("/")[-1][:8]
 
 # Muss zu config.json passen. Steht im Startbanner und im Web-UI – damit ist
 # sofort erkennbar, ob der Container wirklich den neuen Code fährt.
-GW_VERSION = "1.5.3"
+GW_VERSION = "1.5.4"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
 # Jedes Zigbee-Gerät/Endpoint wird beim ersten Daten-Telegramm automatisch als
@@ -1875,6 +1875,65 @@ def _purge_addr(addr, why):
         print(f"[HA] {addr} verworfen ({why}): {len(subs)} Zustands-Topics, "
               f"{gone} Discovery-Configs entfernt")
     _nodes_save()
+
+
+def _device_remove(addr, why="manuell entfernt", tell_c6=True):
+    """Gerät restlos entfernen – Liste, Broker und HA.
+
+    Reihenfolge zählt:
+      1. Node-Namen merken, denn _purge_addr() löscht das Mapping.
+      2. Retained Discovery-Configs wegnehmen. _sent_addr kennt nur, was in
+         DIESER Sitzung publiziert wurde – nach einem Add-on-Neustart ist das
+         leer. Deshalb zusätzlich über _disc_remote (Broker-Stand vom Start)
+         nach dem Knotennamen suchen.
+      3. _purge_addr(): Zustands-Topics, Mappings, _noread/_ctrl, _nodes_save.
+      4. Verfügbarkeits-Merkzettel + retained online/offline.
+      5. Laufzeit-Zustand (devices / node_desc).
+      6. Dem C6 sagen, dass er den Eintrag auch selbst löschen soll. Ohne
+         Schritt 6 hält das Löschen exakt 60 s: der Heartbeat schickt die
+         vollständige Geräteliste, und `t == "lqi"` legt fehlende Einträge
+         per setdefault wieder an (2026-11-05 an 0x023b genau so passiert).
+    """
+    addr = (addr or "").strip()
+    if not addr:
+        return False
+    node = _ha_nodes.get(addr) or _addr_nodes.get(addr)
+
+    topics = set()
+    if node:
+        for t in list(_disc_remote):
+            parts = t.split("/")
+            if len(parts) >= 5 and parts[2] == node:
+                topics.add(t)
+    topics |= {t for t, a in list(_sent_addr.items()) if a == addr}
+    for t in topics:
+        mq_put(t, "", retain=True, qos=1)
+        _ha_sent.pop(t, None)
+        _sent_addr.pop(t, None)
+        _disc_remote.pop(t, None)
+
+    _purge_addr(addr, why)
+
+    for d in (_avail_last_ok, _avail_last_bad, _avail_pub):
+        d.pop(addr, None)
+    mq_put(_avail_topic(addr), "", retain=True, qos=1)
+
+    with _state_lock:
+        _state["devices"].pop(addr, None)
+        nd = _state.get("node_desc")
+        if isinstance(nd, dict):
+            nd.pop(addr, None)
+
+    if tell_c6:
+        try:
+            ser.write(_js({"cmd": "dev_remove", "addr": addr}).encode())
+            print(f"[→C6] dev_remove {addr}")
+        except Exception as e:                          # noqa: BLE001
+            print(f"[C6] dev_remove {addr} nicht gesendet: {e}")
+
+    print(f"[Web] {addr} entfernt: {len(topics)} Discovery-Configs, "
+          f"Zustands-Topics + Verfügbarkeit gelöscht ({why})")
+    return True
 
 
 def _ha_learn_ieee(addr, ieee):
@@ -3739,6 +3798,17 @@ def dispatch(line: str):
             abw = f"   (!) Wunsch {want} dBm, wirksam {eff} dBm – Anpassung griff nicht"
         print(f"[TX] Sendeleistung: Wunsch {want} dBm, wirksam {eff} dBm{abw}")
 
+    elif t == "dev_removed":
+        # Antwort auf unser "dev_remove": der C6 hat den Eintrag aus seiner
+        # Tabelle + NVS genommen. Falls hier noch Reste liegen (z. B. weil
+        # das Löschen von woanders angestoßen wurde), jetzt nachziehen.
+        a = msg.get("addr")
+        noch_da = a and (a in (_state.get("devices") or {}) or a in _addr_nodes)
+        print(f"[C6] Gerät {a} entfernt (IEEE {msg.get('ieee')}, "
+              f"in Tabelle: {msg.get('found')}, Leave: {msg.get('leave')})")
+        if noch_da:
+            _device_remove(a, "vom Koordinator entfernt", tell_c6=False)
+
     elif t == "lqi":
         # Momentaufnahme auf Anfrage (statt bis zum 60-s-Heartbeat zu warten).
         # Wird für den Sendeleistungs-Vergleich gebraucht: gleiche Stelle,
@@ -4443,13 +4513,12 @@ def _device_html(addr):
     <select name="cmd" style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em">
       <option value="switch2wifi">switch2wifi</option>
       <option value="node_desc">node_desc（查角色：Router / End Device）</option>
-      <option value="leave">leave</option>
     </select>
     <button type="submit">发送</button>
   </form>
   <form method="POST" action="/api/device/{addr}/delete"
-        onsubmit="return confirm('确定移除设备 {addr} 吗？')">
-    <button type="submit" style="margin-top:.5em;background:#5a1a1a;color:#ffaaaa;border:1px solid #aa3333;padding:.25em .75em">&#x1F5D1; 从列表移除</button>
+        onsubmit="return confirm('彻底移除设备 {addr}？\\n\\n会做四件事：\\n① 让协调器把这条记录从表里和 NVS 里删掉（并向设备补发一次 Mgmt_Leave）\\n② 删除全部 MQTT retained 状态话题\\n③ 删除 HA 的 Discovery 配置（实体变成“已移除”）\\n④ 清掉可用性标记\\n\\n设备若仍在本网络中，它会掉网；要重新用就重新配对。')">
+    <button type="submit" style="margin-top:.5em;background:#5a1a1a;color:#ffaaaa;border:1px solid #aa3333;padding:.25em .75em">&#x1F5D1; 从网关彻底移除（含 HA 实体）</button>
   </form>
   <h3 style="color:#7ecbff;margin-top:1em">休眠间隔</h3>
   <form method="POST" action="/api/sleep">
@@ -4617,9 +4686,9 @@ class _Handler(BaseHTTPRequestHandler):
                 uart_msg = _js({"cmd": "node_desc", "addr": addr})
                 ser.write(uart_msg.encode())
                 print(f"[→C6] {uart_msg.strip()}")
-            elif cmd == "leave":
-                uart_msg = _js({"cmd": "leave"})
-                ser.write(uart_msg.encode())
+            # (Das frühere "leave" war ein Blindgänger: die Firmware kannte
+            #  den Befehl nie. Ersetzt durch den eigenen dev_remove-Pfad,
+            #  siehe /api/device/<addr>/delete.)
             self.send_response(302)
             self.send_header("Location", f"/device/{addr}")
             self.end_headers()
@@ -4645,8 +4714,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/device/") and path.endswith("/delete"):
             addr = path[len("/api/device/"):-len("/delete")]
-            with _state_lock:
-                _state["devices"].pop(addr, None)
+            _device_remove(addr, "im Web-UI entfernt")
             try:
                 with _db_lock:
                     cx = _db_connect()

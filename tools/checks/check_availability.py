@@ -263,5 +263,50 @@ chk("测的" not in h2, "新鲜 LQI（5 秒）不加年龄")
 h3 = mod._lqi_cell(0, 50, time.time() - 600)
 chk("未测" in h3, "lqi=0 仍然显示「未测」")
 
+print("== D：设备彻底移除（0x023b 已配到别的网络，用户要求删掉）")
+# 只删 add-on 是不够的：协调器每 60 s 把整份设备表发过来，`t=="lqi"` 用
+# setdefault 把缺的补回来 —— 网页上删掉的设备一分钟后自己回来。所以
+# _device_remove() 必须同时清 broker、清映射、并让固件删它自己的表。
+mod._addr_nodes.clear(); mod._ha_nodes.clear(); mod._addr_ieee.clear()
+mod._state["devices"].clear(); mod._state["node_desc"].clear()
+mod._avail_last_ok.clear(); mod._avail_last_bad.clear(); mod._avail_pub.clear()
+mod._disc_remote.clear(); mod._sent_addr.clear(); mod._addr_subs.clear()
+A = "0xbeef"
+mod._addr_nodes[A] = "c6_" + A
+mod._ha_nodes[A] = "c6_" + A
+mod._state["devices"][A] = {"clusters": {}}
+mod._state["node_desc"][A] = {"role": "router"}
+mod._avail_last_ok[A] = time.time()
+mod._avail_pub[A] = "online"
+cfg_mein  = f"homeassistant/switch/c6_{A}/ep1_on_off/config"
+cfg_fremd = "homeassistant/switch/c6_ffff/ep1_on_off/config"
+mod._disc_remote[cfg_mein]  = json.dumps({"name": "x"}, sort_keys=True)
+mod._disc_remote[cfg_fremd] = json.dumps({"name": "y"}, sort_keys=True)
+mod._sent_addr[cfg_mein] = A
+mod._addr_subs[A] = ["on_off", "ep1/on_off"]
+SENT.clear()
+chk(mod._device_remove(A, "Test", tell_c6=False) is True, "返回 True")
+chk(A not in mod._state["devices"], "★ 从设备表移除")
+chk(A not in mod._state["node_desc"], "从 node_desc 表移除")
+chk(A not in mod._addr_nodes and A not in mod._ha_nodes,
+    "映射清掉（否则心跳 60 s 后自己回来）")
+chk(not mod._avail_last_ok.get(A) and not mod._avail_pub.get(A), "可用性记分板清掉")
+leer = {t for t, p, r in SENT if r and (p == "" or p is None)}
+chk(cfg_mein in leer, "★ 删掉 HA Discovery 配置（retained 空消息）")
+chk(f"gw/coordinator/zigbee/{A}/on_off" in leer, "★ 删掉 retained 状态话题")
+chk(f"gw/coordinator/dev/{A}/status" in leer, "★ 删掉设备可用性话题")
+chk(cfg_fremd not in leer and cfg_fremd in mod._disc_remote,
+    "★ 别的节点的 Config 一律不碰")
+chk(cfg_mein not in mod._disc_remote, "broker 镜像里也不再留着")
+
+print("== 固件回执 dev_removed（幂等，不重复发 dev_remove）")
+mod._state["devices"][A] = {"clusters": {}}
+mod.dispatch(json.dumps({"t": "dev_removed", "addr": A, "ieee": "unbekannt",
+                         "found": True, "leave": False}))
+chk(A not in mod._state["devices"], "★ 收到 dev_removed 后 add-on 侧残留被清")
+mod.dispatch(json.dumps({"t": "dev_removed", "addr": "0xcccc", "ieee": "-",
+                         "found": False, "leave": False}))
+chk("0xcccc" not in mod._state["devices"], "陌生地址的 dev_removed 不建新条目")
+
 print("RESULT:", "FAIL" if fail else "ALL OK")
 sys.exit(1 if fail else 0)
