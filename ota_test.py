@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ota_test.py – Firmware-OTA ueber COM9 direkt antreiben (ohne MQTT/HA).
+"""ota_test.py – 直接通过 COM9 驱动固件 OTA（不经过 MQTT/HA）。
 
 Protokoll (identisch zu serial_gateway.py):
     {"cmd":"fw_ota_start","size":N}
@@ -9,9 +9,8 @@ Protokoll (identisch zu serial_gateway.py):
 Antworten:
     {"t":"fw_ota","st":"begin"|"write"|"done"|"error", ...}
 
-Der Test reproduziert zuerst das alte Verhalten (80 B / 16 pro Stoss / kein
-Delay) und kann dann mit anderem Pacing erneut laufen, um die Ursache des
-Abbruchs bei 1280 B einzukreisen.
+这个测试先复现旧行为（80 B / 每批 16 帧 / 不带延时），再换别的节拍重跑，
+以便把 1280 B 处中断的原因圈出来。
 
 Beispiele:
     python ota_test.py --chunk 80  --batch 16 --delay 0
@@ -52,7 +51,7 @@ class Link:
         self.ser.write(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
 
     def pump(self, secs):
-        """Liest fuer `secs` Sekunden und gibt neue JSON-Objekte zurueck."""
+        """读 `secs` 秒，把新出现的 JSON 对象返回。"""
         out = []
         end = time.time() + secs
         while time.time() < end:
@@ -96,13 +95,13 @@ def main():
     ap.add_argument("--ack-timeout", type=float, default=6.0)
     ap.add_argument("--boot-wait", type=float, default=3.0)
     ap.add_argument("--verify-reboot", action="store_true",
-                    help="nach fw_ota_end Boot-Log pruefen (braucht Port-Neuoefnung)")
+                    help="fw_ota_end 之后核对启动日志（需要重新打开端口）")
     args = ap.parse_args()
 
     size = os.path.getsize(args.bin)
     frames = -(-size // args.chunk)
     print(f"Bin: {args.bin} ({size} B)")
-    print(f"Plan: {frames} Frames à {args.chunk} B, {args.batch}/Stoß, "
+    print(f"计划：{frames} 帧 × {args.chunk} B，每批 {args.batch} 帧，"
           f"delay={args.delay}s\n")
 
     ser = open_port(args.port)
@@ -113,7 +112,7 @@ def main():
     link.send({"cmd": "fw_ota_start", "size": size})
     m = link.wait_for(lambda x: x.get("t") == "fw_ota", 10)
     if not m:
-        print("FAIL  kein 'begin' vom C6")
+        print("FAIL  C6 没回 'begin'")
         ser.close()
         return 1
     if m.get("st") == "error":
@@ -136,10 +135,10 @@ def main():
                     time.sleep(args.delay)
 
             if off >= size:
-                # Der C6 quittiert nur alle FW_ACK_EVERY (16) Frames. Ist die
-                # Gesamtzahl nicht durch 16 teilbar, kommt fuer den letzten
-                # Teil-Stoss gar kein ACK mehr -> sofort mit dem Ende
-                # weitermachen. Die Reihenfolge ist ueber den seriellen Strom
+                # C6 只在每 FW_ACK_EVERY（16）帧回一次执。若总数
+                # 不是 16 的整数倍，最后一小批就
+                # 再也不会有 ACK -> 立刻转到收尾
+                # 步骤。顺序由串口字节流本身
                 # garantiert (rx_task verarbeitet strikt nacheinander).
                 total_frames = -(-size // args.chunk)
                 if total_frames % args.batch == 0:
@@ -151,8 +150,8 @@ def main():
                         ser.close()
                         return 3
                 else:
-                    print(f"  letzter Teil-Stoß ohne ACK "
-                          f"({total_frames} Frames, {args.batch}/Stoß) -> Ende")
+                    print(f"  最后一批没有 ACK "
+                          f"（共 {total_frames} 帧，每批 {args.batch} 帧）-> 收尾")
                 break
 
             ack = link.wait_for(
@@ -162,7 +161,7 @@ def main():
                 print(f"\nFAIL  Timeout: gesendet {off}/{size}, "
                       f"letzter ACK {last_ack} "
                       f"({last_ack * 100 // size} %)")
-                print(f"      Stillstand nach {time.time()-t0:.1f}s")
+                print(f"      卡住了，停在 {time.time()-t0:.1f}s")
                 ser.close()
                 return 2
             if ack.get("st") == "error":
@@ -174,13 +173,13 @@ def main():
             print(f"  ACK off={last_ack} ({ack.get('pct', '?')} %) "
                   f"[gesendet {off}]")
 
-    print(f"\nAlle Bytes gesendet nach {time.time()-t0:.1f}s -> fw_ota_end")
+    print(f"\n全部字节发完，用时 {time.time()-t0:.1f}s -> fw_ota_end")
     link.send({"cmd": "fw_ota_end"})
     m = link.wait_for(lambda x: x.get("t") == "fw_ota" and
                       x.get("st") in ("done", "error"), 20)
     ser.close()
     if not m:
-        print("FAIL  kein 'done' nach fw_ota_end")
+        print("FAIL  fw_ota_end 之后没有 'done'")
         return 4
     if m.get("st") == "error":
         print(f"FAIL  end: {m.get('why')}")

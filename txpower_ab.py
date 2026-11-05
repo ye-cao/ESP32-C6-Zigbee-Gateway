@@ -1,28 +1,28 @@
 # -*- coding: utf-8 -*-
-"""txpower_ab.py – Sendeleistung des C6 messtechnisch vergleichen.
+"""txpower_ab.py – 用实测比较 C6 的发射功率。
 
-Frage, die das hier beantwortet: bringt +20 dBm an einer Keramikantenne
-mehr Reichweite, oder verheizt die PA die obersten dB in Verzerrung?
-Eine Vermutung ersetzt keine Messung – also wird gemessen.
+要回答的问题是：在陶瓷天线上 +20 dBm 到底
+是增加了覆盖，还是让 PA 把最上面那几个 dB 烧成了失真？
+猜不能代替测 —— 所以去测。
 
-WICHTIG zur Messgröße
+关于测量对象（重要）
 ---------------------
-LQI und RSSI, die der C6 meldet, beschreiben den **Uplink** (Gerät → C6):
-beides wird am empfangenen Frame gemessen (zb_gateway.c, aps_data_ind_cb →
-ind.lqi / esp_ieee802154_get_recent_rssi). Die Sendeleistung des Gateways
-ändert daran nichts. Wer hier LQI vorher/nachher vergleicht, misst Rauschen
-und zieht den falschen Schluss.
+C6 报的 LQI 和 RSSI 描述的是**上行**（设备 → C6）：
+两者都在收到的帧上测量（zb_gateway.c，aps_data_ind_cb →
+ind.lqi / esp_ieee802154_get_recent_rssi）。网关的发射功率
+对它们毫无影响。在这里比 LQI 的前后值，量到的是噪声，
+结论一定是错的。
 
-Was sich mit der Sendeleistung ändert, ist der **Downlink** (C6 → Gerät).
-Der einzige harte Beweis, dass ein Downlink-Frame angekommen ist, ist die
-Antwort des Geräts. Also: N-mal Read Attributes auf On/Off schicken und
-zählen, wie oft eine Antwort zurückkommt. Das ist die Messgröße.
+随发射功率变化的只有**下行**（C6 → 设备）。
+下行帧到底有没有到达，唯一的硬证据是设备的应答。
+所以：往 On/Off 连发 N 次 Read Attributes，
+数有多少次收到应答。这就是测量对象。
 
     python txpower_ab.py                        # 20/14/8/2 dBm, 10 Versuche
     python txpower_ab.py --levels 20,17,14 --n 20
-    python txpower_ab.py --dry-run              # nur zeigen, was gesendet würde
+    python txpower_ab.py --dry-run              # 只显示会发什么
 
-Umgebung: MQ_HOST / MQ_PORT / MQ_USER / MQ_PASS (wie mqtt_probe.py).
+环境变量：MQ_HOST / MQ_PORT / MQ_USER / MQ_PASS（同 mqtt_probe.py）。
 """
 import argparse
 import json
@@ -46,13 +46,13 @@ LQI_UP      = f"{BASE}/lqi"
 
 # ── Topic-Hilfen ───────────────────────────────────────────────────────────
 def state_topic(addr, ep):
-    """Wohin die Antwort auf Read Attributes geht (siehe _ha_publish)."""
+    """Read Attributes 的应答会发到哪个 topic（见 _ha_publish）。"""
     sub = "on_off" if int(ep) <= 1 else "ep%d/on_off" % int(ep)
     return f"{BASE}/zigbee/{addr}/{sub}"
 
 
 def key_of(payload):
-    """JSON → dict, sonst None."""
+    """JSON → dict，失败给 None。"""
     try:
         v = json.loads(payload)
     except Exception:
@@ -61,7 +61,7 @@ def key_of(payload):
 
 
 def dev_row(lqi_msg, addr):
-    """LQI/RSSI eines Geräts aus einer {"t":"lqi",…}-Meldung."""
+    """从一条 {"t":"lqi",…} 消息里取出设备的 LQI/RSSI。"""
     for d in (lqi_msg or {}).get("dev", []):
         if d.get("addr") == addr:
             return d.get("lqi"), d.get("rssi")
@@ -70,12 +70,12 @@ def dev_row(lqi_msg, addr):
 
 # ── Messung ────────────────────────────────────────────────────────────────
 class Runner(mp.Cli):
-    """Erbt Verbindungsaufbau und Paketlesen von mqtt_probe.Cli."""
+    """连接和收包都继承自 mqtt_probe.Cli。"""
 
     def __init__(self, dry=False, settle=6.0, timeout=4.0):
         super().__init__()
         self.dry = dry
-        # Im dry-run wird nichts gesendet, also gibt es auch nichts abzuwarten.
+        # dry-run 下什么都不发，也就没什么好等的。
         self.settle = 0.0 if dry else settle
         self.timeout = 0.01 if dry else timeout
 
@@ -84,7 +84,7 @@ class Runner(mp.Cli):
             return
         typ, fl, rc = self.connect("txpower-ab")
         if rc != 0:
-            sys.exit("CONNACK rc=%d – keine Berechtigung am Broker" % rc)
+            sys.exit("CONNACK rc=%d —— broker 上没有权限" % rc)
         for t in (f"{BASE}/zigbee/#", TX_TOPIC, LQI_UP):
             self.subscribe(t, 0)
         self.sk.settimeout(0.5)
@@ -111,7 +111,7 @@ class Runner(mp.Cli):
                 continue
             except (OSError, IOError):
                 break
-            if (t & 0xF0) != 0x30:                       # kein PUBLISH (z.B. SUBACK)
+            if (t & 0xF0) != 0x30:                       # 不是 PUBLISH（比如 SUBACK）
                 continue
             qos = (t >> 1) & 3
             tl = int.from_bytes(body[:2], "big")
@@ -123,7 +123,7 @@ class Runner(mp.Cli):
         return out
 
     def wait_for(self, topic, seconds):
-        """Auf eine bestimmte Meldung warten; gibt Payload oder None."""
+        """等某条特定消息；返回负载或 None。"""
         t0 = time.time()
         while time.time() - t0 < seconds:
             for t, p in self.pump(0.5):
@@ -142,14 +142,14 @@ class Runner(mp.Cli):
         if tx:
             row["eff"] = tx.get("eff")
             if tx.get("eff") != tx.get("want"):
-                print("   ! Wunsch %s dBm, wirksam %s dBm – Anpassung griff nicht"
+                print("   ! 期望 %s dBm，实际 %s dBm —— 调整没生效"
                       % (tx.get("want"), tx.get("eff")))
             else:
                 print("   wirksam: %s dBm" % tx.get("eff"))
         elif not self.dry:
-            print("   ! keine txpower-Rückmeldung – läuft dort eine alte Firmware?")
+            print("   ! 没有 txpower 回执 —— 那边是不是还跑着老固件？")
 
-        print("   warte %.0f s bis sich der Funkpfad beruhigt hat …" % self.settle)
+        print("   等 %.0f s，让射频路径稳下来 …" % self.settle)
         self.pump(self.settle)
 
         target = state_topic(addr, ep)
@@ -179,7 +179,7 @@ class Runner(mp.Cli):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--addr", default="0x747d", help="Gerät (kurze Adresse)")
+    ap.add_argument("--addr", default="0x747d", help="设备（短地址）")
     ap.add_argument("--ep", type=int, default=1, help="Endpunkt (Panel oft 2)")
     ap.add_argument("--levels", default="20,14,8,2", help="dBm-Stufen")
     ap.add_argument("--n", type=int, default=10, help="Versuche je Stufe")
@@ -192,16 +192,16 @@ def main():
     levels = [int(x) for x in a.levels.split(",") if x.strip()]
     r = Runner(dry=a.dry_run, settle=a.settle, timeout=a.timeout)
     print("Broker %s:%d   Basis %s" % (mp.HOST, mp.PORT, BASE))
-    print("Gerät %s ep%d, %d Versuche je Stufe, Stufen %s"
+    print("设备 %s ep%d，每档 %d 次尝试，档位 %s"
           % (a.addr, a.ep, a.n, levels))
     if a.dry_run:
-        print("(dry-run: es wird nichts gesendet)")
+        print("（dry-run：什么都不会发）")
     r.open()
 
     rows = [r.measure(d, a.addr, a.ep, a.n, 0.0 if a.dry_run else a.pause)
             for d in levels]
 
-    print("\n%-9s %-8s %-9s %-5s %-8s" % ("Wunsch", "wirksam", "Antwort", "LQI", "RSSI"))
+    print("\n%-9s %-8s %-9s %-5s %-8s" % ("期望", "实际", "应答", "LQI", "RSSI"))
     print("-" * 44)
     for x in rows:
         print("%-9s %-8s %-9s %-5s %-8s" % (
@@ -211,25 +211,25 @@ def main():
             x["lqi"] if x["lqi"] is not None else "–",
             ("%d dBm" % x["rssi"]) if x["rssi"] is not None else "–"))
 
-    # Auswertung: kleinste Stufe, die noch alle Versuche beantwortet.
+    # 评估：仍能把所有尝试都答上的最小一档。
     if a.dry_run:
         return
     full = [x for x in rows if x["ok"] == x["n"]]
     if full:
         best = min(full, key=lambda x: x["eff"] if x["eff"] is not None else x["want"])
-        print("\nKleinste Stufe ohne einen einzigen Fehlversuch: %+d dBm" % best["want"])
+        print("\n一次都没失败的最小档位：%+d dBm" % best["want"])
         better_high = [x for x in rows if x["want"] > best["want"] and x["ok"] < x["n"]]
         if better_high:
-            print("Höhere Stufen waren NICHT besser – oben hat die PA nichts gutgemacht.")
+            print("更高的档位**并没有**更好 —— 再往上 PA 也没加分。")
         else:
-            print("Höhere Stufen waren mindestens gleich gut. Solange die Störumgebung "
-                  "es zulässt, ist die höchste Stufe die sichere Wahl.")
+            print("更高的档位至少一样好。只要干扰环境允许，"
+                  "最高那一档就是稳妥的选择。")
     else:
-        print("\nKeine Stufe hat alle Versuche geschafft. Dann ist nicht die "
-              "Sendeleistung das Problem, sondern Strecke/Antenne/Störer.")
+        print("\n没有哪一档能过全部尝试。那问题就不是发射功率，"
+              "而是距离/天线/干扰源。")
     if any(x["eff"] is not None and x["eff"] != x["want"] for x in rows):
-        print("Achtung: mindestens eine Stufe wurde anders gefahren als gewünscht – "
-              "in der Tabelle steht der wirksame Wert.")
+        print("注意：至少有一档实际跑的不是期望值 —— "
+              "表里写的是实际生效的值。")
 
 
 if __name__ == "__main__":

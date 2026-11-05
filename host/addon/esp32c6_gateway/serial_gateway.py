@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-serial_gateway.py – liest JSON-Lines vom ESP32-C6 (COM-Port)
-und published sie als MQTT an den Broker + schreibt in MariaDB.
-Web-Dashboard auf Port 8080.
+serial_gateway.py —— 读取 ESP32-C6 的 JSON-Lines（COM 口），
+转成 MQTT 发到 broker，同时写进 MariaDB。
+Web 面板在 8080 端口。
 
-Verwendung:
+用法：
     python3 serial_gateway.py
     python3 serial_gateway.py --port /dev/ttyACM1 --broker 192.168.178.218
 """
@@ -23,15 +23,15 @@ import serial
 import paho.mqtt.client as mqtt
 import pymysql
 
-# ── Log-Zeitstempel: lokale Zeitzone, nicht Container-UTC ────────────────
-# Der HA-Add-on-Container läuft ohne TZ in UTC – dann steht im Log 02:33,
-# während an der Uhr 10:33 steht. Quelle ist deshalb (in dieser Reihenfolge):
-#   1. LOG_TZ  (vom Add-on aus der Option "timezone" gesetzt)
-#   2. TZ      (nur wenn nicht UTC/GMT)
-#   3. /etc/timezone bzw. Symlink /etc/localtime
-#   4. Systemzeit (unverändert)
+# ── 日志时间戳：用本地时区，不是容器 UTC ─────────────────────────────────
+# HA 加载项容器默认没有 TZ，于是日志写 02:33，而墙上的钟是 10:33。
+# 所以按这个顺序找时区来源：
+#   1. LOG_TZ  （由加载项从 "timezone" 选项设置）
+#   2. TZ      （仅当不是 UTC/GMT 时）
+#   3. /etc/timezone 或符号链接 /etc/localtime
+#   4. 系统时间（原样使用）
 def _resolve_local_tz():
-    """Gibt (tzinfo|None, Anzeigename) zurück. None = Systemzeit verwenden."""
+    """返回 (tzinfo|None, 显示名)。None = 使用系统时间。"""
     name = (os.getenv("LOG_TZ") or "").strip()
     if not name:
         env_tz = (os.getenv("TZ") or "").strip()
@@ -61,7 +61,7 @@ def _resolve_local_tz():
         return ZoneInfo(name), name
     except Exception:
         pass
-    # Kein tzdata im Image: TZ + tzset() als Notnagel
+    # 镜像里没有 tzdata：只好拿 TZ + tzset() 顶一下
     try:
         if hasattr(time, "tzset"):
             os.environ["TZ"] = name
@@ -83,13 +83,13 @@ def _ts() -> str:
 
 
 _print_raw = print
-def print(*args, **kwargs):   # noqa: A001 – absichtlich global überschrieben
+def print(*args, **kwargs):   # noqa: A001 —— 故意全局覆盖
     kwargs.setdefault("flush", True)
     _print_raw(_ts(), *args, **kwargs)
 
 _dt0 = datetime.now(_LOG_TZ) if _LOG_TZ else datetime.now().astimezone()
-print(f"[Log] Zeitzone {_LOG_TZ_NAME} · UTC{_dt0.strftime('%z')} · "
-      f"jetzt {_dt0.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"[Log] 时区 {_LOG_TZ_NAME} · UTC{_dt0.strftime('%z')} · "
+      f"现在 {_dt0.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ── Konfiguration ─────────────────────────────────────────────────────────
 DEFAULT_PORT   = "/dev/ttyACM0"
@@ -121,31 +121,30 @@ args = ap.parse_args()
 BASE   = args.base
 DB_MAC = BASE.split("/")[-1][:8]
 
-# Muss zu config.json passen. Steht im Startbanner und im Web-UI – damit ist
-# sofort erkennbar, ob der Container wirklich den neuen Code fährt.
+# 必须跟 config.json 里的版本号一致。它出现在启动横幅和网页上 ——
+# 这样一眼就能看出容器是不是真的在跑新代码。
 GW_VERSION = "1.5.4"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
-# Jedes Zigbee-Gerät/Endpoint wird beim ersten Daten-Telegramm automatisch als
-# HA-Entity angemeldet – es muss NICHTS in configuration.yaml eingetragen
-# werden (vorausgesetzt die HA-MQTT-Integration ist aktiv).
+# 每个 Zigbee 设备/端点都会在第一条数据帧到达时自动注册成 HA 实体 ——
+# configuration.yaml 里什么都不用写（前提是 HA 的 MQTT 集成已启用）。
 HA_PREFIX  = os.getenv("HA_PREFIX", "homeassistant")
 HA_ENABLED = os.getenv("HA_DISCOVERY", "1").lower() not in ("0", "no", "off", "false")
 # 每台设备独立的 availability（见 _ha_avail / _avail_sync）。
 # 关掉就退回"只看网关在线"，出问题时可以一条环境变量回滚。
 DEVICE_AVAIL = os.getenv("DEVICE_AVAIL", "1").lower() not in ("0", "no", "off", "false")
 
-# Modell-Datenbank aus den Zigbee2MQTT-Convertern (von gen_device_db.py erzeugt).
-# Schlüssel = ZCL Basic 0x0005 (ModelIdentifier). Damit werden Endpunkte und
-# Fähigkeiten eines frisch beigetretenen Geräts sofort richtig erkannt.
+# 型号数据库，来自 Zigbee2MQTT 的 converter（由 gen_device_db.py 生成）。
+# 键 = ZCL Basic 0x0005（ModelIdentifier）。有了它，刚入网设备的端点
+# 和能力立刻就能判对。
 _ha_db = {}
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "device_db.json"), encoding="utf-8") as _f:
         _ha_db = json.load(_f)
-    print(f"[HA] Gerätedatenbank: {len(_ha_db)} Modelle geladen")
+    print(f"[HA] 设备数据库：已载入 {len(_ha_db)} 个型号")
 except Exception as _e:
-    print(f"[HA] WARNUNG: device_db.json nicht ladbar ({_e}) – nur generische Discovery")
+    print(f"[HA] 警告：device_db.json 载入失败（{_e}）—— 只用通用 Discovery")
 
 # ── In-Memory State ────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
@@ -155,8 +154,8 @@ _state = {
     "channel":      0,
     "pan":          "–",
     "permit_join":  {"open": False, "seconds": 0},
-    # Sendepfad des Funks: "want" ist der Wunschwert, "eff" der von der PA
-    # zurückgelesene Istwert. Nur "eff" ist eine Messung (siehe §21).
+    # 射频发送链路："want" 是设定值，"eff" 是 PA 回读的实际值。
+    # 只有 "eff" 才是测量值（见 §21）。
     "tx_power":     {"want": None, "eff": None, "ts": ""},
     "devices":      {},   # addr → {ieee, name, last_seen, clusters: {name: value}}
     # 中继自报的父节点：addr → 父节点地址。来自中继固件把
@@ -185,8 +184,8 @@ _state = {
         "size":        0,
         "version":     1,
         "transferred": 0,
-        # image type: welche Geräteklasse bekommt dieses Image
-        #   0x0001 = Endgerät (client/, switch2wifi)
+        # image type：这次推给哪一类设备
+        #   0x0001 = 终端节点（client/，switch2wifi）
         #   0x0002 = Repeater (router/)
         "image_type":  0x0001,
         # 网关侧 OTA server 的内部计数（窗口命中/未命中/超时）
@@ -213,20 +212,17 @@ _ota_hash   = _OTA_FNV0
 _ota_sent   = 0
 _ota_next   = 0
 
-# ── Coordinator-Firmware-OTA über Serial ────────────────────────────────────
-# Bin liegt auf dem Pi; Blöcke gehen per UART an den C6, der sie via esp_ota
-# in die nächste OTA-Partition schreibt. Flow-Control: FW_BATCH Blöcke pro
-# Stoß, C6 quittiert alle FW_ACK_EVERY (=16) Blöcke mit st="write".
+# ── 协调器固件 OTA（走串口）─────────────────────────────────────────────────
+# bin 放在树莓派上；按块经 UART 送给 C6，C6 用 esp_ota 写进下一个 OTA 分区。
+# 流控：每批 FW_BATCH 块，C6 每收满 FW_ACK_EVERY（=16）块回一次 st="write"。
 _fw_ota_file = None
 _fw_ota_size = 0
 _fw_ota_off  = 0
 
-# ★ 2026-10-25: Zeitstempel des letzten {"t":"boot"}.
-# Der C6 startet den uart_rx-Task VOR esp_zb_start(); Befehle, die in diesem
-# Fenster ankommen, haben ihn in eine Reboot-Schleife geschickt
-# (Load access fault in zb_schedule_alarm). Firmware ist gefixt – dieses
-# Cooldown schützt zusätzlich alte Images und verhindert, dass der Transfer
-# durch einen Reboot mitten im OTA endgültig hängen bleibt.
+# ★ 2026-10-25：最后一次 {"t":"boot"} 的时间戳。
+# C6 在 esp_zb_start() **之前**就起了 uart_rx 任务；这个窗口期内到达的命令
+# 曾把它打进重启循环（zb_schedule_alarm 里 Load access fault）。固件已修 ——
+# 这段冷却时间额外保护老镜像，也避免传输被 OTA 中途的一次重启彻底卡死。
 _gw_boot_ts = 0.0
 _GW_BOOT_COOLDOWN = 8.0
 _fw_ota_restarts = 0
@@ -240,32 +236,29 @@ def _env_int(name, default, lo, hi):
     return max(lo, min(hi, v))
 
 
-# Frame-Größe: eine Zeile ist 43 + len(str(off)) + 2*chunk Zeichen lang.
-# Der C6 liest Kommandos mit fgets(buf, BUF_SIZE). Ältere Builds haben
-# BUF_SIZE=256 – eine ~950-Zeichen-Zeile wird dann in Fragmente zerhackt und
-# STILLSCHWEIGEND verworfen (genau das Symptom: begin kommt, dann nie ein
-# "write"-ACK). Mit chunk=96 bleibt die Zeile bei ~241 Zeichen und passt
-# auch in den alten Puffer – dafür dauert der Transfer ein paar Minuten.
+# 帧长：一行是 43 + len(str(off)) + 2*chunk 个字符。
+# C6 用 fgets(buf, BUF_SIZE) 读命令。老固件 BUF_SIZE=256 —— 一条 ~950 字符的行
+# 会被切成碎片然后**静默丢弃**（症状正是：begin 到了，却永远等不到 "write" ACK）。
+# 用 chunk=96 时一行约 241 字符，老缓冲也装得下 —— 代价是传输要多花几分钟。
 FW_CHUNK = _env_int("FW_CHUNK", 80, 32, 512)
 FW_BATCH = _env_int("FW_BATCH", 16, 1, 64)
 
-# Startbanner: ohne diese Zeile läuft noch ein alter Build im Container.
+# 启动横幅：没有这一行，说明容器里跑的还是旧构建。
 print(f"[GATEWAY] v{GW_VERSION} · OTA-Frame {FW_CHUNK} B × {FW_BATCH} = "
-      f"{FW_CHUNK * FW_BATCH} B/Stoß · kompaktes JSON")
+      f"{FW_CHUNK * FW_BATCH} B/批 · 紧凑 JSON")
 
 def _js(obj) -> str:
-    """Kompaktes JSON + Zeilenende (für Log-Ausgabe und .encode())."""
+    """紧凑 JSON + 换行（用于日志输出和 .encode()）。"""
     return json.dumps(obj, separators=(",", ":")) + "\n"
 
 
 def _j(obj) -> bytes:
-    """Kompaktes JSON für die UART – ohne Leerzeichen nach ':' und ','.
+    """给 UART 用的紧凑 JSON —— ':' 和 ',' 后面都不加空格。
 
-    Wichtig: alte Firmware-Builds parsen mit `strstr(buf, "\\"data\\":\\"")`.
-    `json.dumps()` schreibt standardmäßig `"data": "…"` (Leerzeichen nach dem
-    Doppelpunkt) – das wird von so einem starren strstr nie gefunden, der Frame
-    verschwindet still. Kompakt geschrieben (`"data":"…"`) erfüllen wir beide
-    Parser-Varianten, die alte strenge und die neue tolerante (json_val).
+    注意：老固件是用 `strstr(buf, "\\"data\\":\\"")` 解析的。
+    `json.dumps()` 默认写 `"data": "…"`（冒号后带空格）—— 这种死板的
+    strstr 永远找不到，帧就被静默丢掉了。写成紧凑形式（`"data":"…"`）可以
+    同时满足两种解析器：老的那套严格的，和新的那套宽松的（json_val）。
     """
     return _js(obj).encode()
 
@@ -278,15 +271,15 @@ def _fw_ota_close():
     _fw_ota_off = 0
 
 def _save_upload(ctype: str, body: bytes, dst: str = None):
-    """Speichert die erste Datei aus einem multipart/form-data-Body.
+    """保存 multipart/form-data 请求体里的第一个文件。
 
-    Nötig, weil /data im Add-on-Container liegt und auf dem HA-Host nicht
-    sichtbar ist – Hochladen im Browser ist der einzige Weg ohne Samba.
-    Gibt den geschriebenen Pfad zurück (oder None).
+    需要这样做，是因为 /data 在 add-on 容器里，HA 主机上看不到 ——
+    不装 Samba 的话，从浏览器上传就是唯一的路。
+    返回写好的路径（或 None）。
 
-    dst: optionaler Zielpfad. Wichtig für OTA – jede Geräteklasse braucht ihr
-    eigenes Image, sonst überschreibt der Repeater-Upload das Endgerät-Image
-    (und umgekehrt), bevor irgendwer es geflasht hat.
+    dst：可选目标路径。对 OTA 很重要 —— 每类设备都要有自己的镜像，
+    否则中继上传会把终端设备的镜像覆盖掉（反过来也一样），
+    而那时还没人刷过。
     """
     import re as _re
     m = _re.search(r"boundary=([^;]+)", ctype)
@@ -300,23 +293,23 @@ def _save_upload(ctype: str, body: bytes, dst: str = None):
         if not sep or not data:
             continue
         if data.endswith(b"\r\n"):
-            data = data[:-2]                       # abschließendes CRLF der Part
+            data = data[:-2]                       # 去掉这一部分结尾的 CRLF
         if not data:
             continue
         if not dst:
             dst = "/data/fw_upload.bin" if os.path.isdir("/data") else "/tmp/fw_upload.bin"
         with open(dst, "wb") as f:
             f.write(data)
-        print(f"[OTA] Upload: {len(data)} Bytes → {dst}")
+        print(f"[OTA] 上传：{len(data)} 字节 → {dst}")
         return dst
     return None
 
 def _mp_field(ctype: str, body: bytes, name: str):
-    """Liest ein gewöhnliches Textfeld aus einem multipart/form-data-Body.
+    """读取 multipart/form-data 请求体里的一个普通文本字段。
 
-    Nötig, weil do_POST bei multipart `params = {}` setzt (parse_qs würde die
-    Binärdaten verstümmeln) – damit sind aber auch die <select>-Felder im
-    selben Formular unsichtbar. Für /api/ota brauchen wir genau die (image type).
+    需要这样做，是因为 do_POST 遇到 multipart 会把 `params` 置成 `{}`
+    （parse_qs 会弄坏二进制）—— 可这样一来同一个表单里的 <select> 字段
+    也就看不见了。而 /api/ota 要的正是它（image type）。
     """
     import re as _re
     m = _re.search(r"boundary=([^;]+)", ctype)
@@ -333,7 +326,7 @@ def _mp_field(ctype: str, body: bytes, name: str):
 
 
 def _ota_image_type(raw_val, default=0x0001) -> int:
-    """Parst '0x0001' / '1' / None robust zu int."""
+    """把 '0x0001' / '1' / None 稳妥地转成 int。"""
     if raw_val is None:
         return default
     s = str(raw_val).strip()
@@ -349,10 +342,10 @@ def _ota_image_type(raw_val, default=0x0001) -> int:
 
 
 def _fw_ota_watchdog():
-    """Meldet, wenn der C6 die Datenframes nicht mehr quittiert.
+    """C6 不再回数据帧时发出告警。
 
-    Ohne das bleibt der Transfer stumm stehen und man sieht nur "7168/789804"
-    – ohne jede Erklärung, warum es nicht weitergeht.
+    没有它，传输就那么静静地停住，只看到 "7168/789804" ——
+    完全不知道为什么走不下去。
     """
     last, still = -1, 0
     while True:
@@ -362,30 +355,30 @@ def _fw_ota_watchdog():
         if _fw_ota_off == last:
             still += 5
             if still == 20:
-                print(f"[OTA] WARNUNG: seit 20 s keine Quittung vom C6 "
-                      f"(steht bei {_fw_ota_off}/{_fw_ota_size}).")
+                print(f"[OTA] 警告：20 s 没收到 C6 的回执 "
+                      f"（停在 {_fw_ota_off}/{_fw_ota_size}）。")
                 if FW_CHUNK <= 128:
-                    print("[OTA] Die Frames sind mit "
-                          f"{FW_CHUNK} B (~{2*FW_CHUNK+50} Zeichen) bereits klein "
-                          "genug für einen 256-Byte-Puffer → der laufende Build "
-                          "kann fw_ota_data nicht parsen. Dann hilft nur noch "
-                          "esptool über USB.")
+                    print("[OTA] 帧长只有 "
+                          f"{FW_CHUNK} B（约 {2*FW_CHUNK+50} 个字符），已经小到 "
+                          "256 字节的缓冲都够用 ⇒ 正在跑的固件 "
+                          "解析不了 fw_ota_data。那就只能 "
+                          "用 esptool 走 USB 了。")
                 else:
                     print("[OTA] Vermutlich BUF_SIZE=256 im laufenden Build: "
-                          f"ein Frame ist {FW_CHUNK} B ≈ {2*FW_CHUNK+50} Zeichen. "
-                          "Add-on-Option 'fw_chunk' auf 80 setzen und neu starten.")
+                          f"一帧是 {FW_CHUNK} B ≈ {2*FW_CHUNK+50} 个字符。"
+                          "把加载项选项 'fw_chunk' 设成 80 再重启。")
         else:
             last, still = _fw_ota_off, 0
 
 
 def _fw_ota_start(bin_path: str):
-    """Coordinator-Firmware über USB-Serial flashen (esp_ota)."""
+    """通过 USB 串口刷协调器固件（esp_ota）。"""
     global _fw_ota_file, _fw_ota_size, _fw_ota_off
     import os as _os
     if not bin_path:
         bin_path = "/data/zigbee-vital-sensor.bin"
     if not _os.path.isfile(bin_path):
-        print(f"[OTA] Coordinator-Datei nicht gefunden: {bin_path}")
+        print(f"[OTA] 找不到协调器固件文件：{bin_path}")
         with _state_lock:
             _state["fw_ota"]["status"] = "error"
         return
@@ -403,12 +396,12 @@ def _fw_ota_start(bin_path: str):
     batches = -(-frames // FW_BATCH)
     est_s   = batches * 0.55 + frames * 0.004
     print(f"[OTA] Coordinator-Update: {bin_path} size={_fw_ota_size}")
-    print(f"[OTA] Plan: {frames} Frames à {FW_CHUNK} B, {FW_BATCH} pro Stoß → "
-          f"{batches} Stöße, geschätzt {est_s/60:.1f} min")
+    print(f"[OTA] 计划：{frames} 帧 × {FW_CHUNK} B，每批 {FW_BATCH} 帧 ⇒ "
+          f"{batches} 批，预计 {est_s/60:.1f} 分钟")
     threading.Thread(target=_fw_ota_watchdog, daemon=True).start()
 
 def _fw_ota_send_batch():
-    """FW_BATCH Blöcke ab aktuellem Offset senden; letzter Stoß löst Ende aus."""
+    """从当前偏移开始发 FW_BATCH 个块；最后一批发出后就触发结束。"""
     global _fw_ota_off
     if _fw_ota_file is None:
         return
@@ -426,13 +419,13 @@ def _fw_ota_send_batch():
         _state["fw_ota"]["off"] = _fw_ota_off
         _state["fw_ota"]["status"] = "transferring"
     pct = (_fw_ota_off * 100 // _fw_ota_size) if _fw_ota_size else 0
-    print(f"[OTA] coordinator {_fw_ota_off}/{_fw_ota_size} Bytes gesendet ({pct} %)")
+    print(f"[OTA] 协调器 {_fw_ota_off}/{_fw_ota_size} 字节，已发送 ({pct} %)")
     if _fw_ota_off >= _fw_ota_size:
         ser.write(b'{"cmd":"fw_ota_end"}\n')
-        print("[OTA] coordinator: alle Bytes übertragen – Ende …")
+        print("[OTA] 协调器：全部字节已发完 —— 结束 …")
 
 def _now():
-    """Datum/Uhrzeit in Ortszeit (identisch zum Log-Zeitstempel)."""
+    """本地时区的日期/时间（与日志时间戳一致）。"""
     if _LOG_TZ is not None:
         return datetime.now(_LOG_TZ).strftime("%d.%m. %H:%M:%S")
     return datetime.now().strftime("%d.%m. %H:%M:%S")
@@ -522,9 +515,9 @@ def db_init():
                     "last_seen": ts, "clusters": {}
                 })
         cur.close()
-        print(f"[DB] verbunden {DB_HOST}/{DB_NAME} mac={DB_MAC} devices={len(_state['devices'])}")
+        print(f"[DB] 已连接 {DB_HOST}/{DB_NAME} mac={DB_MAC} devices={len(_state['devices'])}")
     except Exception as e:
-        print(f"[DB] Fehler bei Init: {e}")
+        print(f"[DB] 初始化出错：{e}")
         _db_conn = None
 
 def db_insert_chan_scan(ch, count, nets_json):
@@ -572,7 +565,7 @@ def db_upsert_zigbee_device(addr, ieee=""):
             print(f"[DB] zigbee device upsert: {e}")
 
 def _extract_value(cluster, raw):
-    # Multi-Gang-Geräte: Sub-Topic kann "ep2/on_off" etc. sein → Basisnamen vergleichen
+    # 多联设备：子 topic 可能是 "ep2/on_off" 之类 → 比对基础名
     base = cluster.rsplit("/", 1)[-1] if "/" in cluster else cluster
     if base == "temperature":
         r = raw.get("raw")
@@ -608,36 +601,32 @@ if args.user:
     mq.username_pw_set(args.user, args.passwd)
 mq.will_set(f"{BASE}/status", "offline", retain=True, qos=1)
 
-# ── MQTT-Ausgang: einheitlicher Publish-Pfad ──────────────────────────────
-# Nachbau von vier Mechanismen aus Zigbee2MQTT (lib/mqtt.ts), die hier fehlten:
+# ── MQTT 出口：统一的发布路径 ────────────────────────────────────────────
+# 复刻 Zigbee2MQTT（lib/mqtt.ts）里四个当时缺失的机制：
 #
-#  1. Topic-Prüfung. Ein Publish-Topic mit '+' oder '#' ist kein Topic, sondern
-#     ein Filter – der Broker antwortet mit einem Protokollfehler und trennt
-#     die Verbindung. Genau das ist beim Debuggen passiert (mqtt_probe.py mit
-#     'c6_#': sofortiger Disconnect). Ein Gerätename mit '#' würde die
-#     Gateway-Verbindung also hart abschießen → vorher abfangen.
-#  2. Registry der retained Nachrichten. Läuft der Broker ohne Persistenz,
-#     sind nach seinem Neustart alle Discovery-Configs weg und HA kennt die
-#     Entities nicht mehr. Z2M setzt seine retained Nachrichten deshalb 2 s
-#     nach jedem Verbindungsaufbau erneut (lib/mqtt.ts, onConnect).
-#  3. Echo-Schutz. Wir abonnieren {BASE}/cmd/+, {BASE}/set/# und – während des
-#     Startfensters – {HA_PREFIX}/+/+/+/config. Auf {BASE}/cmd/* publizieren
-#     wir selbst (Web-Formulare), deshalb ist dieser Zweig ausdrücklich von der
-#     Echo-Unterdrückung ausgenommen (siehe on_message).
-#  4. Ein Ausgangspunkt. Jeder Publish läuft über mq_put(); damit lassen sich
-#     Prüfungen und Buchführung an genau einer Stelle halten.
-_retained = {}       # topic → payload  (was wir mit retain=true gesetzt haben)
-_self_pub = {}       # topic → Zeitpunkt, bis zu dem ein Echo ignoriert wird
+#  1. Topic 校验。带 '+' 或 '#' 的 publish topic 不是 topic，而是过滤器 ——
+#     broker 会回一个协议错误并断开连接。调试时正踩了这个坑（mqtt_probe.py
+#     用 'c6_#'：立刻掉线）。所以设备名里带 '#' 会直接把网关连接打死
+#     → 必须提前拦下。
+#  2. retained 消息登记表。broker 若不落盘，它一重启所有 discovery 配置就没了，
+#     HA 也就不再认识这些实体。Z2M 因此每次连上之后 2 s 再发一遍 retained
+#     消息（lib/mqtt.ts, onConnect）。
+#  3. 回声保护。我们订阅 {BASE}/cmd/+、{BASE}/set/#，以及启动窗口期内的
+#     {HA_PREFIX}/+/+/+/config。而 {BASE}/cmd/* 是我们自己发的（网页表单），
+#     所以这一支明确豁免回声抑制（见 on_message）。
+#  4. 单一出口。所有 publish 都走 mq_put()；这样校验和记账只在一处维护。
+_retained = {}       # topic → payload（我们以 retain=true 发过的内容）
+_self_pub = {}       # topic → 忽略回声的截止时间
 
-# HA publiziert hier 'online', sobald es fertig gestartet ist. Z2M hängt
-# daran das erneute Senden aller Zustände (lib/extension/homeassistant.ts).
+# HA 启动完成后会在这里发 'online'。Z2M 就挂在这个事件上重发全部状态
+# （lib/extension/homeassistant.ts）。
 _HA_STATUS_TOPIC = "homeassistant/status"
 
 
 def mq_put(topic, payload, retain=False, qos=1):
-    """Einziger Ausgangspunkt für alle Publishes."""
+    """所有 publish 的唯一出口。"""
     if "+" in topic or "#" in topic:
-        print(f"[MQTT] Topic '{topic}' enthält ein Wildcard-Zeichen – nicht gesendet")
+        print(f"[MQTT] topic '{topic}' 含通配符 —— 未发送")
         return
     if retain:
         if payload:
@@ -645,36 +634,34 @@ def mq_put(topic, payload, retain=False, qos=1):
         else:
             _retained.pop(topic, None)
     if len(_self_pub) > 400:
-        _self_pub.clear()          # reiner Echo-Schutz, kein Datenverlust
+        _self_pub.clear()          # 纯粹是回声保护，不丢数据
     _self_pub[topic] = time.time() + 1.0
     try:
         mq.publish(topic, payload, retain=retain, qos=qos)
     except Exception as e:
-        print(f"[MQTT] publish '{topic}' fehlgeschlagen: {e}")
+        print(f"[MQTT] publish '{topic}' 失败：{e}")
 
 
 def _republish_retained():
-    """Nach einem Verbindungsaufbau alle retained Nachrichten erneut setzen.
+    """连接建立后，把所有 retained 消息重发一遍。
 
-    Beim ersten Verbindungsaufbau ist die Registry leer – dann passiert nichts.
-    Nötig wird das erst nach einem Broker-Neustart ohne Persistenz.
+    第一次连上时登记表是空的 —— 那就什么也不做。
+    真正需要它，是 broker 重启且没有落盘之后。
     """
     n = 0
     for topic, payload in list(_retained.items()):
         mq_put(topic, payload, retain=True, qos=1)
         n += 1
     if n:
-        print(f"[MQTT] {n} retained Nachricht(en) nach Verbindungsaufbau erneut gesetzt")
+        print(f"[MQTT] 连接建立后重发了 {n} 条 retained 消息")
 
 
 def _ha_republish_all(why=""):
-    """Alle bekannten Zustände erneut senden (nach einem HA-Neustart).
+    """重发所有已知状态（HA 重启之后用）。
 
-    Ohne das stehen die Entities nach einem HA-Neustart auf 'unknown', wenn
-    der Broker ohne Persistenz läuft: HA hat die Zustände nicht mehr, und das
-    Gateway erfährt davon nichts, weil sich am Gerät nichts geändert hat.
-    Z2M macht genau das Gegenteil von 'nichts tun': es publiziert den
-    Bridge-Status und danach jeden zwischengespeicherten Gerätezustand neu.
+    没有它，HA 一重启实体就停在 'unknown'（前提是 broker 没落盘）：
+    HA 手里没有状态了，网关这边又不知情 —— 设备自己什么都没变。
+    Z2M 的做法恰恰相反：先发 bridge 状态，再把缓存的每个设备状态都发一遍。
     """
     mq_put(f"{BASE}/status", "online", retain=True, qos=1)
     n = 0
@@ -682,12 +669,12 @@ def _ha_republish_all(why=""):
         for sub, p in list(subs.items()):
             mq_put(f"{BASE}/zigbee/{addr}/{sub}", json.dumps(p), retain=True, qos=1)
             n += 1
-    print(f"[MQTT] HA {why or 'neu gestartet'}: {n} Zustand/Zustände erneut gesendet")
+    print(f"[MQTT] HA {why or '重新启动'}：重发了 {n} 条状态")
 
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print(f"[MQTT] verbunden → {BASE}")
+        print(f"[MQTT] 已连接 → {BASE}")
         mq_put(f"{BASE}/status", "online", retain=True, qos=1)
         client.subscribe(f"{BASE}/cmd/+", qos=1)
         client.subscribe(f"{BASE}/set/#", qos=1)   # HA-Entity-Befehle
@@ -695,47 +682,42 @@ def on_connect(client, userdata, flags, rc):
         db_upsert_gateway("online")
         with _state_lock:
             _state["status"] = "online"
-        # Z2M setzt retained Nachrichten 2 s nach dem Verbindungsaufbau erneut;
-        # die Discovery-Configs kommen zusätzlich aus dem Startfenster zurück.
+        # Z2M 在连接建立 2 s 后重发 retained 消息；
+        # Discovery 配置则另外从启动窗口读回来。
         threading.Timer(2.0, _republish_retained).start()
         _disc_begin_window()
     else:
-        print(f"[MQTT] Fehler rc={rc}")
+        print(f"[MQTT] 出错 rc={rc}")
 
-# ── Befehls-Bestätigung und Wiederholung ─────────────────────────────────
-# Das Gerät antwortet auf einen Fernbefehl nur mit Default-Response und
-# schickt KEINEN Report-Attribut. Ob der Befehl wirklich angekommen ist,
-# erfährt man erst durch ein aktives Read-Attributes (read_onoff).
+# ── 命令确认与重发 ───────────────────────────────────────────────────────
+# 设备收到远程命令只回一个 Default Response，**不发** Report 属性。
+# 命令到底有没有到，只能靠一次主动的 Read Attributes（read_onoff）来确认。
 #
-# Bei LQI 15–30 – Gerät sitzt in der Wand, Koordinator im Schaltschrank –
-# gehen BEFEHL und LESEANFRAGE gelegentlich verloren. Dann zeigte HA den
-# angenommenen Wert, obwohl das Gerät nie geschaltet hat. Genau das war am
-# 2026-10-17 messbar: ep17 meldete 0.78 s nach "off" wieder v=1.
+# LQI 15–30 时 —— 设备埋在墙里、协调器在配电箱里 —— 命令和读请求偶尔会丢。
+# 这时 HA 显示的是假定值，而设备压根没动。2026-10-17 就量到过：
+# ep17 在收到 "off" 之后 0.78 s 又报 v=1。
 #
-# Deshalb: nach dem Befehl lesen, zweimal nachfassen, und bei Abweichung oder
-# ausbleibender Antwort den Befehl bis zu _MAX_TRIES mal wiederholen.
+# 所以：发完命令就读，连追两次；一旦值不对或者没回应，
+# 就把命令重发，最多 _MAX_TRIES 次。
 _MAX_TRIES   = 3
-_READ_DELAY  = 0.7     # s bis zum ersten Read-Attributes
-_READ_DELAY2 = 1.5     # s bis zum zweiten (falls der erste verloren geht)
-_RETRY_AFTER = 2.6     # s ohne jede Rückmeldung → Befehl wiederholen
+_READ_DELAY  = 0.7     # 秒，到第一次 Read-Attributes 的间隔
+_READ_DELAY2 = 1.5     # 第二次读的延迟秒数（防止第一次丢了）
+_RETRY_AFTER = 2.6     # 完全没有回应的秒数 ⇒ 重发命令
 
 _pending      = {}     # (addr, ep) → {"want": 0|1, "tries": n, "ts": t}
 _pending_lock = threading.Lock()
 
-# ── Geräte ohne rücklesbaren Zustand ───────────────────────────────────────
-# Nicht jedes Gerät kann seinen On/Off-Zustand beantworten. Das Szenen-Panel
-# FTB56+ZSN18ZY1.1 (0x747d) ist derselbe Feibit-Bau wie der HGZB-043, aber
-# ohne Relais: es nimmt On/Off-Befehle an und quittiert sie mit
-# Default-Response SUCCESS, beantwortet ein Read-Attributes auf 0x0006/0x0000
-# jedoch mit 0x86 (UNSUPPORTED_ATTRIBUTE) – es gibt schlicht kein Attribut,
-# weil es nichts zu schalten gibt.
-#   gemessen 2026-10-17:  0x07da → "186c010000002001"  (status 00, type 20, v=1)
-#                         0x747d → "185001000086"      (status 86)
-# Für solche Endpunkte ist eine Bestätigung prinzipiell unmöglich. Ohne diese
-# Liste würde JEDER Klick drei Befehle und sechs Leseanfragen auslösen und am
-# Ende "nicht durchgesetzt" melden – für immer.
-_noread = set()        # "addr/ep" – Zustand nicht rücklesbar
-_ctrl   = set()        # "addr/ep" – reiner Sender (Tastenpanel, kein Relais)
+# ── 状态不可回读的设备 ─────────────────────────────────────────────────────
+# 不是每台设备都能回答自己的开/关状态。情景面板 FTB56+ZSN18ZY1.1（0x747d）
+# 和 HGZB-043 同为 Feibit 结构，但没有继电器：它接受 On/Off 命令、
+# 回 Default-Response SUCCESS，而 Read-Attributes 0x0006/0x0000 却答
+# 0x86（UNSUPPORTED_ATTRIBUTE）—— 它压根没有这个属性，因为没什么可开关的。
+#   2026-10-17 实测：  0x07da → "186c010000002001"  (status 00, type 20, v=1)
+#                      0x747d → "185001000086"      (status 86)
+# 这类端点原则上不可能给出确认。没有这张表，每次点击都会发三条命令、
+# 六次读取，最后还是报"没能生效"—— 永远如此。
+_noread = set()        # "addr/ep" —— 状态不可回读
+_ctrl   = set()        # "addr/ep" —— 纯发送方（按键面板，没有继电器）
 
 
 def _ep_key(addr, ep):
@@ -748,11 +730,11 @@ def _noread_add(addr, ep, why):
         return
     _noread.add(k)
     _nodes_save()
-    print(f"[HA] {addr} ep{ep}: Zustand nicht rücklesbar ({why}) – "
-          f"Befehle werden ab jetzt NICHT mehr wiederholt")
-    # Ist der Endpunkt schon als Sender bekannt, ist die switch-Entity damit
-    # endgültig widerlegt → jetzt abmelden (siehe _classify).
-    _classify(addr, ep, f"kein OnOff-Attribut ({why})")
+    print(f"[HA] {addr} ep{ep}：状态无法回读（{why}）—— "
+          f"从现在起**不再**重发命令")
+    # 端点如果已经判定为发送端，那把 switch 就彻底推翻了 →
+    # 现在就去注销（见 _classify）。
+    _classify(addr, ep, f"没有 OnOff 属性（{why}）")
 
 
 def _noread_del(addr, ep):
@@ -760,25 +742,25 @@ def _noread_del(addr, ep):
     if k in _noread:
         _noread.discard(k)
         _nodes_save()
-        print(f"[HA] {addr} ep{ep}: meldet doch einen Zustand – "
-              f"Rücklesen wieder aktiv")
+        print(f"[HA] {addr} ep{ep}：居然能报状态了 —— "
+              f"回读重新启用")
 
 
 def _send_read_onoff(addr, ep):
-    """Fragt den echten On/Off-Zustand beim Gerät ab (Read Attributes)."""
+    """向设备查询真实的 On/Off 状态（Read Attributes）。"""
     if time.monotonic() - _gw_boot_ts < _GW_BOOT_COOLDOWN:
-        # Gateway hat gerade gebootet, Zigbee-Stack ist evtl. noch nicht oben.
+        # 网关刚启动，Zigbee 协议栈可能还没起来。
         return
     try:
         msg = _js({"cmd": "read_onoff", "addr": addr, "ep": ep})
         ser.write(msg.encode())
         print(f"[→C6] {msg.strip()}")
     except Exception as e:
-        print(f"[HA] Rücklesen {addr} ep{ep} fehlgeschlagen: {e}")
+        print(f"[HA] 回读 {addr} ep{ep} 失败：{e}")
 
 
 def _sub_ep(sub):
-    """'ep17/on_off' → 17, 'on_off' → 1 (der C6 lässt bei EP1 das Präfix weg)."""
+    """'ep17/on_off' → 17，'on_off' → 1（C6 在 EP1 上会省掉前缀）。"""
     if sub.startswith("ep") and "/" in sub:
         try:
             return int(sub.split("/", 1)[0][2:])
@@ -788,7 +770,7 @@ def _sub_ep(sub):
 
 
 def _pending_ack(addr, sub, p):
-    """Ein echter Gerätewert ist eingetroffen – offene Bestätigung prüfen."""
+    """收到设备的真实值了 —— 检查待确认项。"""
     if not sub.endswith("on_off"):
         return
     v = (p or {}).get("v")
@@ -797,7 +779,7 @@ def _pending_ack(addr, sub, p):
     ep = _sub_ep(sub)
     if ep is None:
         return
-    # Ein echter Zustand ist der Beweis, dass der Endpunkt lesbar ist.
+    # 收到真实状态，就证明这个端点可读。
     _probe_seen(addr, ep)
     key = (addr, ep)
     with _pending_lock:
@@ -807,19 +789,19 @@ def _pending_ack(addr, sub, p):
         nr = bool(pend.get("noread"))
         if int(v) == int(pend["want"]):
             _pending.pop(key, None)
-            print(f"[HA] {addr} ep{ep}: Gerät bestätigt v={int(v)}")
+            print(f"[HA] {addr} ep{ep}：设备已确认 v={int(v)}")
             _noread_del(addr, ep)
             return
         if nr or pend["tries"] >= _MAX_TRIES:
             _pending.pop(key, None)
             if nr:
-                print(f"[HA] {addr} ep{ep}: Gerät meldet v={int(v)} "
-                      f"(kein Rücklesen möglich) – Anzeige korrigiert")
+                print(f"[HA] {addr} ep{ep}：设备报告 v={int(v)} "
+                      f"（无法回读）—— 已修正显示")
             else:
-                print(f"[HA] {addr} ep{ep}: nach {_MAX_TRIES} Versuchen nicht "
-                      f"durchgesetzt (Gerät meldet v={int(v)})")
-            # Anzeige auf die Wahrheit korrigieren – nicht auf der Annahme
-            # stehen lassen, sonst zeigt HA dauerhaft einen falschen Zustand.
+                print(f"[HA] {addr} ep{ep}：试了 {_MAX_TRIES} 次仍未 "
+                      f"生效（设备报告 v={int(v)}）")
+            # 把显示改成事实 —— 不要继续挂着假定值，
+            # 否则 HA 会一直显示错误状态。
             _ha_state(addr, f"ep{ep}/on_off" if ep > 1 else "on_off",
                       {"v": int(v)})
             return
@@ -827,78 +809,75 @@ def _pending_ack(addr, sub, p):
         want = pend["want"]
         n = pend["tries"]
         pend["ts"] = time.time()
-    print(f"[HA] {addr} ep{ep}: Gerät meldet v={int(v)}, gewollt {want} "
-          f"→ Befehl wird wiederholt ({n}/{_MAX_TRIES})")
+    print(f"[HA] {addr} ep{ep}：设备报告 v={int(v)}，期望 {want} "
+          f"⇒ 重发命令（{n}/{_MAX_TRIES}）")
     _issue_cmd(addr, ep, want, "on" if want else "off", n)
 
 
 def _issue_cmd(addr, ep, want, act, attempt=1):
-    """Schickt dev_cmd und legt die Bestätigung an (mit Read-Back-Timern)."""
+    """发出 dev_cmd 并登记确认（带回读定时器）。"""
     noread = _ep_key(addr, ep) in _noread
     uart_msg = _js({"cmd": "dev_cmd", "addr": addr, "ep": ep, "sw": act})
     ser.write(uart_msg.encode())
     print(f"[→C6] {uart_msg.strip()}"
           + (f"   (Versuch {attempt}/{_MAX_TRIES})" if attempt > 1 else ""))
     with _pending_lock:
-        # Bei "noread" wird tries auf _MAX_TRIES gesetzt: dann kann weder
-        # _retry_if_silent noch ein abweichender Report eine Wiederholung
-        # auslösen – ein Befehl pro Klick, mehr nicht.
+        # 对 "noread" 直接把 tries 设成 _MAX_TRIES：这样
+        # _retry_if_silent 和异常上报都不会再触发重发 ——
+        # 一次点击就一条命令，不多发。
         _pending[(addr, ep)] = {"want": want,
                                 "tries": _MAX_TRIES if noread else attempt,
                                 "noread": noread,
                                 "ts": time.time()}
     try:
-        # EIN Rückleseversuch bleibt auch bei "noread" stehen: er kostet
-        # einen Frame und ist die einzige Chance, die Einstufung später
-        # automatisch zu revidieren (meldet das Gerät doch einen Wert,
-        # löscht _pending_ack das Merkmal wieder).
+        # 即便是 "noread" 也保留**一次**回读尝试：只花一帧，
+        # 却是以后能自动纠正判定的唯一机会（设备一旦真的报了值，
+        # _pending_ack 就会把这个标记清掉）。
         threading.Timer(_READ_DELAY, _send_read_onoff, (addr, ep)).start()
         if not noread:
             if attempt == 1:
                 threading.Timer(_READ_DELAY2, _send_read_onoff, (addr, ep)).start()
-            # Der Timeout-Wächter gehört an JEDEN Versuch, nicht nur an den
-            # ersten: stand er nur dort, endete eine stumme Kette nach
-            # Versuch 2 und der Eintrag in _pending blieb für immer liegen
-            # (am 2026-10-17 im Test aufgefallen: 2 statt 3 Befehle, pending
-            # nie abgeräumt). _retry_if_silent prüft selbst, ob es zu früh ist.
+            # 超时看门狗要挂在**每一次**尝试上，不能只挂第一次：
+            # 只在第一次挂时，一条没有回应的链路会在第 2 次尝试后结束，
+            # 而 _pending 里的条目就永远躺在那儿了（2026-10-17 测试发现：
+            # 只发了 2 条而不是 3 条，pending 也没清掉）。
+            # _retry_if_silent 自己会判断是不是还太早。
             threading.Timer(_RETRY_AFTER, _retry_if_silent, (addr, ep)).start()
     except Exception as e:
-        print(f"[HA] Bestätigungs-Timer nicht gestartet: {e}")
+        print(f"[HA] 确认定时器没启动起来：{e}")
 
 
 def _retry_if_silent(addr, ep):
-    """Gar keine Rückmeldung? Dann ist vermutlich schon der Befehl verloren."""
+    """完全没有回应？那多半是命令本身就丢了。"""
     key = (addr, ep)
     with _pending_lock:
         pend = _pending.get(key)
         if not pend:
-            return                        # wurde bestätigt
+            return                        # 已经确认过了
         if pend.get("noread"):
-            return                        # hier ist Wiederholen sinnlos
+            return                        # 这里重发没有意义
         if time.time() - pend["ts"] < _RETRY_AFTER * 0.5:
             return                        # gerade erst wiederholt
         if pend["tries"] >= _MAX_TRIES:
             _pending.pop(key, None)
-            print(f"[HA] {addr} ep{ep}: keine Antwort vom Gerät, "
-                  f"{_MAX_TRIES} Versuche ohne Erfolg")
-            # Nach drei erfolglosen Runden nie wieder: entweder kann das Gerät
-            # kein Read-Attributes (siehe _noread) oder der Funkweg ist so
-            # schlecht, dass Wiederholen nichts bringt. Beides heißt "nicht
-            # bestätigbar" – und dann soll ein Klick EINEN Befehl auslösen,
-            # nicht drei.
-            _noread_add(addr, ep, "keine Antwort auf Read-Attributes")
+            print(f"[HA] {addr} ep{ep}：设备无应答，"
+                  f"试了 {_MAX_TRIES} 次都没成功")
+            # 三轮都没成功就别再试了：要么设备不支持 Read-Attributes
+            # （见 _noread），要么射频链路差到重发也没用。两种都算"无法确认" ——
+            # 这时候一次点击应该只发**一条**命令，而不是三条。
+            _noread_add(addr, ep, "Read Attributes 没有应答")
             return
         pend["tries"] += 1
         want = pend["want"]
         n = pend["tries"]
         pend["ts"] = time.time()
-    print(f"[HA] {addr} ep{ep}: keine Bestätigung → Befehl wiederholt "
+    print(f"[HA] {addr} ep{ep}：没有确认 ⇒ 重发命令 "
           f"({n}/{_MAX_TRIES})")
     _issue_cmd(addr, ep, want, "on" if want else "off", n)
 
 
 def _ha_handle_set(topic, payload):
-    """HA-Schaltbefehl → dev_cmd an den Koordinator.
+    """HA 的开关命令 → 转成 dev_cmd 发给协调器。
 
     Topic:   {BASE}/set/{addr}/{epN}/on_off
     Payload: "1" | "0" | "toggle"
@@ -908,23 +887,21 @@ def _ha_handle_set(topic, payload):
         return
     addr = parts[1]
     ep   = int("".join(c for c in parts[2] if c.isdigit()) or 1)
-    # HA schickt je nach Config 1/0, ON/OFF oder true/false – alles abbilden.
-    # Alles Unbekannte bleibt toggle.
+    # HA 根据配置会发 1/0、ON/OFF 或 true/false —— 全都要能映射。
+    # 认不出来的一律按 toggle 处理。
     pl   = payload.strip().upper()
     if   pl in ("1", "ON", "TRUE"):  act = "on"
     elif pl in ("0", "OFF", "FALSE"): act = "off"
     else:                              act = "toggle"
 
-    # Zustand sofort zurückspiegeln. Das Gerät (z. B. HGZB-043) antwortet auf
-    # On/Off nur mit einem Default-Response und schickt KEIN Report-Attribute –
-    # ohne diesen Echo bliebe die HA-Kachel auf "unknown" und der Schalter
-    # würde nach jedem Klick zurückspringen ("lässt sich nicht steuern").
-    # Kommt später doch ein echter Report, überschreibt der den Wert.
+    # 立刻把状态回显出去。设备（例如 HGZB-043）收到 On/Off 只回
+    # Default-Response，**不发** Report 属性 —— 没有这次回显，
+    # HA 的卡片会一直停在 "unknown"，而且每次点击后开关都会弹回去（"无法控制"）。
+    # 之后要是真来了 Report，会把这个值覆盖掉。
     #
-    # WICHTIG: gleiche Namensregel wie ha_mqtt_publish_zigbee_ep() im C6 –
-    # Endpunkt 1 bekommt KEIN "ep1/"-Präfix. Sonst landet der Echo auf einem
-    # anderen Topic als dem state_topic der Entity, und bei Einzel-Endpunkt-
-    # Geräten springt der Schalter zurück, obwohl der Befehl ankam.
+    # 重要：命名规则跟 C6 里的 ha_mqtt_publish_zigbee_ep() 保持一致 ——
+    # 端点 1 **不带** "ep1/" 前缀。否则回显会发到跟实体 state_topic
+    # 不同的 topic 上，单端点设备的开关就会在命令其实送达的情况下弹回去。
     sub = f"ep{ep}/on_off" if ep > 1 else "on_off"
     old = (_ha_last.get(addr, {}).get(sub) or {}).get("v")
     if act == "on":
@@ -935,12 +912,12 @@ def _ha_handle_set(topic, payload):
         new = 0 if old == 1 else 1
     _ha_state(addr, sub, {"v": new})
 
-    # Befehl raus + Bestätigung anfordern (siehe Block oben).
+    # 发命令 + 登记确认（见上面的段落）。
     _issue_cmd(addr, ep, new, act)
 
 def on_message(client, userdata, msg):
-    """Kommandos vom Host → an C6 über Serial weiterleiten."""
-    # Echo-Schutz: was wir gerade selbst gesendet haben, ist kein Kommando.
+    """把主机发来的命令转发给 C6（走串口）。"""
+    # 回声保护：我们刚刚自己发出去的东西不算命令。
     #
     # 例外 {BASE}/cmd/*：网页表单把命令发到这里
     # （permit_join、tx_power 等），好让网页和 MQTT 走同一条路径。
@@ -950,15 +927,14 @@ def on_message(client, userdata, msg):
         return
     payload = msg.payload.decode(errors="replace")
 
-    # HA ist fertig gestartet → Zustände erneut senden.
+    # HA 启动完成 → 重发状态。
     if msg.topic == _HA_STATUS_TOPIC:
         if payload.strip().lower() == "online":
-            print("[HA] meldet Neustart (homeassistant/status) → sende Zustände neu")
-            threading.Timer(1.0, _ha_republish_all, ("neu gestartet",)).start()
+            print("[HA] 报告重启（homeassistant/status）⇒ 重发状态")
+            threading.Timer(1.0, _ha_republish_all, ("重新启动",)).start()
         return
 
-    # Startfenster: die vorhandenen Discovery-Configs nur einlesen, nicht
-    # als Kommando behandeln.
+    # 启动窗口：现有的 Discovery 配置只读进来、不往外发。
     if not _disc_ready and msg.topic.startswith(f"{HA_PREFIX}/") and msg.topic.endswith("/config"):
         _disc_remote[msg.topic] = payload
         return
@@ -979,7 +955,7 @@ def on_message(client, userdata, msg):
             ser.write(uart_msg.encode())
             print(f"[→C6] {uart_msg.strip()}")
         else:
-            print(f"[WARN] Ungültiger Zigbee-Kanal: {ch} (11-26)")
+            print(f"[WARN] 无效的 Zigbee 信道：{ch}（11-26）")
     elif cmd == "scan_chan":
         uart_msg = _js({"cmd": "scan_chan"})
         ser.write(uart_msg.encode())
@@ -989,8 +965,8 @@ def on_message(client, userdata, msg):
         ser.write(uart_msg.encode())
         print(f"[→C6] {uart_msg.strip()}")
     elif cmd == "probe":
-        # Modellabfrage für ein Gerät, das schon im Netz ist, aber nichts von
-        # sich hören lässt (kein Announce, keine Reports) → Basic-Cluster lesen.
+        # 型号查询，给已经入网却什么都不吭声的设备用
+        # （没有 Announce、没有上报）→ 直接读 Basic 簇。
         # Payload: "0x07da,16"  (EP optional, Default 1)
         try:
             parts = payload.split(",")
@@ -1000,7 +976,7 @@ def on_message(client, userdata, msg):
             ser.write(uart_msg.encode())
             print(f"[→C6] {uart_msg.strip()}")
         except (ValueError, IndexError):
-            print(f"[WARN] probe: ungültiger Payload {payload}")
+            print(f"[WARN] probe：无效载荷 {payload}")
     elif cmd == "set_sleep":
         try:
             secs = max(10, int(payload))
@@ -1008,7 +984,7 @@ def on_message(client, userdata, msg):
             ser.write(uart_msg.encode())
             print(f"[→C6] {uart_msg.strip()}")
         except ValueError:
-            print(f"[WARN] set_sleep: ungültiger Wert {payload}")
+            print(f"[WARN] set_sleep：无效值 {payload}")
     elif cmd == "set_dev_power":
         # 中继发射功率：payload 是 JSON {"addr":"0x1234","ep":1,"dbm":14}
         # 网关会翻成 ZCL Write Attribute 0xFC00/0x0001 发给那台中继；
@@ -1019,45 +995,44 @@ def on_message(client, userdata, msg):
             ep   = int(o.get("ep", 1) or 1)
             dbm  = max(-24, min(20, int(o.get("dbm", 8))))
             if not addr:
-                raise ValueError("addr fehlt")
+                raise ValueError("缺少 addr")
         except (ValueError, TypeError, json.JSONDecodeError):
-            print(f"[WARN] set_dev_power: ungültiger Payload {payload!r}")
+            print(f"[WARN] set_dev_power：无效载荷 {payload!r}")
             return
         uart_msg = _js({"cmd": "set_dev_power", "addr": addr, "ep": ep, "dbm": dbm})
         ser.write(uart_msg.encode())
         print(f"[→C6] {uart_msg.strip()}")
     elif cmd == "set_tx_power":
-        # Sendepfad des C6 in dBm. Payload: "-4" oder "{\"dbm\":-4}"
+        # Sendepfad des C6 in dBm. Payload: "-4" 或 "{\"dbm\":-4}"
         try:
             raw = payload.strip()
             if raw.startswith("{"):
                 raw = str(json.loads(raw).get("dbm", ""))
             dbm = int(raw)
         except (ValueError, TypeError, json.JSONDecodeError):
-            print(f"[WARN] set_tx_power: ungültiger Wert {payload!r}")
+            print(f"[WARN] set_tx_power：无效值 {payload!r}")
             return
         dbm = max(-24, min(20, dbm))
         uart_msg = _js({"cmd": "set_tx_power", "dbm": dbm})
         ser.write(uart_msg.encode())
-        _txp_save(dbm)          # überlebt C6-Neustart und Add-on-Neustart
-        print(f"[→C6] {uart_msg.strip()}   (Rücklesewert folgt als {{\"t\":\"txpower\"}})")
+        _txp_save(dbm)          # 能扛过 C6 重启和加载项重启
+        print(f"[→C6] {uart_msg.strip()}   (回读值会以 {{\"t\":\"txpower\"}} 报回来)")
     elif cmd == "lqi":
-        # Momentaufnahme: sonst liefert nur der 60-s-Heartbeat LQI/RSSI.
+        # 即时取一次：否则 LQI/RSSI 只能等 60 s 心跳。
         uart_msg = _js({"cmd": "lqi"})
         ser.write(uart_msg.encode())
         print(f"[→C6] {uart_msg.strip()}")
     elif cmd == "read_onoff":
         # Payload "0x747d,2" → Read Attributes auf On/Off.
-        # Der einzige harte Beweis, dass ein Downlink-Frame das Gerät erreicht
-        # hat, ist dessen Antwort. Genau das braucht der Sendeleistungs-Vergleich
-        # (txpower_ab.py): LQI/RSSI beschreiben die Gegenrichtung und bleiben
-        # beim Ändern der Gateway-Leistung praktisch unverändert.
+        # 唯一能证明下行帧真的到达设备的硬证据，就是设备自己回话。
+        # 发射功率对比（txpower_ab.py）要的正是这个：
+        # LQI/RSSI 描述的是相反方向，改网关功率时几乎不变。
         try:
             parts = payload.split(",")
             addr = parts[0].strip()
             ep   = int(parts[1]) if len(parts) > 1 else 1
         except (ValueError, IndexError):
-            print(f"[WARN] read_onoff: ungültiger Payload {payload!r}")
+            print(f"[WARN] read_onoff：无效载荷 {payload!r}")
             return
         uart_msg = _js({"cmd": "read_onoff", "addr": addr, "ep": ep})
         ser.write(uart_msg.encode())
@@ -1071,9 +1046,9 @@ _write_err = 0        # 累计写失败次数（只用于限速日志，见 Coor
 
 
 class CoordinatorSerial:
-    """Persistente Serial-Verbindung ohne ESP32-C6 Reset-Trigger."""
+    """持久串口连接，不触发 ESP32-C6 复位。"""
     def __init__(self, port, baudrate):
-        # HUPCL deaktivieren bevor pyserial öffnet → WCH-Chip löst kein DTR-Reset aus
+        # 在 pyserial 打开之前关掉 HUPCL ⇒ WCH 芯片不会因 DTR 触发复位
         import subprocess
         subprocess.run(["stty", "-F", port, "-hupcl"], check=False)
         self.ser = serial.Serial()
@@ -1088,7 +1063,7 @@ class CoordinatorSerial:
             self.ser.dtr = False
         except Exception:
             pass
-        print(f"[Serial] {port} @ {baudrate} offen (DTR/RTS=LOW, HUPCL=off)")
+        print(f"[Serial] {port} @ {baudrate} 已打开（DTR/RTS=LOW，HUPCL=off）")
 
     def read(self, n):   return self.ser.read(n)
 
@@ -1116,18 +1091,17 @@ class CoordinatorSerial:
     @property
     def in_waiting(self): return self.ser.in_waiting
 
-# ── Notfall-Flash über esptool (Bootloader-Weg) ───────────────────────────
-# Der App-Level-OTA (fw_ota_*) setzt voraus, dass die LAUFENDE Firmware
-# fw_ota_data versteht. Ältere Builds tun das nicht – sie lesen Kommandos mit
-# fgets(buf, 256) und/oder matchen starr mit strstr("\"data\":\"") –, dann
-# kommt nie ein ACK und der Transfer hängt nach dem ersten Stoß.
-# In dem Fall bleibt nur der Bootloader: esptool resettet den C6 über
-# USB-Serial-JTAG in den Download-Modus und schreibt das Image direkt.
+# ── 用 esptool 应急刷机（走 bootloader）──────────────────────────────────
+# App 级 OTA（fw_ota_*）的前提是：**正在运行**的固件认识 fw_ota_data。
+# 老构建不认识 —— 它们用 fgets(buf, 256) 读命令，和/或写死
+# strstr("\"data\":\"") 匹配 —— 于是永远不会有 ACK，传完第一批就卡住。
+# 这种情况只剩 bootloader：esptool 经 USB-Serial-JTAG 把 C6 复位进下载模式，
+# 直接写镜像。
 APP_OFFSET = "0x20000"   # ota_0 – boot-Log: "Loaded app from partition at offset 0x20000"
 FLASH_BAUD = 460800
 
-_serial_pause      = threading.Event()   # hält die Leseschleife an
-_flash_mutex       = threading.Lock()    # nur ein Flash gleichzeitig
+_serial_pause      = threading.Event()   # 暂停读取循环
+_flash_mutex       = threading.Lock()    # 同一时间只允许一个刷写
 _flash_state_lock  = threading.Lock()
 _flash_state       = {"status": "idle", "bin": "", "tail": []}
 
@@ -1248,10 +1222,10 @@ def flash_is_running() -> bool:
 
 
 def flash_apply(bin_path: str) -> bool:
-    """Schreibt bin_path über den Bootloader. Blockiert bis esptool fertig ist."""
+    """通过 bootloader 写入 bin_path。阻塞到 esptool 跑完。"""
     global ser
     if not _flash_mutex.acquire(blocking=False):
-        print("[FLASH] läuft bereits – Anfrage ignoriert")
+        print("[FLASH] 已经在跑了 —— 忽略本次请求")
         return False
     _serial_pause.set()                 # Hauptschleife anhalten
     with _flash_state_lock:
@@ -1277,12 +1251,12 @@ def flash_apply(bin_path: str) -> bool:
                 _flash_state["tail"] = (_flash_state["tail"] + [line])[-40:]
         rc = proc.wait()
         ok = rc == 0
-        print(f"[FLASH] esptool beendet, rc={rc}"
-              + ("" if ok else "  (Details oben; fehlt esptool im Image?)"))
+        print(f"[FLASH] esptool 结束，rc={rc}"
+              + ("" if ok else "  （详情见上；镜像里是不是缺 esptool？）"))
     except FileNotFoundError:
-        print("[FLASH] esptool/python nicht gefunden")
+        print("[FLASH] 找不到 esptool/python")
     except Exception as e:
-        print(f"[FLASH] Fehler: {e}")
+        print(f"[FLASH] 出错：{e}")
     finally:
         # 刷完恢复串口。用 _serial_open：刷机后设备正在重新枚举，一次打不开
         # 很正常，别让整个 finally 抛异常（会把 _flash_state 卡在 running）。
@@ -1297,45 +1271,39 @@ def flash_apply(bin_path: str) -> bool:
 
 # ── HA Auto-Discovery ─────────────────────────────────────────────────────
 _ha_devices = {}     # addr → {"ieee", "mfr", "model"}
-_ha_nodes   = {}     # addr → node  (Sitzungs-Cache, siehe _ha_node)
-_ha_last    = {}     # addr → {sub: payload}  letzter bekannter Zustand
+_ha_nodes   = {}     # addr → node（会话内缓存，见 _ha_node）
+_ha_last    = {}     # addr → {sub: payload} 最后一次已知状态
 
 # ── Discovery-Cache ───────────────────────────────────────────────────────
-# Früher war _ha_sent eine Menge (node, obj_id, addr, _DISC_VER). Zwei
-# Nachteile, die sich beide in der Praxis gezeigt haben:
+# 以前 _ha_sent 是个集合 (node, obj_id, addr, _DISC_VER)。两个毛病都实际踩到过：
 #
-#   * Der Versionszähler _DISC_VER musste bei JEDER Inhaltsänderung von Hand
-#     erhöht werden. Wurde er vergessen, ging die neue Config nie raus und HA
-#     behielt stillschweigend die alte Entity – der Fehler ist nicht sichtbar.
-#   * Nach jedem Add-on-Neustart war die Menge leer, also wurden ALLE
-#     Configs neu publiziert und HA hat jedes Mal sämtliche Entities neu
-#     verarbeitet.
+#   * 版本计数器 _DISC_VER 每次改内容都得手工加一。忘了加，新配置就永远发不出去，
+#     HA 悄无声息地继续用旧实体 —— 而且完全看不出来。
+#   * 每次加载项重启集合就空了，于是所有配置全量重发，HA 每次都把全部实体
+#     重新处理一遍。
 #
-# Nach Z2M-Vorbild (lib/extension/homeassistant.ts) wird jetzt der fertige
-# JSON-String je Topic verglichen:
+# 照 Z2M 的做法（lib/extension/homeassistant.ts），现在按 topic 比较成品 JSON：
 #     if (!discoveredMessage || discoveredMessage.payload !== payloadStr)
-# Damit ist eine Inhaltsänderung automatisch ein Neu-Publish, und ein
-# unveränderter Neustart kostet keinen einzigen Publish. _DISC_VER entfällt.
+# 这样内容一变就自动重发，而内容没变的重启一条都不会发。_DISC_VER 取消。
 _ha_sent   = {}      # topic → zuletzt publizierter JSON-String
-_sent_addr  = {}     # topic → addr   (nur für _purge_addr / Aufräumen)
+_sent_addr  = {}     # topic → addr（仅用于 _purge_addr / 清理）
 
-# Startfenster: Z2M abonniert beim Start 5 s lang das Discovery-Topic, liest
-# die dort retained liegenden Configs ein und publiziert nur, was fehlt oder
-# abweicht. Das spart beim Neustart hunderte Publish-Vorgänge – und ist die
-# einzige Chance, überhaupt zu erfahren, was der Broker schon hat.
+# 启动窗口：Z2M 启动时订阅 Discovery topic 5 秒，把 broker 上 retained 的
+# 配置读进来，然后只发布会缺的或不一样的。这样重启能省掉几百次 publish ——
+# 也是唯一能知道 broker 上到底已经有什么的机会。
 _DISC_WAIT   = 5.0
-_disc_ready  = True     # vor dem ersten Verbindungsaufbau: sofort publizieren
-_disc_remote = {}       # topic → payload (aus dem Broker gelesen)
-_disc_defer  = {}       # topic → payload (während des Fensters zurückgehalten)
+_disc_ready  = True     # 第一次连接之前：直接发布
+_disc_remote = {}       # topic → payload（从 broker 读到的）
+_disc_defer  = {}       # topic → payload（窗口期内先扣住不发）
 
-# Nur noch dokumentarisch: der Zähler wird nicht mehr in Schlüssel eingerechnet.
-#   1 → erste Fassung
-#   2 → "has_entity_name" (Namen waren doppelt: "HGZB-043 HGZB-043 上 开关")
-#   3 → event-Entity für Tastenpanels (_ha_publish_event)
+# 现在只作记录用：这个计数器不再参与键的计算。
+#   1 → 第一版
+#   2 → "has_entity_name"（名字重复了："HGZB-043 HGZB-043 上 开关"）
+#   3 → 按键面板的 event 实体（_ha_publish_event）
 _DISC_VER = 3
 
-# Herkunft der Entities – HA zeigt sie im Geräte-Dialog an. Z2M setzt das
-# Feld ebenfalls (origin: {name, sw, url}).
+# 实体的来源标记 —— HA 会在设备对话框里显示。Z2M 也是这么设的，
+# 字段也一样（origin: {name, sw, url}）。
 def _gw_version():
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1349,7 +1317,7 @@ _GW_ORIGIN = {"name": "ESP32-C6 Gateway", "sw": _gw_version(),
 
 
 def _ha_avail(addr=None):
-    """Verfügbarkeit im aktuellen Format (Liste) statt des alten Einzelfelds.
+    """当前格式的可用性（列表）—— 取代旧的单字段。
 
     ★ 2026-10-26: 以前只有网关自己这一个 Topic ⇒ 网关在线时，**已经掉线的
       开关也照样显示 "关"**（HA 只是显示最后一次 payload），用户点了没反应
@@ -1509,7 +1477,7 @@ def _ago(ts) -> str:
 
 
 def _disc_begin_window():
-    """Startfenster öffnen: vorhandene Discovery-Configs einlesen."""
+    """打开启动窗口：先读入现有的 Discovery 配置。"""
     global _disc_ready
     if not HA_ENABLED:
         return
@@ -1520,12 +1488,12 @@ def _disc_begin_window():
         print(f"[HA] lese vorhandene Discovery-Configs ({_DISC_WAIT:.0f} s)")
         threading.Timer(_DISC_WAIT, _disc_flush).start()
     except Exception as e:
-        print(f"[HA] Startfenster nicht möglich: {e}")
+        print(f"[HA] 打不开启动窗口：{e}")
         _disc_ready = True
 
 
 def _disc_flush():
-    """Startfenster schließen: nur abweichende Configs wirklich publizieren."""
+    """关闭启动窗口：只真正发布有差异的配置。"""
     global _disc_ready
     _disc_ready = True
     try:
@@ -1535,23 +1503,23 @@ def _disc_flush():
     neu = gleich = 0
     for topic, payload in list(_disc_defer.items()):
         if _disc_remote.get(topic) == payload:
-            _ha_sent[topic] = payload      # Broker hat sie schon, nichts zu tun
+            _ha_sent[topic] = payload      # broker 已经有了，不用再发
             gleich += 1
             continue
         mq_put(topic, payload, retain=True, qos=1)
         _ha_sent[topic] = payload
         neu += 1
     _disc_defer.clear()
-    print(f"[HA] Discovery-Abgleich: {neu} neu/geändert, {gleich} unverändert "
+    print(f"[HA] Discovery 核对：{neu} 个新增/变化，{gleich} 个未变 "
           f"({len(_disc_remote)} Configs im Broker)")
     _disc_purge_orphans()
     _disc_upgrade_avail()
 
 
 def _disc_purge_orphans():
-    """Retained Discovery-Configs entfernen, die zu nichts mehr gehören.
+    """删掉那些已经不属于任何设备的 retained discovery 配置。
 
-    Zwei Fälle, beide schon aufgetreten:
+    两种情况都真遇到过：
       * 设备已经不在了（短地址未知）→ 否则整套配置会变成孤儿留在 broker 里，
         在 HA 里留一张"不可用"的僵尸卡片。
       * 端点被判定为纯发送端 → 那里不该（再）存在 switch。
@@ -1559,11 +1527,10 @@ def _disc_purge_orphans():
     if not HA_ENABLED or not _disc_remote:
         return
     if not _addr_nodes and not _ieee_nodes:
-        # Ohne jede Kenntnis über die eigenen Geräte (ha_nodes.json fehlt,
-        # Neuinstallation) ist "unbekannter Knoten" nicht von "Gerät noch
-        # nicht wieder aufgetaucht" zu trennen. Dann lieber nichts löschen –
-        # ein falsch gelöschter Satz kostet den Nutzer alle Entities.
-        print("[HA] kein Gerätebestand bekannt – Aufräumen übersprungen")
+        # 如果对自己的设备一无所知（ha_nodes.json 不存在、全新安装），
+        # 就分不清"未知节点"和"设备还没重新上线"。这种时候宁可什么都不删 ——
+        # 删错一条，用户会丢掉那一整套实体。
+        print("[HA] 不知道有哪些设备 —— 跳过清理")
         return
     bekannt = set(_addr_nodes.values()) | set(_ieee_nodes.values())
     rueck   = {v: k for k, v in _addr_nodes.items()}
@@ -1574,11 +1541,11 @@ def _disc_purge_orphans():
         if len(parts) < 5:
             continue
         comp, node, obj_id = parts[1], parts[2], parts[3]
-        # Zugehörigkeit nicht am Namenspräfix festmachen, sondern am
-        # availability-Topic der Config selbst. Z2M prüft genauso
-        # (message.availability[0].topic.startsWith(baseTopic)). Sonst würde
-        # eine ZWEITE Gateway-Instanz am selben Broker die Entities der
-        # ersten wegräumen – deren Knoten heißen genauso "c6_…".
+        # 归属不能按节点名前缀判断，要看配置自身的 availability topic。
+        # Z2M 也是这么判的
+        # (message.availability[0].topic.startsWith(baseTopic))。否则同一个
+        # broker 上的**第二个**网关实例会把第一台的实体清掉 ——
+        # 它们的节点名同样叫 "c6_…"。
         try:
             cfg = json.loads(payload)
         except Exception:
@@ -1592,7 +1559,7 @@ def _disc_purge_orphans():
             continue
         grund = None
         if node not in bekannt:
-            grund = "Gerät unbekannt"
+            grund = "设备未知"
         elif comp == "switch" and obj_id.startswith("ep") and "_" in obj_id:
             try:
                 ep = int(obj_id[2:].split("_", 1)[0])
@@ -1600,20 +1567,20 @@ def _disc_purge_orphans():
                 ep = 0
             addr = rueck.get(node)
             if ep and addr and _ep_key(addr, ep) in _ctrl:
-                grund = "Endpunkt ist reiner Sender"
+                grund = "端点是纯发送端"
         if grund:
             mq_put(topic, "", retain=True, qos=1)
             _ha_sent.pop(topic, None)
             _sent_addr.pop(topic, None)
             _disc_remote.pop(topic, None)
             weg += 1
-            print(f"[HA] verwaiste Config entfernt ({grund}): {topic}")
+            print(f"[HA] 已删除孤儿配置（{grund}）：{topic}")
     if weg:
-        print(f"[HA] {weg} veraltete Discovery-Config(s) aufgeräumt")
+        print(f"[HA] 清理了 {weg} 个过期 Discovery 配置")
 
 
 def _node_addr_map() -> dict:
-    """node-ID → aktuelle Kurzadresse (Umkehrung von _addr_nodes / _ieee_nodes)."""
+    """node-ID → 当前短地址（_addr_nodes / _ieee_nodes 的反查）。"""
     m = {n: a for a, n in _addr_nodes.items() if n and a}
     for ieee, node in _ieee_nodes.items():
         if node and node not in m:
@@ -1624,21 +1591,19 @@ def _node_addr_map() -> dict:
 
 
 def _disc_upgrade_avail():
-    """Alte, stehengebliebene Discovery-Configs um die Geräte-Availability ergänzen.
+    """给遗留的旧 discovery 配置补上设备 availability。
 
-    Warum das nötig ist: eine Discovery-Config wird **nur dann** neu geschrieben,
-    wenn das Gerät wieder ein Telegramm schickt (_disc_send hängt am Datenpfad).
-    Ein Panel, das ausschließlich rohe APS-Tastenrahmen sendet (0x747d), oder ein
-    Gerät, das seit dem Update still ist, behält deshalb für immer die alte
-    Config mit nur EINEM Availability-Topic (Gateway). Folge: das Gerät ist
-    längst weg, in HA steht aber "aus" statt "nicht verfügbar" – eine
-    Karteileiche, die man von einem echten "aus" nicht unterscheiden kann.
+    为什么需要：discovery 配置**只有**在设备再发一条电文时才会重写
+    （_disc_send 挂在数据路径上）。一个只发原始 APS 按键帧的面板（0x747d），
+    或者更新之后就再没说过话的设备，就会永远留着那份只带**一个**
+    availability topic（网关）的旧配置。后果：设备早就没了，
+    HA 里却还显示"关"而不是"不可用" ——
+    一张跟真正的"关"分不出来的僵尸卡片。
 
-    Das Startfenster ist der einzige Moment, in dem _disc_remote **alle**
-    retained Configs des Brokers im Speicher hat. Genau hier nachziehen.
+    启动窗口期是 _disc_remote 里**装齐** broker 全部 retained 配置的唯一时刻。
+    补发就在这里做。
 
-    Reihenfolge: Gateway-Topic bleibt auf [0], weil _disc_purge_orphans() die
-    Zugehörigkeit daran festmacht.
+    顺序：网关 topic 保持在 [0]，因为 _disc_purge_orphans() 是拿它判归属的。
     """
     if not HA_ENABLED or not DEVICE_AVAIL or not _disc_remote:
         return
@@ -1661,14 +1626,14 @@ def _disc_upgrade_avail():
         av = cfg.get("availability")
         if isinstance(av, list) and av and isinstance(av[0], dict):
             if av[0].get("topic") != eigen:
-                continue                    # fremde Instanz – nicht anfassen
+                continue                    # 别的实例 —— 不要动
         elif cfg.get("availability_topic") == eigen:
             av = []                         # uralte Einzel-Topic-Fassung
         else:
             continue
         addr = n2a.get(node)
         if not addr:
-            continue                        # Adresse unbekannt – nichts raten
+            continue                        # 地址未知 —— 不要瞎猜
         want = _avail_topic(addr)
         if any(isinstance(x, dict) and x.get("topic") == want for x in av):
             continue
@@ -1686,53 +1651,49 @@ def _disc_upgrade_avail():
         _ha_sent[topic]    = neu
         _disc_remote[topic] = neu
         auf += 1
-        print(f"[HA] availability ergänzt: {topic} → {want}")
+        print(f"[HA] 已补上 availability：{topic} → {want}")
     if auf:
-        print(f"[HA] {auf} Discovery-Config(s) auf Geräte-Availability umgestellt")
+        print(f"[HA] {auf} 个 Discovery 配置改成设备级 availability")
     else:
-        print("[HA] availability: alle Discovery-Configs bereits aktuell")
+        print("[HA] availability：所有 Discovery 配置都是最新的")
 
 
 def _disc_send(comp, node, obj_id, cfg, addr=""):
-    """Eine Discovery-Config setzen – aber nur, wenn sie sich geändert hat."""
+    """设置一条 Discovery 配置 —— 但只在它发生变化时才发。"""
     topic   = f"{HA_PREFIX}/{comp}/{node}/{obj_id}/config"
     payload = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
     if _ha_sent.get(topic) == payload:
         return
     _sent_addr[topic] = addr
     if not _disc_ready:
-        # Noch im Startfenster: merken und nach dem Abgleich nachziehen.
-        # Ohne diese Warteschlange ginge die Entity verloren, denn die
-        # Discovery hängt am eintreffenden Telegramm und wird nicht wiederholt.
+        # 还在启动窗口期：先记下来，对齐之后补发。
+        # 没有这个队列，实体就丢了 —— discovery 是跟着来电文走的，不会重来一次。
         _disc_defer[topic] = payload
         return
     mq_put(topic, payload, retain=True, qos=1)
     _ha_sent[topic] = payload
     print(f"[HA] discovery {comp}/{node}/{obj_id} → {cfg.get('name')}")
 
-# ── Persistente Knoten-Zuordnung ───────────────────────────────────────────
-# Ohne diese Datei wurde die Node-ID nach jedem Add-on-Start neu aus der
-# AKTUELLEN Short-Adresse gebildet. Wechselt ein Gerät beim Rejoin die
-# Adresse (nach Stromausfall, Umstecken, Neuaufnahme), entstand ein zweiter
-# Entity-Satz; die alten retained Discovery-Configs blieben als Waisen im
-# Broker und in HA standen Doppel-Entities.
+# ── 持久化的节点归属 ───────────────────────────────────────────────────────
+# 没有这个文件时，Node-ID 在每次 add-on 启动后都按**当时**的短地址重新拼。
+# 设备一旦在 rejoin 时换了地址（停电、换插座、重新入网），就会生成第二套
+# 实体；旧的 retained discovery 配置留在 broker 里成了孤儿，HA 里于是
+# 出现重复实体。
 #
-# Gespeichert wird beides:
-#   addr_nodes: {addr: node}   – friert bestehende Namen ein (keine Migration)
-#   ieee_nodes: {ieee: node}   – findet das Gerät nach Adresswechsel wieder
-#   addr_ieee : {addr: ieee}   – gelernte Zuordnung
+# 两样都存：
+#   addr_nodes: {addr: node}   – 冻结现有名字（不做迁移）
+#   ieee_nodes: {ieee: node}   – 换地址后还能把设备认回来
+#   addr_ieee : {addr: ieee}   – 学到手的对应关系
 _DATA_DIR   = "/data" if os.path.isdir("/data") else "/tmp"
 _NODES_FILE = os.path.join(_DATA_DIR, "ha_nodes.json")
 
-# ── Sendeleistung merken und nach einem C6-Boot wiederherstellen ───────────
-# `set_tx_power` wirkt in der Firmware nur zur LAUFZEIT (main.c schreibt keinen
-# NVS-Eintrag). Nach einem Stromausfall oder Reset steht die Leistung wieder auf
-# dem SDK-Default – und es fällt niemandem auf, weil `lqi`/`rssi` die
-# GEGENrichtung beschreiben und sich beim Ändern der Gateway-Leistung praktisch
-# nicht bewegen (§4). Genau so entsteht die Fehlannahme "das Gateway sendet mit
-# 20 dBm", während es längst mit 0 dBm läuft.
-# Deshalb: letzten Wunschwert in /data ablegen und nach jedem C6-Boot erneut
-# senden, bis der Rücklesewert (`eff`) ihn bestätigt.
+# ── 记住发射功率，C6 重启后恢复 ────────────────────────────────────────────
+# `set_tx_power` 在固件里只在**运行期**生效（main.c 不写 NVS）。断电或复位
+# 之后功率回到 SDK 默认值 —— 而且没人会察觉，因为 `lqi`/`rssi` 描述的是
+# **反方向**，改网关功率它们基本不动（§4）。"网关在用 20 dBm"这种误判
+# 就是这么来的，而它其实早就跑在 0 dBm 上了。
+# 所以：把最后一次期望值存进 /data，每次 C6 启动后重发，直到回读值
+# （`eff`）确认为止。
 _TXP_FILE = os.path.join(_DATA_DIR, "gw_txpower.json")
 _TXP_DBM  = None
 _TXP_LOCK = threading.Lock()
@@ -1748,7 +1709,7 @@ def _txp_load():
         _TXP_DBM = None
     except Exception as e:                              # noqa: BLE001
         _TXP_DBM = None
-        print(f"[TX] Sendeleistung nicht lesbar ({_TXP_FILE}): {e}")
+        print(f"[TX] 发射功率读不出来（{_TXP_FILE}）：{e}")
 
 
 def _txp_save(dbm):
@@ -1760,15 +1721,14 @@ def _txp_save(dbm):
             json.dump({"dbm": _TXP_DBM}, f)
         os.replace(tmp, _TXP_FILE)
     except Exception as e:                              # noqa: BLE001
-        print(f"[TX] Sendeleistung nicht speicherbar: {e}")
+        print(f"[TX] 发射功率存不下来：{e}")
 
 
 def _txp_reapply(delay: float = 3.0, versuche: int = 3):
-    """Nach einem C6-Boot den gemerkten Wunschwert erneut senden.
+    """C6 启动后把记住的期望值重发一遍。
 
-    Mehrere Versuche, weil das Kommando direkt nach `boot` noch ins Leere
-    laufen kann (ZBOSS meldet erst danach "ZDO Config Ready"). Abgebrochen
-    wird, sobald der Rücklesewert den Wunsch bestätigt.
+    要试多次，因为紧跟 `boot` 之后这条命令还可能打空
+    （ZBOSS 之后才报 "ZDO Config Ready"）。一旦回读值确认了期望值就停。
     """
     if _TXP_DBM is None:
         return
@@ -1779,17 +1739,17 @@ def _txp_reapply(delay: float = 3.0, versuche: int = 3):
                 with _TXP_LOCK:
                     ser.write(_js({"cmd": "set_tx_power", "dbm": _TXP_DBM}).encode())
             except Exception as e:                      # noqa: BLE001
-                print(f"[TX] Wiederherstellen fehlgeschlagen: {e}")
+                print(f"[TX] 恢复失败：{e}")
                 return
             time.sleep(4.0)
             with _state_lock:
                 tp = dict(_state.get("tx_power") or {})
             if tp.get("eff") == _TXP_DBM:
-                print(f"[TX] Sendeleistung nach C6-Boot wiederhergestellt: "
+                print(f"[TX] C6 重启后已恢复发射功率："
                       f"{_TXP_DBM} dBm (Versuch {i + 1})")
                 return
-        print(f"[TX] WARNUNG: {_TXP_DBM} dBm nach C6-Boot nicht bestätigt "
-              f"(eff={tp.get('eff')}) – bitte /api/tx_power prüfen")
+        print(f"[TX] 警告：C6 重启后 {_TXP_DBM} dBm 未被确认 "
+              f"（eff={tp.get('eff')}）—— 请检查 /api/tx_power")
 
     threading.Thread(target=_go, daemon=True).start()
 
@@ -1797,7 +1757,7 @@ def _txp_reapply(delay: float = 3.0, versuche: int = 3):
 _addr_nodes = {}
 _ieee_nodes = {}
 _addr_ieee  = {}
-_ieee_addr  = {}      # ieee → aktuelle addr  (für Aufräumen der alten Adresse)
+_ieee_addr  = {}      # ieee → 当前 addr（用于清理旧地址）
 _addr_subs  = {}      # addr → [sub, …]      (was wir je auf diesem Topic publiziert haben)
 
 
@@ -1809,7 +1769,7 @@ def _nodes_load():
     except FileNotFoundError:
         return
     except Exception as e:
-        print(f"[HA] Knoten-Zuordnung nicht lesbar ({_NODES_FILE}): {e}")
+        print(f"[HA] 节点映射读不出来（{_NODES_FILE}）：{e}")
         return
     _addr_nodes = dict(d.get("addr_nodes") or {})
     _ieee_nodes = dict(d.get("ieee_nodes") or {})
@@ -1820,10 +1780,10 @@ def _nodes_load():
     _noread.update(d.get("noread") or [])
     _ctrl.clear()
     _ctrl.update(d.get("ctrl") or [])
-    print(f"[HA] Knoten-Zuordnung: {len(_addr_nodes)} Adressen, "
+    print(f"[HA] 节点映射：{len(_addr_nodes)} 个地址，"
           f"{len(_ieee_nodes)} IEEE ({_NODES_FILE})")
     if _noread or _ctrl:
-        print(f"[HA] bekannt: {len(_noread)} Endpunkt(e) ohne Rücklesen, "
+        print(f"[HA] 已知：{len(_noread)} 个端点不可回读，"
               f"{len(_ctrl)} reine Sender: {sorted(_ctrl) or '-'}")
 
 
@@ -1838,18 +1798,18 @@ def _nodes_save():
                       f, ensure_ascii=False, indent=1)
         os.replace(tmp, _NODES_FILE)
     except Exception as e:
-        print(f"[HA] Knoten-Zuordnung nicht speicherbar: {e}")
+        print(f"[HA] 节点映射存不下来：{e}")
 
 
 def _ha_slug(s):
     return "".join(c if c.isalnum() else "_" for c in str(s)).strip("_").lower()
 
 def _purge_addr(addr, why):
-    """Alle retained Topics einer alten Kurzadresse entfernen.
+    """把某个旧短地址上的 retained topic 全部清掉。
 
-    Ohne das bleibt nach jedem Rejoin ein kompletter zweiter Satz im Broker:
-    am 2026-10-17 lagen 0xb2a2 und 0x747d parallel da (dieselbe IEEE!), und
-    für ep1 existierte zusätzlich ein veralteter ep1/on_off-Wert neben on_off.
+    没有它，每次 rejoin 之后 broker 里就多一整套：
+    2026-10-17 就出现过 0xb2a2 和 0x747d 并排躺着（同一个 IEEE！），
+    而且 ep1 除了 on_off 还额外留着一个过期的 ep1/on_off 值。
     """
     subs = _addr_subs.pop(addr, [])
     for sub in subs:
@@ -1863,34 +1823,32 @@ def _purge_addr(addr, why):
     _addr_nodes.pop(addr, None)
     _ha_nodes.pop(addr, None)
     _addr_ieee.pop(addr, None)
-    # Kenntnisse über DIESE Adresse mitnehmen – sonst gälte die alte Adresse
-    # ewig als "nicht rücklesbar" und die neue würde neu beurteilt.
+    # 把这个地址上学到的东西一并带走 —— 否则旧地址会永远被当成"不可回读"，
+    # 新地址又要重新判一遍。
     for k in [k for k in _noread if k.split("/", 1)[0] == addr]:
         _noread.discard(k)
     for k in [k for k in _ctrl if k.split("/", 1)[0] == addr]:
         _ctrl.discard(k)
     if subs or gone:
         print(f"[HA] {addr} verworfen ({why}): {len(subs)} Zustands-Topics, "
-              f"{gone} Discovery-Configs entfernt")
+              f"已删除 {gone} 个 Discovery 配置")
     _nodes_save()
 
 
-def _device_remove(addr, why="manuell entfernt", tell_c6=True):
-    """Gerät restlos entfernen – Liste, Broker und HA.
+def _device_remove(addr, why="手动删除", tell_c6=True):
+    """把设备彻底删掉 —— 列表、broker、HA。
 
-    Reihenfolge zählt:
-      1. Node-Namen merken, denn _purge_addr() löscht das Mapping.
-      2. Retained Discovery-Configs wegnehmen. _sent_addr kennt nur, was in
-         DIESER Sitzung publiziert wurde – nach einem Add-on-Neustart ist das
-         leer. Deshalb zusätzlich über _disc_remote (Broker-Stand vom Start)
-         nach dem Knotennamen suchen.
-      3. _purge_addr(): Zustands-Topics, Mappings, _noread/_ctrl, _nodes_save.
-      4. Verfügbarkeits-Merkzettel + retained online/offline.
-      5. Laufzeit-Zustand (devices / node_desc).
-      6. Dem C6 sagen, dass er den Eintrag auch selbst löschen soll. Ohne
-         Schritt 6 hält das Löschen exakt 60 s: der Heartbeat schickt die
-         vollständige Geräteliste, und `t == "lqi"` legt fehlende Einträge
-         per setdefault wieder an (2026-11-05 an 0x023b genau so passiert).
+    顺序很重要：
+      1. 先记住节点名，因为 _purge_addr() 会把映射删掉。
+      2. 撤掉 retained discovery 配置。_sent_addr 只知道**本次**会话发过
+         什么 —— add-on 重启之后它就是空的。所以还要靠 _disc_remote
+         （启动时 broker 的现状）按节点名再找一遍。
+      3. _purge_addr()：状态 topic、映射、_noread/_ctrl、_nodes_save。
+      4. availability 备忘 + retained 的 online/offline。
+      5. 运行时状态（devices / node_desc）。
+      6. 告诉 C6 让它也把这条记录删掉。少了第 6 步，删除只能维持 60 s：
+         心跳会把完整设备表发过来，而 `t == "lqi"` 会用 setdefault
+         把缺失的条目重新建出来（2026-11-05 在 0x023b 上正是这样）。
     """
     addr = (addr or "").strip()
     if not addr:
@@ -1927,23 +1885,21 @@ def _device_remove(addr, why="manuell entfernt", tell_c6=True):
             ser.write(_js({"cmd": "dev_remove", "addr": addr}).encode())
             print(f"[→C6] dev_remove {addr}")
         except Exception as e:                          # noqa: BLE001
-            print(f"[C6] dev_remove {addr} nicht gesendet: {e}")
+            print(f"[C6] dev_remove {addr} 没发出去：{e}")
 
-    print(f"[Web] {addr} entfernt: {len(topics)} Discovery-Configs, "
-          f"Zustands-Topics + Verfügbarkeit gelöscht ({why})")
+    print(f"[Web] 已删除 {addr}：{len(topics)} 个 Discovery 配置，"
+          f"状态 topic 和可用性一并清除（{why}）")
     return True
 
 
 def _ha_learn_ieee(addr, ieee):
-    """IEEE zu einer Adresse merken und an die bestehende Node-ID binden.
+    """记住某个地址的 IEEE，并把它绑到已有的 Node-ID 上。
 
-    Damit findet ein Gerät, das später unter einer NEUEN Short-Adresse
-    auftaucht, seine alte Entity wieder (statt einen zweiten Satz anzulegen).
-    Die alte Adresse wird dabei komplett aus dem Broker entfernt.
+    这样设备以后以**新**短地址出现时，还能找回原来的实体
+    （而不是又建一套）。旧地址会同时从 broker 里彻底清掉。
 
-    Wird bei JEDER zigbee-Meldung mit ieee aufgerufen (auch bei on_off-
-    Reports). Deshalb nur schreiben, wenn sich wirklich etwas ändert –
-    sonst würde pro Tastendruck die JSON-Datei neu geschrieben.
+    每条带 ieee 的 zigbee 消息都会调它（on_off 上报也算）。所以只在真的
+    有变化时才写文件 —— 否则每按一次键都要重写一遍 JSON。
     """
     if not ieee:
         return
@@ -1953,16 +1909,16 @@ def _ha_learn_ieee(addr, ieee):
     if prev and prev != addr:
         prev_node = _addr_nodes.get(prev) or _ha_nodes.get(prev)
         if prev_node:
-            _ieee_nodes[ieee] = prev_node      # Name überlebt den Adresswechsel
+            _ieee_nodes[ieee] = prev_node      # 名字熬过换地址
             print(f"[HA] IEEE {ieee}: Kurzadresse {prev} → {addr}")
-            # Was wir über das Gerät gelernt haben, gilt weiter – nur unter
-            # der neuen Adresse. Sonst würde ein Panel nach jedem Rejoin
-            # erneut drei Befehle pro Klick schicken.
+                # 我们学到的关于这台设备的东西继续有效 —— 只是挂在
+                # 新地址下。否则面板每次 rejoin 之后，
+                # 又会变成一次点击发三条命令。
             for s in (_noread, _ctrl):
                 for k in [k for k in s if k.split("/", 1)[0] == prev]:
                     s.discard(k)
                     s.add(f"{addr}/{k.split('/', 1)[1]}")
-            _purge_addr(prev, "Gerät hat neue Kurzadresse")
+            _purge_addr(prev, "设备换了新短地址")
         changed = True
     _ieee_addr[ieee] = addr
 
@@ -1977,22 +1933,19 @@ def _ha_learn_ieee(addr, ieee):
 
 
 def _ha_node(addr):
-    """Node-ID – pro Adresse UND pro IEEE stabil.
+    """Node-ID —— 按地址、也按 IEEE 保持稳定。
 
-    Reihenfolge:
-      1. Adresse schon bekannt (Sitzung oder Datei) → diesen Namen behalten.
-         Das friert bestehende Entities ein; keine Migration, keine Waisen.
-      2. IEEE bekannt und schon vergeben (Gerät kam mit neuer Adresse
-         zurück) → die ALTE Node-ID übernehmen und die neue Adresse darauf
-         abbilden.
-      3. Sonst neu bilden – aus der ADRESSE, genau wie vor 1.2.0.
+    顺序：
+      1. 地址已认识（本次会话或文件里）→ 沿用这个名字。
+         这样现有实体被冻结住；不迁移，也不产生孤儿。
+      2. IEEE 已知且已分到过名字（设备换了地址回来）
+         → 沿用**旧**的 Node-ID，并把新地址映射上去。
+      3. 否则新建 —— 用**地址**，跟 1.2.0 之前一样。
 
-    Warum in Schritt 3 nicht die IEEE? Weil das Bestandsinstallationen
-    migrieren würde: bisher hiessen alle Knoten c6_0x07da. Würde jetzt
-    bevorzugt die IEEE genommen, bekäme JEDES Gerät beim Update eine neue
-    Node-ID – also exakt die Doppel-Entities, die diese Datei verhindern
-    soll. Die IEEE-Tabelle dient nur dazu, den einmal vergebenen Namen
-    nach einem Adresswechsel wiederzufinden.
+    第 3 步为什么不用 IEEE？因为那会迁移现有安装：此前所有节点都叫
+    c6_0x07da。若改成优先用 IEEE，更新之后**每台**设备都会拿到新的
+    Node-ID —— 正好产生这个文件想避免的重复实体。IEEE 表只用来在换地址
+    之后把已经发出去的名字找回来。
     """
     node = _ha_nodes.get(addr) or _addr_nodes.get(addr)
     if node:
@@ -2002,8 +1955,8 @@ def _ha_node(addr):
     ieee = _ha_devices.get(addr, {}).get("ieee") or _addr_ieee.get(addr, "")
     if ieee and ieee in _ieee_nodes:
         node = _ieee_nodes[ieee]
-        print(f"[HA] {addr} hat neue Kurzadresse → bestehende Entities "
-              f"{node} übernommen (gleiche IEEE)")
+        print(f"[HA] {addr} 换了新短地址 ⇒ 现有实体"
+              f"继续沿用 {node}（同一 IEEE）")
     else:
         node = "c6_" + _ha_slug(addr)
 
@@ -2018,19 +1971,18 @@ def _ha_node(addr):
 
 
 def _ha_state(addr, sub, p, retain=True):
-    """Zustand auf das state_topic legen – retained.
+    """把状态发到 state_topic —— retained。
 
-    Vorher wurde ohne retain publiziert: nach jedem HA-Neustart standen alle
-    Schalter wieder auf "unknown", weil weder Broker noch HA den letzten Wert
-    hatte. Zusätzlich merkt sich _ha_last den Wert, damit ein "toggle" ohne
-    Gerätereport in die richtige Richtung gedreht werden kann.
+    以前是不带 retain 发的：HA 每次重启所有开关都回到 "unknown"，
+    因为 broker 和 HA 都没有最后一个值。另外 _ha_last 会记住这个值，
+    好让没有设备回报的 "toggle" 也能朝正确方向翻。
     """
     topic = f"{BASE}/zigbee/{addr}/{sub}"
     mq_put(topic, json.dumps(p), retain=retain, qos=1)
     if isinstance(p, dict):
         _ha_last.setdefault(addr, {})[sub] = p
-    # Merken, welche Topics wir je gesetzt haben – nur damit lässt sich eine
-    # alte Kurzadresse später restlos aufräumen (_purge_addr).
+    # 记下我们曾经设过哪些 topic —— 只有靠它，之后才能把一个
+    # 旧短地址彻底清理干净（_purge_addr）。
     subs = _addr_subs.setdefault(addr, [])
     if sub not in subs:
         subs.append(sub)
@@ -2049,7 +2001,7 @@ def _ha_device(addr):
         "model": db.get("model") or d.get("model") or "未知型号",
     }
 
-# Endpunkt-Namen aus der Z2M-DB (top/center/bottom/left/right …) → Anzeigename
+# 端点名取自 Z2M 数据库（top/center/bottom/left/right …）→ 显示名
 _EP_ZH = {"top": "上", "center": "中", "bottom": "下", "left": "左", "right": "右",
           "top_left": "左上", "top_right": "右上",
           "bottom_left": "左下", "bottom_right": "右下"}
@@ -2073,11 +2025,10 @@ _HA_MAP = {
 }
 
 def _ha_publish(addr, sub, p):
-    """Meldet (addr, sub) automatisch bei Home Assistant an (MQTT Discovery).
+    """把 (addr, sub) 自动登记到 Home Assistant（MQTT Discovery）。
 
-    Wird pro eingehendem Telegramm aufgerufen, publiziert die Config aber nur
-    einmal pro (Node, Objekt) – mit retain, damit sie einen HA-Neustart
-    überlebt. Kein YAML nötig: HA legt die Entity selbst an.
+    每条进来的电文都会调用，但配置每个 (节点, 对象) 只发一次 ——
+    带 retain，好熬过 HA 重启。不需要 YAML：HA 自己建实体。
     """
     if not HA_ENABLED:
         return
@@ -2092,9 +2043,8 @@ def _ha_publish(addr, sub, p):
     node      = _ha_node(addr)
     dev       = _ha_device(addr)
     topic     = f"{BASE}/zigbee/{addr}/{sub}"
-    # Endpunkte, die als reiner Sender erkannt wurden, bekommen KEINEN
-    # Schalter zurück – sonst würde das nächste Telegramm die eben
-    # abgemeldete Kachel sofort wieder anlegen (siehe _ha_drop_switch).
+        # 被判定为纯发送方的端点**不**再建开关 —— 否则下一帧电报会立刻
+        # 把刚撤掉的开关卡片重新建出来（见 _ha_drop_switch）。
     if base_name == "on_off":
         try:
             _epn_num = int(epn[2:]) if epn.startswith("ep") else 1
@@ -2102,7 +2052,7 @@ def _ha_publish(addr, sub, p):
             _epn_num = 1
         if _ep_key(addr, _epn_num) in _ctrl:
             return
-    # "EP1" ist bei Einzel-Endpunkt-Geräten nur Rauschen im Namen
+        # 单端点设备的 "EP1" 只是名字里的噪声
     ep_label  = _ha_ep_label(addr, epn)
     ep_part   = "" if ep_label == "EP1" else ep_label + " "
     avail     = _ha_avail(addr)
@@ -2130,10 +2080,9 @@ def _ha_publish(addr, sub, p):
             }))
     elif base_name in _HA_MAP:
         comp, label, tpl, unit, dc, sc = _HA_MAP[base_name]
-        # "has_entity_name": HA stellt dem Namen den Gerätenamen voran. Stand
-        # der Gerätename vorher zusätzlich IM name-Feld, kam "HGZB-043
-        # HGZB-043 上 开关" heraus. Also nur noch den Teil nennen, der das
-        # Gerät unterscheidet (Endpunkt + Rolle).
+            # "has_entity_name"：HA 会把设备名加在名字前面。原先设备名又重复
+            # 出现在 name 字段里，结果出来是 "HGZB-043 HGZB-043 上 开关"。
+            # 所以这里只写区分设备的那部分（端点 + 角色）。
         cfg = {
             "name": f"{ep_part}{label}",
             "has_entity_name": True,
@@ -2155,15 +2104,14 @@ def _ha_publish(addr, sub, p):
         objects.append((comp, f"{epn}_{base_name}", cfg))
 
     for comp, obj_id, cfg in objects:
-        # addr gehört mit in die Buchführung: wechselt das Gerät die
-        # Kurzadresse, müssen state_topic/command_topic neu publiziert werden
-        # und die alten Topics restlos verschwinden (_purge_addr).
-        # Ob wirklich gesendet wird, entscheidet _disc_send am Inhalt.
+            # addr 也要一起记账：设备换了短地址时，state_topic/command_topic
+            # 得重新发布，旧 topic 要彻底消失（_purge_addr）。
+            # 到底发不发，由 _disc_send 按内容决定。
         cfg["unique_id"] = f"{node}_{obj_id}"
         cfg["device"]    = dev
         cfg["origin"]    = _GW_ORIGIN
-        # HA 2025.10 hat object_id durch default_entity_id abgelöst; Z2M
-        # setzt beide, damit bestehende Entity-IDs die Migration überleben.
+            # HA 2025.10 用 default_entity_id 取代了 object_id；Z2M 两个都写，
+            # 好让已有的实体 ID 熬过这次迁移。
         cfg["default_entity_id"] = f"{comp}.{_ha_slug(node)}_{_ha_slug(obj_id)}"
         _disc_send(comp, node, obj_id, cfg, addr)
 
@@ -2174,22 +2122,21 @@ def _db_kind_of(entry):
     if ("scene" in desc or "selector" in desc) and ("switch" in caps or "action" in caps):
         return "panel"
     if "switch" in caps and "action" in caps:
-        return "maybe"          # mehrdeutig, siehe _ha_db_hint
+        return "maybe"          # 有歧义，见 _ha_db_hint
     if "switch" in caps or "light" in caps:
         return "switch"
     return None
 
 
 def _ha_db_family(model):
-    """Gleiche Baureihe in der DB suchen – für Modelle, die dort fehlen.
+    """在 DB 里找同一系列 —— 给那些 DB 里没有的型号用。
 
-    FTB56+ZSN18ZY1.1 steht nicht in der DB, FTB56+ZSN15HG1.0 und
-    FTB56+ZSN16HG1.0 schon („Smart N key scene wall switch“). Über das
-    längste gemeinsame Präfix lässt sich die Einordnung erben.
+    FTB56+ZSN18ZY1.1 不在 DB 里，FTB56+ZSN15HG1.0 和
+    FTB56+ZSN16HG1.0 在（"Smart N key scene wall switch"）。用最长公共
+    前缀就能把这套分类继承过来。
 
-    Das Präfix darf nicht zu kurz werden: „FTB56+“ enthält auch
-    FTB56+SKT1BCW1.0 – eine Steckdose MIT Relais. Deshalb mindestens 9
-    Zeichen, und nur bei einstimmigem Votum der ganzen Familie.
+    前缀不能太短："FTB56+" 也会匹配到 FTB56+SKT1BCW1.0 —— 一个**带**继电器的
+    插座。所以至少 9 个字符，而且只在整族一致同意时才用。
     """
     if not model:
         return None, []
@@ -2203,11 +2150,10 @@ def _ha_db_family(model):
 
 
 def _ha_db_hint(addr):
-    """Was die Z2M-Datenbank über die Bauart sagt – nur ein HINWEIS.
+    """Z2M 数据库对设备类型的说法 —— 只是**提示**。
 
-    Warum kein Urteil: die DB unterscheidet "Smart 2 key scene wall switch"
-    von echten Schaltern nur über die Beschreibung. Die naheliegenden
-    Felder taugen nicht (am 2026-10-17 gegen alle 3188 Einträge geprüft):
+    为什么不下结论：DB 只靠描述文字来区分 "Smart 2 key scene wall switch"
+    和真正的开关。几个看着好用的字段都不行（2026-10-17 拿全部 3188 条验过）：
 
       * caps 里含 "action"：31 条命中，其中包括 MEAZON_BIZY_PLUG、
         DinRail 单相电表、Power switch S1、LK FUGA wiser 无线双联继电器 ——
@@ -2216,9 +2162,9 @@ def _ha_db_hint(addr):
         （只是 Z2M 没写出来）。
       * components=switch：618 个型号，其中只有 7 个在文字里带 "scene"。
 
-    Und das Gerät, um das es hier geht (FTB56+ZSN18ZY1.1), steht gar nicht
-    in der DB – deshalb der Familien-Umweg über _ha_db_family().
-    Entschieden wird trotzdem über Descriptor/Probe, nie über diesen Text.
+    而这里说的这台设备（FTB56+ZSN18ZY1.1）压根不在 DB 里 ——
+    所以才绕道 _ha_db_family() 走系列。最终裁决仍然靠 Descriptor/探测，
+    永远不看这段文字。
     """
     d = _ha_devices.get(addr, {})
     model = (d.get("model") or "").strip()
@@ -2234,16 +2180,16 @@ def _ha_db_hint(addr):
     kinds.discard(None)
     names = ", ".join(sorted(hits))[:56]
     if kinds == {"panel"}:
-        return "panel", f"DB-Familie „{pre}*“ (nur Szenen-Panels: {names})"
+        return "panel", f"数据库同族「{pre}*」（只有情景面板：{names}）"
     if kinds and kinds <= {"panel", "maybe"}:
         return "maybe", f"DB-Familie „{pre}*“ (Panel-Verdacht: {names})"
-    return None, f"DB-Familie „{pre}*“ gemischt {sorted(kinds)} – kein Hinweis"
+    return None, f"数据库同族「{pre}*」混杂 {sorted(kinds)} —— 不作为判据"
 
 
 def _ha_prepublish(addr):
-    """Meldet alle aus der Z2M-DB bekannten Endpunkte sofort an, damit das Gerät
-    direkt nach dem Join in HA auftaucht – nicht erst nach dem ersten Tastendruck.
-    Nur bei expliziter Endpoint-Map, sonst würden Phantom-Entities entstehen."""
+    """把 Z2M DB 里已知的端点立刻登记上去，让设备
+    刚入网就出现在 HA 里 —— 而不是等到第一次按键。
+    只在有明确端点表时才做，否则会造出幽灵实体。"""
     db  = _ha_devices.get(addr, {}).get("db") or {}
     eps = db.get("endpoints") or {}
     if not eps or "switch" not in (db.get("caps") or []):
@@ -2252,41 +2198,37 @@ def _ha_prepublish(addr):
         _ha_publish(addr, f"ep{num}/on_off", {"v": 0})
 
 def _ha_forget(addr):
-    """Discovery-Cache für ein Gerät verwerfen (z.B. nach neuem Basic-Read),
-    damit die Entities mit korrektem Modellnamen neu angemeldet werden."""
+    """丢弃某台设备的 discovery 缓存（比如读过新的 Basic 之后），
+    好让实体带着正确的型号名重新登记。"""
     node = _ha_node(addr)
     for t in [t for t in _ha_sent if f"/{node}/" in t]:
         _ha_sent.pop(t, None)
 
 
-# ── Tastenereignisse ───────────────────────────────────────────────────────
-# Der C6 gibt JEDEN eingehenden APS-Frame roh als {"t":"aps", …,"hex":…} aus.
-# Damit lassen sich Tastendrücke im Add-on dekodieren, ohne im C6 eine
-# cluster-spezifische Empfangslogik zu brauchen:
+# ── 按键事件 ───────────────────────────────────────────────────────────────
+# C6 把**每一个**收到的 APS 帧都原样输出成 {"t":"aps", …,"hex":…}。有了它，
+# 按键就能在 add-on 里解码，C6 侧不必再写簇相关的接收逻辑：
 #
-#   cluster 0x0006 (On/Off), Frame-Typ 0x01 (cluster-spezifisch),
-#   Richtung Client→Server (Bit 0x08 NICHT gesetzt), cmd 0x00/0x01/0x02
-#   cluster 0x0005 (Scenes), cmd 0x05 (recall), Payload = Gruppe(2) + Szene(1)
+#   cluster 0x0006 (On/Off)，帧类型 0x01（簇相关），
+#   方向 Client→Server（0x08 位**未**置位），cmd 0x00/0x01/0x02
+#   cluster 0x0005 (Scenes)，cmd 0x05 (recall)，负载 = 组(2) + 场景(1)
 #
-# Eine Default-Response des Geräts (cmd 0x0b) hat Bit 0x08 gesetzt und wird
-# dadurch nie als Tastendruck gewertet – sonst würde jeder eigene Befehl ein
-# Tastenereignis auslösen.
+# 设备回的 Default-Response（cmd 0x0b）置了 0x08 位，因此永远不会被当成
+# 按键 —— 否则我们自己每发一条命令都会触发一次按键事件。
 _ONOFF_ACT = {0x00: "off", 0x01: "on", 0x02: "toggle"}
 
 
 def _event_types():
-    """Erlaubte Werte der HA-event-Entity.
+    """HA event 实体允许的取值。
 
-    ★ HA verwirft jedes Ereignis, dessen Wert NICHT in `event_types` steht
-    („Invalid event type“ im Log, Entity bleibt unverändert). Die Liste muss
-    also alle Werte im Voraus enthalten, die das Panel je senden kann – sie
-    lässt sich nicht nachträglich erweitern, ohne die Entity neu anzulegen.
+    ★ 只要值**不**在 `event_types` 里，HA 就丢弃该事件
+    （日志里写 "Invalid event type"，实体保持不变）。所以这张表必须事先
+    包含面板可能发出的所有值 —— 事后没法扩充，除非重建实体。
 
-    Quelle für die Werte ist der Upstream-Converter des Geräts:
-    `FTB56+ZSN15HG1.0` / `FTB56+ZSN16HG1.0` (nue_3a.ts) benutzen
-    `fromZigbee: [fz.command_recall]` → `action = "recall_<sceneid>"`.
-    Für den 2-Tasten-Betrieb ist die **Szenen-ID** das, was die Taste
-    unterscheidet; die Endpunkt-Nummer trennt zusätzlich die Wippen.
+    这些值的来源是设备的上游转换器：
+    `FTB56+ZSN15HG1.0` / `FTB56+ZSN16HG1.0`（nue_3a.ts）用的是
+    `fromZigbee: [fz.command_recall]` → `action = "recall_<sceneid>"`。
+    两键操作时，区分按键靠的是**场景 ID**；端点号则另外区分两个翘板。
     """
     t = ["on", "off", "toggle", "scene"]        # "scene" = Altbestand (1.2.2)
     t += ["recall_%d" % i for i in range(32)]   # genScenes recall
@@ -2298,34 +2240,32 @@ _EVENT_TYPES = _event_types()
 ESP_ZB_CL_ON_OFF = 0x0006     # ZCL-Cluster On/Off
 ESP_ZB_CL_SCENES = 0x0005     # ZCL-Cluster Scenes
 
-# HA-Profil: Device-IDs, deren ROLLE das Schalten ist (…Switch). Ein Gerät
-# mit so einer ID ist ein Sender, kein Aktor. Absichtlich knapp gehalten und
-# nur als Zweitmerkmal benutzt – ein Fehlgriff hier kann keinen funktionierenden
-# Schalter entfernen, weil dafür zusätzlich "kein Rücklesen" nötig ist.
+# HA 分类：角色就是"开关"的 Device-ID（…Switch）。带这种 ID 的设备是
+# 发送方，不是执行器。故意留得很窄，只当第二特征用 —— 这里判错也不会
+# 删掉一个能用的开关，因为还额外要求"不可回读"。
 _SWITCH_DEV_IDS = {0x0005, 0x0008, 0x0009, 0x000A}
 
 
 def _ha_event_sub(ep):
-    """Gleiche Namensregel wie überall: EP1 ohne Präfix."""
+    """命名规则到处一致：EP1 不带前缀。"""
     return f"ep{ep}/action" if ep > 1 else "action"
 
 
-# ★ HA verlangt für event-Entities ein JSON-Payload mit event_type-Element
-#   (Dokumentation MQTT Event: "The JSON payload should contain the
-#   event_type element"). Ein nacktes "on" ist kein JSON → HA verwirft es
-#   STILL (Entity bleibt auf "unbekannt"). Genau deshalb zeigte die Kachel
-#   nichts, obwohl die Nachrichten sichtbar im Broker ankamen.
+# ★ HA 要求 event 实体的负载是带 event_type 元素的 JSON
+#   （MQTT Event 文档原文："The JSON payload should contain the
+#   event_type element"）。裸的 "on" 不是 JSON → HA 会**静默**丢弃
+#   （实体停在"未知"）。当初卡片什么都不显示、可消息明明已经到 broker，
+#   原因就是这个。
 #
-# Kein Dedupe: Doppelte Ereignisse (zwei Frames pro Taste) sind ABSICHT des
-# Geräts – der Nutzer hat es 2026-10-17 so bestätigt: eine ganz kurze
-# Berührung löst kein Umschalten aus, wird aber trotzdem gemeldet. Das
-# zweite identische Ereignis ist also ein echtes Ereignis, kein Artefakt.
+# 不去重：重复事件（一次按键两帧）是设备的**故意设计** —— 用户 2026-10-17
+# 亲口确认：极短的一次触碰不会触发翻转，但照样会上报。所以第二条一模一样
+# 的事件是真实事件，不是假信号。
 def _action_payload(act):
     return json.dumps({"event_type": act})
 
 
 def _ha_publish_event(addr, ep):
-    """Event-Entity (Taste) für einen Endpunkt anmelden."""
+    """给某个端点注册事件实体（按键）。"""
     if not HA_ENABLED:
         return
     _avail_sync(addr)          # availability 主题要先存在，否则实体一开始不可用
@@ -2350,21 +2290,19 @@ def _ha_publish_event(addr, ep):
 
 
 def _ha_button_from_report(addr, sub, p, was_expected=False):
-    """Tastendruck aus einem on/off-**Report** ableiten.
+    """从 on/off 的 **Report** 推导按键。
 
-    ★ Messung 2026-10-17 18:53 an 0x747d (FTB56+ZSN18ZY1.1): beim Drücken
-    meldet das Panel NICHT die im Upstream-Converter hinterlegte Szene
-    (`fromZigbee: [fz.command_recall]`), sondern schlicht das OnOff-Attribut
-    des betroffenen Endpunkts – ep2 → `{"v": 1}`, 2 s später ep1 → `{"v": 1}`.
+    ★ 2026-10-17 18:53 在 0x747d（FTB56+ZSN18ZY1.1）上实测：按下时
+    面板报的**不是**上游转换器里写的那个场景
+    （`fromZigbee: [fz.command_recall]`），而是受影响端点的 OnOff 属性
+    本身 —— ep2 → `{"v": 1}`，2 s 后 ep1 → `{"v": 1}`。
 
-    Ein Report hat Frame-Type 0 (allgemein) und Direction Server→Client.
-    `_ha_aps_action` verwirft beides mit Absicht (sonst würde jede Antwort
-    auf unseren eigenen Befehl als Tastendruck gelten). Genau deshalb kam
-    der Tastendruck dort nie an – er ist keine Kommando-Nachricht.
+    Report 的帧类型是 0（通用）、方向是 Server→Client。
+    `_ha_aps_action` 故意把这两种都丢掉（否则每条对我们命令的应答都会
+    被当成按键）。也正因此按键在那里从来没出现过 —— 它根本不是命令报文。
 
-    Nur für Endpunkte, die als reiner Sender eingestuft sind (`_ctrl`):
-    bei einem echten Schalter ist ein Report eine Zustandsänderung, kein
-    Tastendruck und darf kein Ereignis erzeugen.
+    只对判为纯发送方的端点做（`_ctrl`）：对真开关来说，Report 是状态变化，
+    不是按键，不能产生事件。
     """
     if not HA_ENABLED or not sub.endswith("on_off"):
         return
@@ -2373,18 +2311,16 @@ def _ha_button_from_report(addr, sub, p, was_expected=False):
         return
     k = _ep_key(addr, ep)
     if k not in _ctrl:
-        # Zweitweg: das Gerät ist bereits als Panel bekannt (irgendein
-        # Endpunkt in _ctrl) UND die Modellfamilie ist einstimmig ein
-        # Szenen-Panel. Deckt den Fall ab, dass der Simple-Descriptor nur
-        # einen Endpunkt geliefert hat, die andere Wippe aber trotzdem
-        # Tasten meldet. Die Familienbedingung ist streng (2/2 einstimmig),
-        # damit kein echtes Relais versehentlich Tastendrücke erzeugt.
+        # 第二条路：设备已经作为面板登记过了（_ctrl 里任一端点），**并且**
+        # 型号族一致认定为情景面板。这覆盖了 Simple-Descriptor 只给了一个
+        # 端点、而另一个翘板照样报按键的情况。族条件很严（2/2 一致），
+        # 免得真继电器被误判成按键源。
         if _ha_db_hint(addr)[0] != "panel":
             return
         if not any(x.split("/", 1)[0] == addr for x in _ctrl):
             return
     if was_expected:
-        # Antwort auf unser eigenes Read-Attributes → kein Tastendruck
+        # 是在回答我们自己的 Read-Attributes → 不算按键
         return
     v = (p or {}).get("v")
     if v is None:
@@ -2392,18 +2328,18 @@ def _ha_button_from_report(addr, sub, p, was_expected=False):
     act = "on" if int(v) else "off"
     topic = f"{BASE}/zigbee/{addr}/{_ha_event_sub(ep)}"
     mq_put(topic, _action_payload(act), retain=False, qos=1)
-    print(f"[MQTT] {topic} {act}   (Taste ep{ep} aus Report)")
+    print(f"[MQTT] {topic} {act}   （来自上报的按键 ep{ep}）")
     _ha_publish_event(addr, ep)
 
 
 def _ha_drop_switch(addr, ep, why):
-    """switch-Entity eines reinen Senders wieder abmelden.
+    """把纯发送方的 switch 实体撤掉。
 
-    Ein Panel ohne Relais nimmt On/Off-Befehle an, quittiert sie mit SUCCESS
-    und tut nichts – die switch-Kachel in HA verspricht also etwas, das es
-    nicht gibt. Deshalb wird sie entfernt und durch die event-Entity ersetzt.
-    Rückgängig: "addr/ep" aus "ctrl" in /data/ha_nodes.json löschen, Add-on
-    neu starten.
+    没有继电器的面板接受 On/Off 命令、回 SUCCESS，然后什么也不做 ——
+    HA 里那张 switch 卡片就是在承诺一件不存在的事。所以撤掉它，
+    换成 event 实体。
+    想恢复：把 /data/ha_nodes.json 里 "ctrl" 下的 "addr/ep" 删掉，
+    重启 add-on。
     """
     if not HA_ENABLED:
         return
@@ -2421,18 +2357,18 @@ _dropped = set()       # "addr/ep" – switch-Entity in dieser Laufzeit schon ab
 
 
 def _classify(addr, ep, why=""):
-    """Aus den zwei Merkmalen die richtige Entity-Form ableiten.
+    """从两个特征推出正确的实体形态。
 
-    Regeln (beide Merkmale werden automatisch erhoben, keins von Hand):
+    规则（两个特征都自动采集，没有一个是手填的）：
 
-      A  OnOff-Attribut rücklesbar  → echter Schalter (switch)
-      B  Gerät schickt selbst Tastenbefehle → reiner Sender (event)
-      B + kein Rücklesen (A verletzt) → Panel ohne Relais: switch abmelden
-      B + Rücklesen möglich          → Gerät MIT Relais, das zusätzlich
-                                       Tasten sendet: switch UND event behalten
+      A  OnOff 属性可回读        → 真开关（switch）
+      B  设备自己发按键命令      → 纯发送方（event）
+      B + 不可回读（A 不成立）   → 无继电器面板：撤掉 switch
+      B + 回读没问题             → 带继电器的设备，同时又发按键：
+                                   switch 和 event 都留着
 
-    Aufrufstellen: _ha_mark_controller (Merkmal B neu), _noread_add
-    (Merkmal A widerlegt) und _classify_from_desc (Simple-Descriptor).
+    调用点：_ha_mark_controller（新增特征 B）、_noread_add
+    （特征 A 被推翻）和 _classify_from_desc（Simple-Descriptor）。
     """
     k = _ep_key(addr, ep)
     if k not in _ctrl:
@@ -2440,12 +2376,12 @@ def _classify(addr, ep, why=""):
     _ha_publish_event(addr, ep)
     if k in _noread and k not in _dropped:
         _dropped.add(k)
-        _ha_drop_switch(addr, ep, why or "Gerät ist reiner Sender (kein Rücklesen, "
-                                        "schickt aber eigene Tastenbefehle)")
+        _ha_drop_switch(addr, ep, why or "设备是纯发送端（不可回读，"
+                                        "但会发自己的按键命令）")
 
 
 def _ha_mark_controller(addr, ep):
-    """Endpunkt als reinen Sender einstufen (Merkmal B)."""
+    """把端点判定为纯发送端（判据 B）。"""
     k = _ep_key(addr, ep)
     if k in _ctrl:
         _classify(addr, ep)
@@ -2453,30 +2389,29 @@ def _ha_mark_controller(addr, ep):
     _ctrl.add(k)
     _nodes_save()
     if k in _noread:
-        print(f"[HA] {addr} ep{ep}: schickt eigene Tastenbefehle und ist nicht "
-              f"rücklesbar → Tastenpanel ohne Relais")
+        print(f"[HA] {addr} ep{ep}：会发自有的按键命令且 "
+              f"不可回读 ⇒ 无继电器按键面板")
     else:
-        print(f"[HA] {addr} ep{ep}: schickt eigene Tastenbefehle – "
-              f"als Taste angemeldet (Schalter bleibt, Rücklesen geht)")
+        print(f"[HA] {addr} ep{ep}：会发自有按键命令 —— "
+              f"按按键注册（保留开关，回读可用）")
     _classify(addr, ep)
 
 
-# ── Automatische Einstufung beim Join ─────────────────────────────────────
-# Zwei unabhängige Quellen, damit nichts von Hand entschieden werden muss:
+# ── 入网时自动分级 ───────────────────────────────────────────────────────
+# 两个互相独立的来源，任何一项都不需要人工裁决：
 #
-#  1. Simple-Descriptor (kommt beim Interview): steht 0x0006 in der
-#     INPUT-Liste, ist das Gerät Server für On/Off = echter Schalter.
-#     Steht 0x0006/0x0005 nur in der OUTPUT-Liste, kann es ausschließlich
-#     Befehle SCHICKEN = Tastenpanel.
-#  2. Probe: ein Read-Attributes je Endpunkt. Kommt ein Wert → Schalter.
-#     Kommt nichts → kein Attribut vorhanden → Panel.
+#  1. Simple-Descriptor（配对时下发）：0x0006 出现在 INPUT 列表里，
+#     说明设备是 On/Off 的 Server = 真开关。
+#     0x0006/0x0005 只出现在 OUTPUT 列表里，说明它只能**发**命令 = 按键面板。
+#  2. 探测：每个端点发一次 Read-Attributes。有值回来 → 开关。
+#     什么都没回 → 根本没有这个属性 → 面板。
 #
-# Quelle 1 ist eindeutig, kommt aber nur beim Join. Quelle 2 läuft immer und
-# heilt eine falsche Einstufung wieder (siehe _pending_ack → _noread_del).
-_PROBE_AFTER = 2.5     # s nach "interview done"
-_PROBE_WAIT  = 4.0     # s Frist für die Antwort
-_probe = {}            # (addr, ep) → Ablaufzeit
-_desc  = {}            # addr → {ep: (in_cluster, out_cluster)} aus dem Simple-Desc
+# 来源 1 明确，但只在配对时来一次。来源 2 一直跑，能把错判纠回来
+# （见 _pending_ack → _noread_del）。
+_PROBE_AFTER = 2.5     # 秒，从 "interview done" 算起
+_PROBE_WAIT  = 4.0     # s，等回应的超时
+_probe = {}            # (addr, ep) → 到期时间
+_desc  = {}            # addr → {ep: (in_cluster, out_cluster)}，来自 Simple-Desc
 
 
 def _probe_one(addr, ep):
@@ -2490,12 +2425,11 @@ def _probe_one(addr, ep):
 
 
 def _probe_start(addr, eps):
-    """Nur Endpunkte mit On/Off-Cluster probieren.
+    """只探测带 On/Off 簇的端点。
 
-    Ein Temperatursensor hat kein OnOff-Attribut; ihn zu fragen ergäbe
-    "nicht rücklesbar" und würde das Log mit Meldungen fluten, die für ihn
-    völlig bedeutungslos sind. Der Simple-Descriptor sagt vorher, wer hier
-    überhaupt ein On/Off hat – nur die werden geprüft.
+    温度传感器没有 OnOff 属性；去问它，得到的只会是"不可回读"，
+    还会让日志被一堆对它毫无意义的消息淹掉。Simple-Descriptor 事先就说了
+    谁身上有 On/Off —— 只查这些。
     """
     if not eps:
         return
@@ -2507,9 +2441,8 @@ def _probe_start(addr, eps):
             continue
         cl = known.get(ep)
         if cl is None:
-            # Kein Descriptor (Interview unvollständig). Nur dann auf die
-            # DB verlassen, wenn sie das Gerät als Panel ausweist – sonst
-            # nicht raten.
+            # 没有 Descriptor（配对没走完）。只有 DB 把它标成面板时
+            # 才照着算，否则不要猜。
             if hint == "panel":
                 todo.append(ep)
             continue
@@ -2517,18 +2450,18 @@ def _probe_start(addr, eps):
             todo.append(ep)
     if not todo:
         return
-    print(f"[HA] {addr}: prüfe OnOff-Rücklesbarkeit auf {todo}")
+    print(f"[HA] {addr}：检查 {todo} 上的 OnOff 是否可回读")
     for i, ep in enumerate(todo):
         threading.Timer(_PROBE_AFTER + i * 0.4, _probe_one, (addr, ep)).start()
 
 
 def _probe_seen(addr, ep):
-    """Es ist ein echter Zustand eingetroffen → Endpunkt ist lesbar."""
+    """收到了真实状态 ⇒ 这个端点可读。"""
     key = (addr, ep)
     with _pending_lock:
         hit = _probe.pop(key, None)
     if hit is not None:
-        print(f"[HA] {addr} ep{ep}: antwortet auf Read-Attributes → echter Schalter")
+        print(f"[HA] {addr} ep{ep}：会回 Read Attributes ⇒ 真开关")
     if _ep_key(addr, ep) in _noread:
         _noread_del(addr, ep)
 
@@ -2537,9 +2470,9 @@ def _probe_done(addr, ep):
     key = (addr, ep)
     with _pending_lock:
         if key not in _probe:
-            return                       # es kam eine Antwort
+            return                       # 说明应答来了
         _probe.pop(key, None)
-    _noread_add(addr, ep, "OnOff-Attribut beim Join nicht lesbar")
+    _noread_add(addr, ep, "入网时 OnOff 属性读不到")
 
 
 # ── 型号补读（ZCL Basic 0x0004 厂商 / 0x0005 型号）────────────────────────
@@ -2627,54 +2560,52 @@ def _model_backfill_task():
 
 
 def _classify_from_desc(addr, ep, in_cl, out_cl, dev_id=0):
-    """Einstufung aus dem Simple-Descriptor (eindeutig, kommt beim Join).
+    """按 Simple-Descriptor 分级（明确，配对时下发）。
 
-    Der Descriptor ist die belastbarste Auskunft, die ein Zigbee-Gerät über
-    sich selbst gibt – belastbarer als Hersteller/Modell, weil er aus dem
-    ZDO-Interview stammt und nicht aus einer Textdatenbank:
-        profile_id, device_id, Input-Cluster (Server), Output-Cluster (Client).
+    Descriptor 是 Zigbee 设备关于自己最可靠的说明 —— 比厂商/型号更可靠，
+    因为它来自 ZDO 配对流程，而不是某个文本数据库：
+        profile_id、device_id、Input 簇（Server）、Output 簇（Client）。
 
-    Entscheidend ist die RICHTUNG von Cluster 0x0006:
-        Input/Server  → das Gerät hält einen On/Off-Zustand (schaltbar)
-        Output/Client → das Gerät SCHICKT On/Off, hat keinen eigenen Zustand
-    Zusätzlich wird die Device-ID mitgeschrieben; sie dient als zweites
-    Merkmal, wenn die Cluster-Listen nichts hergeben.
+    关键在簇 0x0006 的**方向**：
+        Input/Server  → 设备持有 On/Off 状态（可开关）
+        Output/Client → 设备**发** On/Off，自己没有状态
+    另外会把 Device-ID 一并记下；当簇列表说明不了问题时，
+    它作为第二特征使用。
     """
     k = _ep_key(addr, ep)
-    # Für die Join-Probe merken, wer überhaupt ein On/Off hat.
+    # 给配对探测记下谁身上有 On/Off。
     _desc.setdefault(addr, {})[ep] = (list(in_cl), list(out_cl))
     if ESP_ZB_CL_ON_OFF in in_cl:
-        # On/Off als Server-Cluster: das Gerät hält einen Zustand → Schalter.
+        # On/Off 是 Server 簇：设备持有状态 → 是开关。
         if k in _ctrl:
             _ctrl.discard(k)
             _nodes_save()
-            print(f"[HA] {addr} ep{ep}: On/Off ist Server-Cluster → "
-                  f"doch ein echter Schalter (Einstufung revidiert)")
+            print(f"[HA] {addr} ep{ep}：On/Off 是 Server 簇 ⇒ "
+                  f"确实是真开关（推翻原判定）")
         _noread_del(addr, ep)
         return
     if (ESP_ZB_CL_ON_OFF in out_cl or ESP_ZB_CL_SCENES in out_cl
             or dev_id in _SWITCH_DEV_IDS):
-        _what = ("On/Off nur Client-Cluster" if ESP_ZB_CL_ON_OFF in out_cl
-                 else "Scenes nur Client-Cluster" if ESP_ZB_CL_SCENES in out_cl
-                 else "Device-ID der Schalter-Klasse")
+        _what = ("On/Off 只在 Client 簇" if ESP_ZB_CL_ON_OFF in out_cl
+                 else "Scenes 只在 Client 簇" if ESP_ZB_CL_SCENES in out_cl
+                 else "Device ID 属开关类")
         print(f"[HA] {addr} ep{ep}: {_what} "
               f"(device=0x{dev_id:04x}, in={in_cl}, out={out_cl}) → Tastenpanel")
         _ha_mark_controller(addr, ep)
 
 
 def _zcl_head(b):
-    """ZCL-Header zerlegen → (fc, mfr, tsn, cmd, payload_start) oder None.
+    """拆 ZCL 头 → (fc, mfr, tsn, cmd, payload_start)，失败返回 None。
 
-    ★ Frame-Control-Bit 2 (0x04) = manufacturer specific. Dann steht ein
-    2-Byte-Herstellercode ZWISCHEN Frame-Control und TSN:
+    ★ Frame-Control 第 2 位（0x04）= 厂商专有。此时 2 字节厂商码
+    夹在 Frame-Control 和 TSN **之间**：
 
-        fc(1) | mfr(2, LSB first) | tsn(1) | cmd(1) | payload…
+        fc(1) | mfr(2, 低位在前) | tsn(1) | cmd(1) | payload…
 
-    Die frühere Fassung las `cmd` immer aus `b[2]`. Bei einem
-    herstellerspezifischen Frame ist das das LOW-Byte des Herstellercodes –
-    also praktisch nie 0x00/0x01/0x02 (On/Off) oder 0x05 (Scene recall).
-    Folge: der Tastendruck wurde **stillschweigend verworfen**, ohne jede
-    Logzeile. Genau das passt zum Symptom „Taste wird nicht gelesen“.
+    早先的版本一律从 `b[2]` 读 `cmd`。对厂商专有帧来说那是厂商码的
+    低字节 —— 所以几乎永远不是 0x00/0x01/0x02（On/Off）或 0x05
+    （Scene recall）。结果：按键被**静默丢弃**，日志一行都没有。
+    这正好对上"按键读不到"的症状。
     """
     if len(b) < 3:
         return None
@@ -2691,11 +2622,11 @@ def _zcl_head(b):
     return fc, mfr, b[i], b[i + 1], i + 2
 
 
-_aps_unbekannt = set()   # (cl, ftype, cmd) – schon protokolliert (kein Spam)
+_aps_unbekannt = set()   # (cl, ftype, cmd) —— 已经记过日志（免得刷屏）
 
 
 def _ha_aps_action(msg):
-    """Tastendruck aus einem rohen APS-Frame erkennen und nach HA geben."""
+    """从原始 APS 帧里识别按键，并送到 HA。"""
     if not HA_ENABLED:
         return
     hx = msg.get("hex") or ""
@@ -2709,7 +2640,7 @@ def _ha_aps_action(msg):
     if not head:
         return
     fc, mfr, tsn, cmd, ps = head
-    if fc & 0x08:            # Server→Client = Antwort auf unseren Befehl
+    if fc & 0x08:            # Server→Client = 在回答我们的命令
         return
     ftype = fc & 0x03        # 0 = allgemein, 1 = clusterspezifisch
     cl   = int(str(msg.get("cl") or "0"), 0)
@@ -2733,17 +2664,16 @@ def _ha_aps_action(msg):
                   f" – Gruppe 0x{grp:04x}, Szene {sid}"
                   + (f", Herstellercode 0x{mfr:04x}" if mfr is not None else ""))
     if not act:
-        # Von einem Endpunkt, der als Sender gilt, sind Tastendrücke zu
-        # erwarten. Was wir nicht zuordnen können, wird EINMAL protokolliert –
-        # sonst ist die nächste Fehlermeldung wieder blind.
+        # 被判为发送方的端点，本来就该有按键。认不出来的消息**只**记一次日志 ——
+        # 否则下一条报错又变成瞎子。
         if _ep_key(addr, sep) in _ctrl or _ha_db_hint(addr)[0] == "panel":
             key = (cl, ftype, cmd)
             if key not in _aps_unbekannt:
                 _aps_unbekannt.add(key)
-                print(f"[HA] {addr} ep{sep}: unerkannte Tasten-Nachricht "
+                print(f"[HA] {addr} ep{sep}：无法识别的按键消息 "
                       f"cl=0x{cl:04x} type={ftype} cmd=0x{cmd:02x} "
                       f"mfr={'0x%04x' % mfr if mfr is not None else '-'} "
-                      f"hex={hx} – wird nicht ausgewertet")
+                      f"hex={hx} —— 不解析")
         return
     topic = f"{BASE}/zigbee/{addr}/{_ha_event_sub(sep)}"
     mq_put(topic, _action_payload(act), retain=False, qos=1)
@@ -3575,19 +3505,18 @@ def dispatch(line: str):
             _state["status"] = "online"
             fw = dict(_state.get("fw_ota") or {})
         print("[C6] boot")
-        # Sendeleistung ist in der Firmware NICHT persistent (kein NVS) –
-        # nach jedem C6-Boot den gemerkten Wunschwert erneut setzen.
+        # 发射功率在固件里**不**持久化（没写 NVS）——
+        # 每次 C6 启动后都要把记住的期望值重设一遍。
         _txp_reapply()
-        # ★ Ist der C6 mitten im Firmware-Transfer neu gestartet, ist die
-        # OTA-Session weg – die restlichen Frames würden stumm verpuffen
-        # (genau das passierte: Transfer stand bei 30720/656560). Also von
-        # vorne, aber höchstens 3-mal.
+        # ★ C6 若在固件传输途中重启，OTA 会话就没了 —— 剩下的帧会悄无声息
+        # 地蒸发（当时正是这样：传输停在 30720/656560）。所以从头发一遍，
+        # 但最多 3 次。
         if (fw.get("status") == "transferring"
                 and fw.get("bin_path")
                 and (fw.get("off") or 0) < (fw.get("size") or 0)
                 and _fw_ota_restarts < 3):
             _fw_ota_restarts += 1
-            print(f"[OTA] C6-Neustart mitten im Transfer – starte neu "
+            print(f"[OTA] 传输中途 C6 重启了 —— 重新开始 "
                   f"({_fw_ota_restarts}/3): {fw['bin_path']}")
             threading.Timer(4.0, _fw_ota_start, (fw["bin_path"],)).start()
 
@@ -3601,26 +3530,26 @@ def dispatch(line: str):
         sub  = msg.get("sub", "raw")
         p    = msg.get("p")
         if p is not None:
-            _ha_state(addr, sub, p)          # retained – überlebt HA-Neustart
+            _ha_state(addr, sub, p)          # retained —— 熬得过 HA 重启
             print(f"[MQTT] {BASE}/zigbee/{addr}/{sub} {p}")
-            # War dieser Wert von uns angefordert? Das muss VOR _pending_ack
-            # festgestellt werden – danach ist der Eintrag aufgeräumt.
+            # 这个值是我们自己要来的吗？必须在 _pending_ack **之前**判断 ——
+            # 之后那条记录就已经清掉了。
             _erwartet = False
             if sub.endswith("on_off"):
                 _e = _sub_ep(sub)
                 _erwartet = _e is not None and (addr, _e) in _pending
-            # Ein echter Gerätewert beendet eine offene Befehls-Bestätigung
-            # bzw. löst eine Wiederholung aus (siehe _pending_ack).
+            # 真实的设备值会结束一次待确认的命令，
+            # 或者触发一次重发（见 _pending_ack）。
             _pending_ack(addr, sub, p)
-            # Tastendruck aus dem Report ableiten (Panels melden on/off,
-            # keine Scene – siehe _ha_button_from_report).
+            # 从 Report 里推导按键（面板报的是 on/off，不是 Scene ——
+            # 见 _ha_button_from_report）。
             _ha_button_from_report(addr, sub, p, _erwartet)
             ieee = msg.get("ieee", "")
             if ieee:
                 _ha_learn_ieee(addr, ieee)
-            # Basic-Read (Hersteller/Modell) → Device-Info für die Discovery.
-            # Danach Cache verwerfen, damit Entities mit echtem Modellnamen
-            # neu angemeldet werden (vorher hießen sie noch "Zigbee 0x…").
+            # Basic-Read（厂商/型号）→ 给 discovery 用的设备信息。
+            # 之后要丢弃缓存，让实体带着真实型号重新登记
+            # （之前它们还叫 "Zigbee 0x…"）。
             if sub == "basic":
                 d = _ha_devices.setdefault(addr, {})
                 if p.get("mfr"):   d["mfr"]   = p["mfr"]
@@ -3628,16 +3557,16 @@ def dispatch(line: str):
                 hit = _ha_db.get((p.get("model") or "").strip())
                 if hit:
                     d["db"] = hit
-                    print(f"[HA] Modell erkannt: {p.get('model')} → {hit['model']} "
+                    print(f"[HA] 识别到型号：{p.get('model')} → {hit['model']} "
                           f"({hit['vendor']}) eps={hit.get('endpoints')}")
                 else:
-                    print(f"[HA] Modell unbekannt: {p.get('model')} – generische Discovery")
+                    print(f"[HA] 型号未知：{p.get('model')} —— 用通用 Discovery")
                 _knd, _why = _ha_db_hint(addr)
                 if _knd == "panel":
-                    print(f"[HA] {addr}: Hinweis {_why} → Tastenpanel vermutet "
-                          f"(entschieden wird über Descriptor/Probe)")
+                    print(f"[HA] {addr}：线索 {_why} ⇒ 猜测是按键面板 "
+                          f"（最终由 Descriptor/Probe 决定）")
                 elif _knd == "maybe":
-                    print(f"[HA] {addr}: Hinweis {_why} – mehrdeutig, "
+                    print(f"[HA] {addr}：线索 {_why} —— 有歧义，"
                           f"entscheidet Descriptor/Probe")
                 elif _knd is None and _why:
                     print(f"[HA] {addr}: {_why}")
@@ -3648,7 +3577,7 @@ def dispatch(line: str):
             db_upsert_zigbee_device(addr, ieee)
             db_insert_zigbee_data(addr, sub, p)
             with _state_lock:
-                # Alten Eintrag mit gleicher IEEE entfernen (Adresse nach Rejoin geändert)
+                # 删掉 IEEE 相同的旧条目（rejoin 后地址变了）
                 if ieee:
                     old = [a for a, d in _state["devices"].items()
                            if d.get("ieee") == ieee and a != addr]
@@ -3658,7 +3587,7 @@ def dispatch(line: str):
                     "ieee": ieee, "name": addr, "last_seen": "", "clusters": {}
                 })
                 dev["ieee"] = ieee
-                # Temperatur-Cluster: 0x8000 ist Ungültig → raw:null
+                # 温度簇：0x8000 表示无效 → raw:null
                 if sub == "temperature" and isinstance(p, dict) and p.get("raw") == -32768:
                     p = dict(p); p["raw"] = None
                 dev["clusters"][sub] = {"payload": p, "ts": _now()}
@@ -3728,9 +3657,9 @@ def dispatch(line: str):
     elif t == "interview":
         # Join-Interview: Active-EP → Simple-Desc → Bind → Configure-Reporting
         act = msg.get("act")
-        # Der C6 schickt die Adresse im interview-Objekt als String ("0x07da"),
-        # im zigbee-Objekt als Zahl. Hier auf dieselbe Schreibweise bringen,
-        # sonst passt der Schlüssel in _ctrl/_noread nicht.
+        # C6 在 interview 对象里把地址当字符串发（"0x07da"），
+        # 在 zigbee 对象里当数字发。这里统一成同一种写法，
+        # 否则 _ctrl/_noread 里的键对不上。
         _raw = msg.get("addr")
         try:
             a = "0x{:04x}".format(int(_raw, 0) if isinstance(_raw, str) else int(_raw))
@@ -3740,9 +3669,8 @@ def dispatch(line: str):
             print(f"[IV] {act} addr={a} ep={msg.get('ep')} "
                   f"cluster={msg.get('cluster')} status={msg.get('status')}")
         elif msg.get("in") is not None or msg.get("out") is not None:
-            # Simple-Descriptor: die Cluster-Listen sind die eindeutige
-            # Auskunft darüber, ob ein Endpunkt schalten kann oder nur
-            # Befehle sendet (siehe _classify_from_desc).
+            # Simple-Descriptor：簇列表是关于"这个端点能开关、还是只能发
+            # 命令"最权威的答案（见 _classify_from_desc）。
             print(f"[IV] desc addr={a} ep={msg.get('ep')} "
                   f"device={msg.get('device')} in={msg.get('in')} out={msg.get('out')}")
             try:
@@ -3752,17 +3680,17 @@ def dispatch(line: str):
                                     [int(x, 0) for x in (msg.get("out") or [])],
                                     int(_dev, 0) if isinstance(_dev, str) else int(_dev))
             except (TypeError, ValueError) as e:
-                print(f"[IV] desc nicht auswertbar: {e}")
+                print(f"[IV] desc 解析不了：{e}")
         else:
             print(f"[IV] {msg.get('state')} addr={a} "
                   f"eps={msg.get('eps')} status={msg.get('status')}")
             if msg.get("state") == "done":
                 # Ein Read-Attributes je Endpunkt entscheidet automatisch,
-                # ob dort ein Zustand existiert (siehe _probe_*).
+                # 那里有没有状态存在（见 _probe_*）。
                 _probe_start(a, msg.get("eps") or [])
 
     elif t == "aps":
-        # Roher APS-Frame: enthält Tastendrücke (siehe _ha_aps_action).
+        # 原始 APS 帧：里面含按键（见 _ha_aps_action）。
         # 能收到它的帧 = 这台设备刚刚真的发了东西，判活最硬的证据。
         _src = msg.get("src")
         if _src:
@@ -3783,9 +3711,9 @@ def dispatch(line: str):
         _ha_aps_action(msg)
 
     elif t == "txpower":
-        # Antwort auf set_tx_power: Wunschwert und von der PA zurückgelesener
-        # Istwert. Weichen sie ab, hat die Änderung nicht gegriffen – dann ist
-        # jede Messung mit diesem Wert wertlos (siehe §21 im Bericht).
+        # set_tx_power 的回执：期望值，以及 PA 回读到的实际值。两者不一致
+        # 就说明改动没生效 —— 那么用这个功率做的任何测量都没意义
+        # （见报告 §21）。
         want = msg.get("want")
         eff  = msg.get("eff")
         with _state_lock:
@@ -3793,24 +3721,22 @@ def dispatch(line: str):
         mq_put(f"{BASE}/tx_power", line, retain=True, qos=1)
         abw = ""
         if want is not None and eff is not None and want != eff:
-            abw = f"   (!) Wunsch {want} dBm, wirksam {eff} dBm – Anpassung griff nicht"
+            abw = f"   (!) 设定 {want} dBm，实际 {eff} dBm —— 调整没生效"
         print(f"[TX] Sendeleistung: Wunsch {want} dBm, wirksam {eff} dBm{abw}")
 
     elif t == "dev_removed":
-        # Antwort auf unser "dev_remove": der C6 hat den Eintrag aus seiner
-        # Tabelle + NVS genommen. Falls hier noch Reste liegen (z. B. weil
-        # das Löschen von woanders angestoßen wurde), jetzt nachziehen.
+        # 我们那条 "dev_remove" 的回执：C6 已经把它从表里 + NVS 里删了。
+        # 如果这里还有残留（比如是从别处触发删除的），现在补上。
         a = msg.get("addr")
         noch_da = a and (a in (_state.get("devices") or {}) or a in _addr_nodes)
-        print(f"[C6] Gerät {a} entfernt (IEEE {msg.get('ieee')}, "
-              f"in Tabelle: {msg.get('found')}, Leave: {msg.get('leave')})")
+        print(f"[C6] 已删除设备 {a}（IEEE {msg.get('ieee')}，"
+              f"表内：{msg.get('found')}，Leave：{msg.get('leave')}）")
         if noch_da:
-            _device_remove(a, "vom Koordinator entfernt", tell_c6=False)
+            _device_remove(a, "由协调器删除", tell_c6=False)
 
     elif t == "lqi":
-        # Momentaufnahme auf Anfrage (statt bis zum 60-s-Heartbeat zu warten).
-        # Wird für den Sendeleistungs-Vergleich gebraucht: gleiche Stelle,
-        # gleiches Gerät, nur die Leistung anders.
+        # 按需取快照（不必等到 60 s 心跳）。
+        # 发射功率对比要用它：同一个位置、同一台设备，只有功率不同。
         devs = msg.get("dev") or []
         with _state_lock:
             for d in devs:
@@ -3831,16 +3757,16 @@ def dispatch(line: str):
             print("[LQI] " + " ".join(
                 f"{d.get('addr')}={d.get('lqi')}/{d.get('rssi')}dBm" for d in devs))
         else:
-            print("[LQI] keine Geräte bekannt")
+            print("[LQI] 还没有已知设备")
 
     elif t == "keepalive":
-        # Keep-Alive-Test: periodische Read-Attribute nach Autorisierung
+        # Keep-Alive 测试：授权之后周期性发 Read-Attributes
         print(f"[KA] addr={msg.get('addr')} ep={msg.get('ep')} "
               f"round={msg.get('round')}")
 
     elif t == "node_desc":
-        # Antwort auf ZDO Node-Descriptor (0x0002). Entscheidet, ob das Gerät
-        # als Router (ZR) Fremdverkehr weiterleiten kann oder nur End Device ist.
+        # ZDO Node-Descriptor（0x0002）的回执。决定这台设备能不能作为
+        # 路由器（ZR）转发别人的流量，还是只是终端设备。
         # ★ 顺便当"活体探测"：拓扑轮询每 60 s 对每台设备发一次，答了就是活着，
         #   回错误（0x85 超时等）就是掉线的**反证** —— 见 _avail_* 记分板。
         a = msg.get("addr", "?")
@@ -3850,7 +3776,7 @@ def dispatch(line: str):
         if str(a).lower() in ("0xffff", "0xfffe", "0xfffd", "0xfffc", "?"):
             return
         if msg.get("error"):
-            print(f"[ND] {a}: Abfrage fehlgeschlagen ({msg.get('error')})")
+            print(f"[ND] {a}：查询失败（{msg.get('error')}）")
             _avail_last_bad[a] = time.time()
         else:
             print(f"[ND] {a}: role={msg.get('role')} power={msg.get('power')} "
@@ -3866,7 +3792,7 @@ def dispatch(line: str):
         st = msg.get("st")
         if st == "begin":
             print(f"[OTA] coordinator: begin – Part {msg.get('part','?')}, "
-                  f"size={msg.get('size','?')} – übertrage …")
+                  f"size={msg.get('size','?')} —— 传输中 …")
             _fw_ota_send_batch()
         elif st == "write":
             with _state_lock:
@@ -3874,15 +3800,15 @@ def dispatch(line: str):
             if _fw_ota_off < _fw_ota_size:
                 _fw_ota_send_batch()
         elif st == "done":
-            # written = was der C6 tatsächlich in die Partition geschrieben hat.
-            # Weicht es von der Dateigröße ab, ist beim Upload/Framing etwas
-            # danebengegangen (z. B. +44 B Schwanz). Nicht kritisch, solange
-            # esp_ota_end zustimmt – aber es soll sichtbar sein, nicht stumm.
+            # written = C6 实际写进分区的字节数。
+            # 和文件大小不一致，说明上传/分帧环节出了岔子
+            # （例如尾部多 44 B）。只要 esp_ota_end 认了就不致命，
+            # 但必须看得见，不能静默。
             written = msg.get("written")
             if isinstance(written, int) and written != _fw_ota_size:
-                print(f"[OTA] WARNUNG: geschrieben {written} B, Datei {_fw_ota_size} B "
+                print(f"[OTA] 警告：已写 {written} B，文件 {_fw_ota_size} B "
                       f"(Differenz {written - _fw_ota_size:+d} B)")
-            print("[OTA] coordinator: Update fertig – Neustart …")
+            print("[OTA] 协调器：更新完成 —— 重启中 …")
             with _state_lock:
                 _state["fw_ota"]["status"] = "done"
             _fw_ota_close()
@@ -3890,9 +3816,9 @@ def dispatch(line: str):
             why = msg.get("why")
             print(f"[OTA] coordinator FEHLER: {why}")
             if why == "busy":
-                print("[OTA] Ein abgebrochener Transfer steckt noch im C6 "
-                      "(s_active=true). Der C6 muss neu gestartet werden, "
-                      "bevor ein neuer Versuch möglich ist.")
+                print("[OTA] C6 里还卡着一个中断的传输 "
+                      "（s_active=true）。必须重启 C6，"
+                      "才能再试一次。")
             with _state_lock:
                 _state["fw_ota"]["status"] = "error"
             _fw_ota_close()
@@ -3955,19 +3881,18 @@ def dispatch(line: str):
 
 
 def _ota_start(bin_path: str, image_type: int = 0x0001):
-    """Startet OTA: öffnet Binary, sendet ota_start an Coordinator.
+    """启动 OTA：打开镜像文件，向协调器发 ota_start。
 
-    image_type 决定这份 Image für welche Geräteklasse gilt:
-        0x0001 = Endgerät (client/)      0x0002 = Repeater (router/)
-    Der Coordinator schickt den Typ im Image-Notify mit; nur Clients mit
-    demselben Typ antworten überhaupt. Falscher Typ = niemand antwortet
-    (kein Schaden, aber auch kein Update).
+    image_type 决定这份镜像适用于哪类设备：
+        0x0001 = 终端设备（client/）   0x0002 = 中继（router/）
+    协调器在 Image-Notify 里带上这个类型；只有同类型的客户端才会应答。
+    类型错了 = 没人应（不出事，但也不会有更新）。
     """
     global _ota_file
     import os as _os
     if not bin_path:
         if image_type == 0x0002:
-            print("[OTA] Repeater-Image ohne Pfad – Upload nötig")
+            print("[OTA] 中继镜像没有路径 —— 需要先上传")
             with _state_lock:
                 _state["ota"]["status"] = "error"
             return
@@ -3976,30 +3901,30 @@ def _ota_start(bin_path: str, image_type: int = 0x0001):
             "client", "build", "zigbee-client.bin"
         )
     if not _os.path.isfile(bin_path):
-        print(f"[OTA] Datei nicht gefunden: {bin_path}")
+        print(f"[OTA] 找不到文件：{bin_path}")
         with _state_lock:
             _state["ota"]["status"] = "error"
         return
     size = _os.path.getsize(bin_path)
-    # ★ Plausibilitätsprüfung: ein ESP-App-Image beginnt mit dem Magic-Byte 0xE9.
-    #   Fehlt es, ist die Datei verstümmelt (klassiker: multipart-Header im Image)
-    #   oder es ist ein .zip/.ota-Wrapper. Dann lieber laut abbrechen, statt
-    #   20 Minuten lang Blöcke zu schicken, die das Gerät am Ende verwirft.
+    # ★ 合理性检查：ESP App 镜像开头是魔术字节 0xE9。
+    #   没有它就说明文件被弄坏了（典型：镜像前面混进了 multipart 头），
+    #   或者这是 .zip/.ota 包装。这种情况宁可大声失败，也别花 20 分钟
+    #   发一堆设备最后照样丢弃的块。
     try:
         with open(bin_path, "rb") as _mf:
             _magic = _mf.read(1)
         if _magic != b"\xE9":
-            print(f"[OTA] ABBRUCH: {bin_path} beginnt mit 0x{_magic.hex() or '??'}, "
-                  f"erwartet 0xe9 (kein ESP-App-Image).")
+            print(f"[OTA] 中止：{bin_path} 开头是 0x{_magic.hex() or '??'}，"
+                  f"应为 0xe9（这不是 ESP 应用镜像）。")
             with _state_lock:
                 _state["ota"]["status"] = "error"
             return
     except OSError as _e:
-        print(f"[OTA] ABBRUCH: {bin_path} nicht lesbar ({_e})")
+        print(f"[OTA] 中止：{bin_path} 读不出来（{_e}）")
         with _state_lock:
             _state["ota"]["status"] = "error"
         return
-    # Versionsnummer aus Datei-Mtime ableiten (Unix-Timestamp, 32-bit)
+    # 版本号由文件 mtime 推出（Unix 时间戳，32 位）
     version = int(_os.path.getmtime(bin_path)) & 0xFFFFFFFF
     _ota_close()
     _ota_file = open(bin_path, "rb")
@@ -4020,12 +3945,12 @@ def _ota_start(bin_path: str, image_type: int = 0x0001):
         })
     ser.write(_j({"cmd": "ota_start", "size": size, "ver": version,
                   "type": image_type}))
-    print(f"[OTA] gestartet: {bin_path} size={size} ver=0x{version:08x} "
+    print(f"[OTA] 已开始：{bin_path} size={size} ver=0x{version:08x} "
           f"type=0x{image_type:04x}")
 
 
 def _ota_handle_req(offset: int, size: int):
-    """Antwortet auf ota_req: liest Chunk aus Binärdatei und sendet hex-kodiert。
+    """回答 ota_req：从镜像文件里读一块，转成 hex 发出去。
 
     ★ 判「有没有在传」只看 _ota_file（打开着就说明 _ota_start 成功过）。
       旧实现白名单只写了 pending/transferring，而网关在 ota_start 之后会先
@@ -4058,7 +3983,7 @@ def _ota_handle_req(offset: int, size: int):
             _state["ota"]["sent"] = _ota_sent
             _state["ota"]["sent_hash"] = "0x%08x" % _ota_hash
     except Exception as e:
-        print(f"[OTA] Fehler beim Lesen: {e}")
+        print(f"[OTA] 读取出错：{e}")
         _ota_close()
         with _state_lock:
             _state["ota"]["status"] = "error"
@@ -4314,7 +4239,7 @@ def _html():
     <button type="submit">按路径升级</button>
   </form>
   <p style="font-size:.85em;color:#888">状态: {s['fw_ota']['status']}
-     &nbsp;|&nbsp; {s['fw_ota']['off']} / {s['fw_ota']['size']} Bytes</p>
+     &nbsp;|&nbsp; {s['fw_ota']['off']} / {s['fw_ota']['size']} 字节</p>
 
   <h3>应急：esptool 直刷（应用层 OTA 卡死时用）</h3>
   <p style="font-size:.85em;color:#ffcc66">绕过应用层 OTA，直接用 Bootloader 通过 USB
@@ -4352,7 +4277,7 @@ def _html():
 
 
 def _device_html(addr):
-    """Detail-Seite für ein einzelnes Zigbee-Gerät."""
+    """单个 Zigbee 设备的详情页。"""
     with _state_lock:
         s = json.loads(json.dumps(_state))
     dev = s["devices"].get(addr)
@@ -4403,12 +4328,12 @@ def _device_html(addr):
                       '<span style="color:#888">（ZDO 探测失败或长时间没有证据，'
                       'HA 里对应实体会变灰）</span>')
 
-    # Node-Descriptor-Ergebnis (Router oder End Device?) – nur wenn schon abgefragt
+    # Node-Descriptor 结果（路由器还是终端设备？）—— 只在查过之后才有
     nd = (_state.get("node_desc") or {}).get(addr)
     if nd and nd.get("role"):
-        role_txt = ("<b style='color:#6f6'>Router (ZR) – leitet Fremdverkehr weiter</b>"
+        role_txt = ("<b style='color:#6f6'>路由器（ZR）—— 会转发他人流量</b>"
                     if nd["role"] == "router" else
-                    "<b style='color:#f90'>End Device (ZED) – leitet NICHT weiter</b>")
+                    "<b style='color:#f90'>终端设备（ZED）—— 不转发</b>")
         role_html = (f'{role_txt}<br><span style="color:#888">cap={nd.get("cap")} · '
                      f'{nd.get("power")} · rx_idle={nd.get("rx_idle")}</span>')
     elif nd and nd.get("error"):
@@ -4590,7 +4515,7 @@ def _device_html(addr):
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass   # kein Access-Log im stdout
+        pass   # stdout 里不要访问日志
 
     def _send(self, code, ctype, body):
         data = body.encode() if isinstance(body, str) else body
@@ -4629,25 +4554,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        # ★ Content-Type NICHT für die Multipart-Auswertung klein schreiben:
-        #   der boundary-Parameter ist **case-sensitive**. Chrome und curl
-        #   schicken gemischte Namen (----WebKitFormBoundary…, ----2YSIdO…).
-        #   Mit .lower() findet body.split(boundary) nichts, der ganze Body
-        #   gilt dann als EIN Part – Folge: image_type fällt auf 0x0001 zurück
-        #   und in die Datei landen ~218 Byte Part-Header VOR dem Image
-        #   (OTA scheitert dann an der Image-Prüfung).
+        # ★ 做 multipart 解析时**不能**把 Content-Type 转小写：
+        #   boundary 参数是**大小写敏感**的。Chrome 和 curl 发的名字都是
+        #   混合大小写（----WebKitFormBoundary…、----2YSIdO…）。
+        #   一旦 .lower()，body.split(boundary) 就切不开，整个 body 会被当成
+        #   一个 part —— 后果：image_type 落回 0x0001，而且文件开头多出
+        #   ~218 字节的 part 头（OTA 随后在镜像校验处失败）。
         raw_ctype = self.headers.get("Content-Type") or ""
         ctype  = raw_ctype.lower()
         raw    = self.rfile.read(length) if length else b""
-        # Datei-Upload (multipart) nicht durch parse_qs schicken – das würde
-        # die Binärdaten verstümmeln.
+        # 文件上传（multipart）不要走 parse_qs —— 那会把二进制数据弄坏。
         if ctype.startswith("multipart/form-data"):
             params = {}
         else:
             params = parse_qs(raw.decode("utf-8", errors="replace"))
-        # Query-String zusätzlich übernehmen: parse_qs(raw) liest nur den Body,
-        # dadurch fiel /api/device/x/tx_power?dbm=20 stillschweigend auf den
-        # Default (8 dBm) zurück – ohne Fehlermeldung.
+        # 顺便把 query string 也收进来：parse_qs(raw) 只读 body，
+        # 于是 /api/device/x/tx_power?dbm=20 悄悄落回了默认值（8 dBm），
+        # 而且没有任何报错。
         for _k, _v in parse_qs(urlparse(self.path).query).items():
             params.setdefault(_k, _v)
         path   = urlparse(self.path).path
@@ -4679,14 +4602,14 @@ class _Handler(BaseHTTPRequestHandler):
                 ser.write(uart_msg.encode())
                 print(f"[→C6] switch2wifi → {addr}")
             elif cmd == "node_desc":
-                # ZDO 0x0002: MAC-Capability verrät, ob das Gerät als Router
-                # arbeitet (bit1) und am Netz hängt (bit2).
+                # ZDO 0x0002：MAC 能力位能看出设备是否作为路由器工作
+                # （bit1）、是否接着市电（bit2）。
                 uart_msg = _js({"cmd": "node_desc", "addr": addr})
                 ser.write(uart_msg.encode())
                 print(f"[→C6] {uart_msg.strip()}")
-            # (Das frühere "leave" war ein Blindgänger: die Firmware kannte
-            #  den Befehl nie. Ersetzt durch den eigenen dev_remove-Pfad,
-            #  siehe /api/device/<addr>/delete.)
+            # （早先那个 "leave" 是空包弹：固件从来没实现过这个命令。
+            #  已换成自己的 dev_remove 路径，
+            #  见 /api/device/<addr>/delete。）
             self.send_response(302)
             self.send_header("Location", f"/device/{addr}")
             self.end_headers()
@@ -4712,7 +4635,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/device/") and path.endswith("/delete"):
             addr = path[len("/api/device/"):-len("/delete")]
-            _device_remove(addr, "im Web-UI entfernt")
+            _device_remove(addr, "在网页上删除")
             try:
                 with _db_lock:
                     cx = _db_connect()
@@ -4737,7 +4660,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/tx_power":
             dbm = params.get("dbm", [""])[0].strip()
             mq_put(f"{BASE}/cmd/set_tx_power", dbm, qos=1)
-            print(f"[Web] set_tx_power {dbm} dBm (Rücklesewert folgt)")
+            print(f"[Web] set_tx_power {dbm} dBm（回读值稍后给出）")
 
         elif path == "/api/lqi":
             mq_put(f"{BASE}/cmd/lqi", "", qos=1)
@@ -4749,15 +4672,15 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 bin_path = params.get("path", [""])[0].strip()
             if bin_path:
-                # Manueller Start setzt das automatische Neustart-Budget zurück
+                # 手动启动会把自动重启的次数预算清零
                 globals()["_fw_ota_restarts"] = 0
                 _fw_ota_start(bin_path)
             else:
-                print("[OTA] kein Firmware-Pfad / Upload leer – abgebrochen")
+                print("[OTA] 没有固件路径 / 上传为空 —— 已中止")
 
         elif path == "/api/fw_flash":
-            # Notfall-Weg über den Bootloader (esptool), unabhängig davon,
-            # ob die laufende Firmware fw_ota_data versteht.
+            # 走 bootloader（esptool）的应急通道，不管当前固件
+            # 认不认 fw_ota_data。
             if ctype.startswith("multipart/form-data"):
                 bin_path = _save_upload(raw_ctype, raw) or ""
             else:
@@ -4768,7 +4691,7 @@ class _Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=flash_apply, args=(bin_path,),
                                  daemon=True).start()
             else:
-                print("[FLASH] kein Firmware-Pfad / Upload leer – abgebrochen")
+                print("[FLASH] 没有固件路径 / 上传为空 —— 已中止")
 
         elif path == "/api/ota/stop":
             # ★ 中止 OTA：否则一次误点会白占一个多小时的无线带宽（~110 B/s）。
@@ -4800,7 +4723,7 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 image_type = _ota_image_type(params.get("type", [None])[0])
                 bin_path = params.get("path", [""])[0].strip()
-            print(f"[OTA] /api/ota type=0x{image_type:04x} path={bin_path or '(leer)'}")
+            print(f"[OTA] /api/ota type=0x{image_type:04x} path={bin_path or '(空)'}")
             _ota_start(bin_path, image_type)
 
         self.send_response(303)
@@ -4819,14 +4742,14 @@ def _run_web():
 # ── Start ───────────────────────────────────────────────────────────────────
 db_init()
 
-print(f"[Serial] öffne {args.port} @ {args.baud} …")
+print(f"[Serial] 正在打开 {args.port} @ {args.baud} …")
 # ★ 开机打不开端口时**不要**直接抛异常退出：那会被 Supervisor 判定成
 #   "启动失败" 反复重启（2026-10-26 重建后就是这样）。先用占位串口把
 #   Web UI / MQTT 拉起来，主循环的看门狗会自己重连。
 ser = _serial_open(args.port, args.baud)
 
-# Persistente Knoten-Zuordnung laden – noch VOR dem ersten Discovery-Publish,
-# sonst entstehen nach einem Neustart neue Node-IDs und damit neue Entities.
+# 加载持久化的节点归属 —— 必须在第一次 discovery 发布**之前**，
+# 否则重启后会生成新的 Node-ID，也就生成了新实体。
 _nodes_load()
 _txp_load()
 
@@ -4857,7 +4780,7 @@ else:
 _txp_reapply(8.0)
 
 # ── Hauptschleife ───────────────────────────────────────────────────────────
-print("[Bridge] läuft – Ctrl+C zum Beenden")
+print("[Bridge] 运行中 —— Ctrl+C 退出")
 buf = b""
 read_err  = 0        # 连续读失败次数（成功一次就归零）
 err_since = 0.0      # 第一连败的时刻，用来限速日志
@@ -4865,8 +4788,8 @@ last_rx   = time.time()   # 最后一次收到任意字节的时刻（判断"端
 last_kick = 0.0      # 上一次强制复位的时刻（限速，别把 C6 反复复位）
 try:
     while True:
-        # Während eines esptool-Flashs ist der Port geschlossen bzw. vom
-        # Bootloader belegt – Leseschleife so lange anhalten.
+        # esptool 刷写期间端口是关着的、或被 bootloader 占着 ——
+        # 读取循环先停一会儿。
         if _serial_pause.is_set():
             time.sleep(0.2)
             continue

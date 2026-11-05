@@ -1,7 +1,7 @@
 """临时检查：串口掉线自愈（Errno 5 / EIO 后必须换 fd，不能原地重试）。
 
 复现的现象（2026-10-26 重建 add-on 后）：连续 100+ 行
-    [Serial] Lese-Fehler: [Errno 5] I/O error – versuche weiter
+    [Serial] 读取出错：[Errno 5] I/O error —— 继续尝试
 网关一台设备都收不到。旧代码只 sleep 0.5 再读同一个 fd，永远不好。
 """
 import sys, types, importlib.util

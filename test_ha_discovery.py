@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Test für die HA-MQTT-Auto-Discovery in host/addon/esp32c6_gateway/serial_gateway.py.
+"""host/addon/esp32c6_gateway/serial_gateway.py 里 HA-MQTT 自动 discovery 的测试。
 
-Die Datei hat keinen __main__-Guard (sie startet beim Import sofort Serial/MQTT),
-deshalb werden hier nur die Discovery-Funktionen per exec aus dem Quelltext
-gezogen und mit einem Fake-MQTT-Client getestet.
+那个文件没有 __main__ 保护（一 import 就立刻起串口/MQTT），
+所以这里只把 discovery 相关函数用 exec 从源码里抽出来，
+配一个假 MQTT 客户端来测。
 """
 import json
 import os
@@ -41,15 +41,15 @@ ns = {
     "HA_ENABLED": True,
     "mq": FakeMQ(),
     "_ha_db": json.load(open(DB_PATH, encoding="utf-8")),
-    # Ab 2026-10-17 laufen alle Publishes über mq_put(); Prüfungen und
-    # Buchführung sitzen dort. Für den Test genügt der Durchgriff.
+    # 从 2026-10-17 起所有 publish 都走 mq_put()；校验和
+    # 记账都在那儿。测试里直接穿透过去就够了。
     "mq_put": lambda t, p, retain=False, qos=1: None,
     "_ep_key": lambda a, e: "%s/%d" % (a, int(e)),
     "_ctrl": set(),
 }
 ns["mq_put"] = lambda t, p, retain=False, qos=1: ns["mq"].publish(t, p, retain=retain, qos=qos)
-# Der Befehlsblock (Wiederholung/Noread) braucht ein paar Nachbarn; für die
-# Discovery-Prüfungen genügen No-Op-Stubs.
+# 命令那段（重发/不可回读）需要几个邻居函数；对 discovery
+# 的检查来说，空实现就够了。
 ns["threading"] = threading
 ns["time"] = time
 ns["_nodes_save"] = lambda: None
@@ -59,14 +59,14 @@ ns["_noread"] = set()
 ns["_addr_nodes"] = {}
 ns["_ieee_nodes"] = {}
 exec(block("# ── HA Auto-Discovery", "# ── Dispatcher"), ns)
-exec(block("# ── Befehls-Bestätigung und Wiederholung", "def on_message("), ns)
-# _ha_handle_set schreibt kompaktes JSON über _js() → echte Implementierung laden
-# ("def _j(obj)" als Endmarker, weil "def _j" auch auf "def _js" passt)
+exec(block("# ── 命令确认与重发", "def on_message("), ns)
+# _ha_handle_set 用 _js() 写紧凑 JSON → 加载真正的实现
+# （以 "def _j(obj)" 作结束标记，因为 "def _j" 也会匹配上 "def _js"）
 exec(block("def _js", "def _j(obj)"), ns)
 
 mq = ns["mq"]
 
-# ser.write wird von _ha_handle_set benutzt → Fake-Serial
+# _ha_handle_set 会用到 ser.write → 假串口
 class FakeSer:
     def __init__(self):
         self.written = []
@@ -87,12 +87,12 @@ def check(cond, msg):
         fails.append(msg)
 
 
-print("== 1. 3-fach-Schalter (FB56, ep16/17/18) ==")
+print("== 1. 三键开关（FB56，ep16/17/18）==")
 for epn in ("ep16", "ep17", "ep18"):
     ns["_ha_publish"]("0x07da", f"{epn}/on_off", {"v": 1})
 
 cfgs = [t for t in mq.published if "/switch/" in t]
-check(len(cfgs) == 3, f"3 switch-Entities erzeugt (ist {len(cfgs)})")
+check(len(cfgs) == 3, f"生成了 3 个 switch 实体（实际 {len(cfgs)}）")
 
 c = mq.published["homeassistant/switch/c6_0x07da/ep16_on_off/config"]
 check(c["state_topic"] == "gw/coordinator/zigbee/0x07da/ep16/on_off",
@@ -135,9 +135,9 @@ b = mq.published["homeassistant/sensor/c6_0x1212/ep1_battery_pct/config"]
 check(b["device_class"] == "battery" and b["value_template"] == "{{ value_json.pct }}",
       "battery pct ok")
 check("homeassistant/sensor/c6_0x1212/ep1_battery_volt/config" not in mq.published,
-      "battery voltage wird ohne voltage_mv nicht angelegt")
+      "没有 voltage_mv 就不建 battery voltage")
 
-print("== 3. Modellname nach Basic-Read ==")
+print("== 3. Basic 读取之后的型号名 ==")
 ns["_ha_devices"]["0x07da"] = {"mfr": "Feibit", "model": "FB56+ZSW1IKJ2.5"}
 ns["_ha_forget"]("0x07da")
 ns["_ha_sent"].clear()
@@ -145,18 +145,18 @@ ns["_ha_publish"]("0x07da", "ep16/on_off", {"v": 0})
 c = mq.published["homeassistant/switch/c6_0x07da/ep16_on_off/config"]
 check(c["device"]["model"] == "FB56+ZSW1IKJ2.5", f"model: {c['device']['model']}")
 check(c["device"]["manufacturer"] == "Feibit", f"mfr: {c['device']['manufacturer']}")
-check(c["name"] == "EP16 开关", f"entity name: {c['name']}")  # ohne DB keine Endpunkt-Namen
+check(c["name"] == "EP16 开关", f"entity name: {c['name']}")  # 没有 DB 就没有端点名
 
-print("== 4. Idempotenz (kein Publish pro Telegramm) ==")
+print("== 4. 幂等（不是每条电文都发）==")
 before = len(mq.published)
 for _ in range(50):
     ns["_ha_publish"]("0x07da", "ep16/on_off", {"v": 1})
 check(len(mq.published) == before, "50 weitere Telegramme → 0 neue Configs")
 
-print("== 5. HA-Befehl → dev_cmd ==")
+print("== 5. HA 命令 → dev_cmd ==")
 ser.written.clear()
 ns["_ha_handle_set"]("gw/coordinator/set/0x07da/ep16/on_off", "0")
-check(len(ser.written) == 1, f"1 UART-Nachricht (ist {len(ser.written)})")
+check(len(ser.written) == 1, f"1 条 UART 消息（实际 {len(ser.written)}）")
 m = json.loads(ser.written[0])
 check(m == {"cmd": "dev_cmd", "addr": "0x07da", "ep": 16, "sw": "off"},
       f"payload: {ser.written[0].strip()}")
@@ -167,12 +167,12 @@ ns["_ha_handle_set"]("gw/coordinator/set/0x07da/ep18/on_off", "TOGGLE")
 m = json.loads(ser.written[-1])
 check(m["sw"] == "toggle", f"toggle: {ser.written[-1].strip()}")
 
-print("== 6. unbekannter sub wird ignoriert ==")
+print("== 6. 不认识的 sub 直接忽略 ==")
 before = len(mq.published)
 ns["_ha_publish"]("0x9999", "ep1/raw", {"cluster": "0xfc00"})
-check(len(mq.published) == before, "sub=raw → keine Entity")
+check(len(mq.published) == before, "sub=raw → 不建实体")
 
-print("== 7. Modell-Datenbank aus Z2M-Convertern ==")
+print("== 7. 从 Z2M 转换器生成的型号库 ==")
 db = ns["_ha_db"]
 check(len(db) > 3000, f"DB geladen: {len(db)} Modelle")
 e = db.get("FB56+ZSW1IKJ2.5")
@@ -190,31 +190,31 @@ ns["_ha_publish"]("0x07da", "ep17/on_off", {"v": 0})
 ns["_ha_publish"]("0x07da", "ep18/on_off", {"v": 1})
 names = sorted(c["name"] for c in mq.published.values())
 # sortiert nach Codepoint: 上(U+4E0A) < 下(U+4E0B) < 中(U+4E2D)
-# has_entity_name: HA stellt den Gerätenamen selbst voran – im Feld name
-# steht nur noch der unterscheidende Teil (Endpunkt + Rolle).
+# has_entity_name：HA 自己会把设备名加在前面 —— name 字段里
+# 只写区分设备的那部分（端点 + 角色）。
 check(names == ["上 开关", "下 开关", "中 开关"], f"Namen: {names}")
 c = mq.published["homeassistant/switch/c6_0x07da/ep17_on_off/config"]
 check(c["device"]["manufacturer"] == "Nue / 3A", f"Hersteller: {c['device']['manufacturer']}")
 
-print("== 9. Entities direkt beim Join (vor dem ersten Tastendruck) ==")
+print("== 9. 入网即建实体（不用等第一次按键）==")
 ns["_ha_sent"].clear()
 mq.published.clear()
 ns["_ha_prepublish"]("0x07da")
-check(len(mq.published) == 3, f"3 Entities sofort da (ist {len(mq.published)})")
+check(len(mq.published) == 3, f"3 个实体立刻就有（实际 {len(mq.published)}）")
 check(sorted(mq.published) == [
     "homeassistant/switch/c6_0x07da/ep16_on_off/config",
     "homeassistant/switch/c6_0x07da/ep17_on_off/config",
-    "homeassistant/switch/c6_0x07da/ep18_on_off/config"], "Topics der 3 Entities")
+    "homeassistant/switch/c6_0x07da/ep18_on_off/config"], "3 个实体的 topic")
 
-print("== 10. Unbekanntes Modell → keine Phantom-Entities ==")
+print("== 10. 未知型号 → 不造幽灵实体 ==")
 ns["_ha_devices"]["0xabcd"] = {"model": "IRGENDEIN-NEUS-GERAET"}
 ns["_ha_sent"].clear()
 mq.published.clear()
 ns["_ha_prepublish"]("0xabcd")
-check(len(mq.published) == 0, "unbekannt → 0 Entities (kein Raten)")
+check(len(mq.published) == 0, "未知 → 0 个实体（不瞎猜）")
 
 print("== 11. End-to-End mit echter Leitungsaufzeichnung ==")
-# So kam es real vom Koordinator (COM9, 2026-10-17 05:47)
+# 协调器实际发来的就是这一段（COM9，2026-10-17 05:47）
 real_lines = [
     '{"t":"aps","src":"0x07da","sep":16,"dep":1,"cl":"0x0000","sec":0,"len":44,'
     '"hex":"180101040000421046656962697420496e6320636f2e2020"}',
@@ -243,13 +243,13 @@ for ln in real_lines:
         ns["_ha_publish"](a, sub, p)
 
 sw = sorted(t for t in mq.published if "/switch/" in t)
-check(len(sw) == 3, f"3 Schalter aus echtem Modell erzeugt (ist {len(sw)})")
+check(len(sw) == 3, f"用真实型号生成了 3 个开关（实际 {len(sw)}）")
 for t in sw:
     c = mq.published[t]
     print(f"    {t.split('/')[-2]:14s} {c['name']:22s} state={c['state_topic']}")
     print(f"    {'':14s} cmd={c['command_topic']}")
 check(all(mq.published[t]["device"]["model"] == "HGZB-043" for t in sw),
-      "alle 3 als HGZB-043 erkannt")
+      "3 个都被认成 HGZB-043")
 check(mq.published[sw[0]]["name"] == "上 开关", "erster Schalter heißt 上")
 
 print()

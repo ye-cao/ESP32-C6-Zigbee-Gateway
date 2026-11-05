@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""live_check.py – Momentaufnahme des C6 nach dem OTA.
+"""live_check.py – OTA 之后给 C6 拍一张快照。
 
-Oeffnet COM9 einmal, wartet auf den Boot, dann auf einen Heartbeat mit
-nicht-leerer Geraeteliste (die Liste wird erst nach dem Wiederherstellen
-aus zb_storage gefuellt), und prueft danach:
+只打开 COM9 一次，等启动完成，再等一条设备表非空的心跳
+（设备表要从 zb_storage 恢复之后才会填上），然后检查：
 
-  1. probe ep16  -> basic-Cluster (mfr/model)  == Pairing intakt
-  2. dev_cmd toggle -> Default Response 0x00   == Kommandopfad ok
-  3. danach ein eingehendes Report Attributes  == repcfg-Fix wirkt
-     (0x0a im APS-Payload), d. h. das Geraet meldet den Zustand selbst.
+  1. probe ep16  -> basic 簇（厂商/型号）  == 配对完好
+  2. dev_cmd toggle -> Default Response 0x00   == 命令通路 OK
+  3. 之后来一条入向的 Report Attributes  == repcfg 修复生效
+     （APS 负载里有 0x0a），也就是设备自己上报状态。
 
-Aufruf:  python live_check.py [--port COM9] [--addr 0x07da]
+用法：  python live_check.py [--port COM9] [--addr 0x07da]
 """
 import argparse
 import json
@@ -100,8 +99,8 @@ def main():
         p = hb["p"]
         print(f"  heartbeat: uptime={p.get('uptime')}s ch={p.get('ch')} "
               f"pan={p.get('pan')} dev={p.get('dev')}")
-    chk(hb is not None, "Heartbeat mit nicht-leerer Geraeteliste",
-        "" if hb else "(Geraetetabelle nach Boot noch leer)")
+    chk(hb is not None, "心跳里的设备表非空",
+        "" if hb else "（启动后设备表还是空的）")
 
     # 1) Pairing
     L.send({"cmd": "probe", "addr": args.addr, "ep": args.ep})
@@ -109,7 +108,7 @@ def main():
     if basic:
         print(f"  basic: {basic.get('p')}")
     chk(basic is not None and bool(basic.get("p", {}).get("model")),
-        "probe ep{} liefert basic-Cluster".format(args.ep),
+        "probe ep{} 能取到 basic 簇".format(args.ep),
         (basic or {}).get("p", {}).get("model", ""))
 
     # 2) Steuerbefehl
@@ -120,16 +119,16 @@ def main():
     if dr:
         hx = dr.get("hex", "")
         # ZCL-Header = [frame-control][seq][command]  →  command 0x0B = Default
-        # Response, Payload = [command_id][status].  Status steht also auf
+        # Response 的负载 = [command_id][status]，status 就落在
         # Byte 4 (hex[8:10]), NICHT auf Byte 2.
         st = hx[8:10] if len(hx) >= 10 else "?"
         print(f"  Default Response: {hx}  (command_id=0x{hx[6:8]}, status=0x{st})")
     chk(dr is not None and len(dr.get("hex", "")) >= 10
         and dr.get("hex", "")[8:10] == "00",
         "dev_cmd toggle -> Default Response status 0x00",
-        dr.get("hex", "") if dr else "(keine Antwort)")
+        dr.get("hex", "") if dr else "（没有回应）")
 
-    # 3) Selbststaendige Meldung des Endgeraets (repcfg-Fix)
+    # 3) 终端设备自己上报（repcfg 修复）
     rep = L.wait(lambda m: m.get("t") == "aps" and "082e0a" in m.get("hex", ""), 12)
     onoff = L.wait(lambda m: m.get("t") == "zigbee"
                    and m.get("sub", "").endswith("/on_off"), 8)
@@ -138,7 +137,7 @@ def main():
     if onoff:
         print(f"  on_off-Report: sub={onoff.get('sub')} p={onoff.get('p')}")
     chk(rep is not None or onoff is not None,
-        "Endgeraet meldet Zustand selbst (Report Attributes / on_off)")
+        "终端设备自己上报状态（Report Attributes / on_off）")
 
     ser.close()
     print(f"\n=== {len(ok)} OK / {len(fail)} FAIL ===")

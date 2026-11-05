@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Packaging-Regressionstest für das HA-Add-on.
+"""HA add-on 打包的回归测试。
 
-Anlass: nach einem Windows-Edit hatte run.sh CRLF-Zeilenenden. Das Shebang
-lautete dann "#!/usr/bin/env bash\\r" und der Container starb beim Start mit
+起因：在 Windows 上编辑过之后 run.sh 变成了 CRLF 行尾。于是 shebang
+成了 "#!/usr/bin/env bash\\r" 容器一启动就挂掉：
 
     env: can't execute 'bash
     ': No such file or directory
 
-Der Fehler ist im Build nicht zu sehen – erst beim Start des Containers.
-Dieser Test fängt ihn vorher ab.
+这个错误在构建时看不出来 —— 只有容器启动才暴露。
+这个测试提前把它拦住。
 
-Geprüft wird:
-  1. keine CRLF und kein BOM in run.sh / *.py / *.json / Dockerfile
-  2. Shebang von run.sh ist exakt "#!/usr/bin/env bash"
-  3. run.sh ist syntaktisch gültig (bash -n)
-  4. config.json parst, und die Version stimmt mit GW_VERSION im Python überein
-  5. jede COPY-Zeile im Dockerfile zeigt auf eine existierende Datei
-  6. der Dockerfile-Guard gegen CRLF ist vorhanden
+检查内容：
+  1. run.sh / *.py / *.json / Dockerfile 里没有 CRLF、没有 BOM
+  2. run.sh 的 shebang 精确等于 "#!/usr/bin/env bash"
+  3. run.sh 语法合法（bash -n）
+  4. config.json 能解析，且版本与 Python 里的 GW_VERSION 一致
+  5. Dockerfile 里每条 COPY 都指向一个存在的文件
+  6. Dockerfile 里防 CRLF 的那道保险还在
 """
 import json
 import os
@@ -35,8 +35,8 @@ def check(cond, msg):
 
 
 def _find_git_bash():
-    """Git-Bash suchen. Das nackte "bash" ist unter Windows oft ein WSL-Shim,
-    der hier von der Sandbox blockiert wird – also gezielt suchen."""
+    """找 Git-Bash。Windows 上光写 "bash" 往往只是个 WSL 壳，
+    在这里会被沙箱挡住 —— 所以要定向去找。"""
     candidates = [
         Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe",
         Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "usr" / "bin" / "bash.exe",
@@ -51,12 +51,12 @@ def _find_git_bash():
 def main():
     ok = True
 
-    print("\n[1] Zeilenenden und BOM")
+    print("\n[1] 行尾和 BOM")
     for name in FILES:
         raw = (ADDON / name).read_bytes()
         cr = raw.count(b"\r")
         bom = raw.startswith(b"\xef\xbb\xbf")
-        ok &= check(cr == 0, f"{name}: kein CR (gefunden {cr})")
+        ok &= check(cr == 0, f"{name}：没有 CR（发现 {cr}）")
         ok &= check(not bom, f"{name}: kein UTF-8-BOM")
 
     print("\n[2] Shebang von run.sh")
@@ -67,16 +67,16 @@ def main():
     print("\n[3] run.sh Syntax")
     bash = _find_git_bash()
     if bash is None:
-        print("  SKIP  kein Git-Bash gefunden (prüfe manuell: bash -n run.sh)")
+        print("  SKIP  没找到 Git-Bash（请手工执行 bash -n run.sh）")
     else:
         try:
             r = subprocess.run([bash, "-n", str(ADDON / "run.sh")],
                                capture_output=True)
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
             ok &= check(r.returncode == 0,
-                        "bash -n ohne Fehler" + ("" if r.returncode == 0 else " → " + err))
+                        "bash -n 无报错" + ("" if r.returncode == 0 else " → " + err))
         except OSError as e:
-            print(f"  SKIP  bash nicht ausführbar ({e})")
+            print(f"  SKIP  bash 执行不了（{e}）")
 
     print("\n[4] Versionsgleichheit config.json ↔ serial_gateway.py")
     cfg = json.loads((ADDON / "config.json").read_text(encoding="utf-8"))
@@ -96,7 +96,7 @@ def main():
 
     print("\n[6] Dockerfile normalisiert CRLF")
     ok &= check("s/\\r$//" in docker, "sed 's/\\r$//' Guard vorhanden")
-    ok &= check("chmod a+x /run.sh" in docker, "run.sh wird ausführbar gemacht")
+    ok &= check("chmod a+x /run.sh" in docker, "run.sh 被设为可执行")
 
     print()
     print("全部通过" if ok else "存在失败项")

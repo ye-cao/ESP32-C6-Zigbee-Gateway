@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Test für den esptool-Notfall-Flash (Bootloader-Weg).
+"""esptool 应急刷写（bootloader 通道）的测试。
 
-Hintergrund: die laufende C6-Firmware versteht fw_ota_data nicht (fgets mit
-256-Byte-Puffer / starrer strstr), der App-Level-OTA bleibt nach dem ersten
-Stoß bei 1280 Bytes stehen. Ausweg: esptool schreibt das Image direkt in
-ota_0 – dafür muss die Leseschleife pausieren und der Port exklusiv sein.
+背景：当时跑着的 C6 固件不认 fw_ota_data（fgets 只有 256 字节缓冲 /
+strstr 写死的），应用层 OTA 在第一批之后就停在 1280 字节。绕法：
+让 esptool 把镜像直接写进 ota_0 —— 为此读取循环要暂停、端口要独占。
 
-Getestet wird ohne Hardware:
+不接硬件就能测：
   1. Kommandozeile: Chip, Port, Reset-Modus, Offset 0x20000, write_flash
-  2. flash_apply hält die Leseschleife an, schließt den Port, öffnet ihn wieder
-  3. Status geht idle → running → done (bzw. error bei rc != 0)
-  4. HTTP-Route /api/fw_flash existiert und startet einen Thread
-  5. Dockerfile pinnt esptool <5 (dort heißt das Kommando noch write_flash)
+  2. flash_apply 会停读取循环、关端口、再重新打开
+  3. 状态走 idle → running → done（rc != 0 时是 error）
+  4. HTTP 路由 /api/fw_flash 存在，并且会起一个线程
+  5. Dockerfile 把 esptool 钉在 <5（那个版本里命令还叫 write_flash）
 """
 import ast
 import sys
@@ -29,7 +28,7 @@ def check(cond, msg):
 
 
 class FakePopen:
-    """Ersetzt subprocess.Popen – liefert vorgegebene Zeilen und Returncode."""
+    """替换 subprocess.Popen —— 回放预设的行和返回码。"""
     last_cmd = None
     rc = 0
 
@@ -101,46 +100,46 @@ def main():
     print("\n[1] esptool-Kommandozeile")
     cmd = ns["_esptool_cmd"]("/data/fw_upload.bin")
     joined = " ".join(cmd)
-    ok &= check(cmd[1:3] == ["-m", "esptool"], "Aufruf über python -m esptool")
+    ok &= check(cmd[1:3] == ["-m", "esptool"], "通过 python -m esptool 调用")
     ok &= check("--chip esp32c6" in joined, "Chip esp32c6")
     ok &= check("--port /dev/serial/by-id/usb-Espressif_USB_JTAG_test-if00" in joined,
-                "Port wird durchgereicht")
-    ok &= check("--before default_reset" in joined, "Reset vor dem Flashen")
-    ok &= check("--after hard_reset" in joined, "Neustart nach dem Flashen")
+                "端口被透传下去")
+    ok &= check("--before default_reset" in joined, "刷写前先复位")
+    ok &= check("--after hard_reset" in joined, "刷写后重启")
     ok &= check("write_flash" in cmd, "Kommando write_flash (esptool 4.x)")
     ok &= check(cmd[-3:] == ["write_flash", "0x20000", "/data/fw_upload.bin"]
                 or ("0x20000" in cmd and cmd[-1] == "/data/fw_upload.bin"),
-                f"Offset 0x20000 + Datei (oea_0 laut boot-Log) → {cmd[-3:]}")
+                f"偏移 0x20000 + 文件（boot 日志说是 oea_0）→ {cmd[-3:]}")
 
-    print("\n[2] flash_apply: Pause, Port zu, Port wieder auf")
+    print("\n[2] flash_apply：暂停、关端口、再打开")
     old_ser = ns["ser"]
     FakePopen.rc = 0
     result = ns["flash_apply"]("/data/fw_upload.bin")
     ok &= check(result is True, "_flash_apply meldet Erfolg")
-    ok &= check(old_ser.closed, "alter Serial-Port wurde geschlossen")
-    ok &= check(len(ns["_created"]) >= 1, "CoordinatorSerial wurde neu geöffnet")
+    ok &= check(old_ser.closed, "旧的串口关掉了")
+    ok &= check(len(ns["_created"]) >= 1, "CoordinatorSerial 重新打开了")
     ok &= check(not ns["_serial_pause"].is_set(),
-                "Leseschleife läuft wieder (_serial_pause gelöscht)")
+                "读取循环恢复（_serial_pause 已清除）")
     ok &= check(ns["_flash_state"]["status"] == "done", "Status = done")
     ok &= check(len(ns["_flash_state"]["tail"]) >= 3,
                 f"Ausgabe mitgeschnitten ({len(ns['_flash_state']['tail'])} Zeilen)")
     ok &= check(FakePopen.last_cmd[-1] == "/data/fw_upload.bin",
-                "esptool bekam die richtige Datei")
+                "esptool 拿到的是对的文件")
 
     print("\n[3] Fehlerfall rc=1")
     FakePopen.rc = 1
     ok &= check(ns["flash_apply"]("/data/fw_upload.bin") is False, "Rückgabe False")
     ok &= check(ns["_flash_state"]["status"] == "error", "Status = error")
-    ok &= check(not ns["_serial_pause"].is_set(), "Leseschleife trotzdem wieder frei")
-    ok &= check(not ns["_flash_mutex"].locked(), "Mutex wieder freigegeben (kein Deadlock)")
+    ok &= check(not ns["_serial_pause"].is_set(), "不管怎样读取循环都放开了")
+    ok &= check(not ns["_flash_mutex"].locked(), "锁已释放（没有死锁）")
     FakePopen.rc = 0
 
-    print("\n[4] HTTP-Route und UI")
+    print("\n[4] HTTP 路由和界面")
     src = SRC.read_text(encoding="utf-8")
     ok &= check('path == "/api/fw_flash"' in src, "Route /api/fw_flash im do_POST")
     ok &= check('action="/api/fw_flash"' in src, "Formular im Dashboard vorhanden")
     ok &= check("threading.Thread(target=flash_apply" in src,
-                "Flash läuft im Hintergrund-Thread")
+                "刷写在后台线程里跑")
     ok &= check("_serial_pause.is_set()" in src, "Leseschleife beachtet die Pause")
 
     print("\n[5] Dockerfile")

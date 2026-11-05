@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""live_dump.py – jede Zeile vom C6 mit Zeitstempel, Befehle klar abgesetzt.
+"""live_dump.py – C6 的每一行都带时间戳，命令之间清楚分隔。
 
-Zweck: sauber zuordnen, welche APS-Antwort zu welchem Befehl gehoert
-(Default Response enthaelt Status + urspruengliche Command-ID).
+目的：干净地把"哪个 APS 应答属于哪条命令"对上号
+（Default Response 里带状态 + 原命令 ID）。
 """
 import argparse
 import json

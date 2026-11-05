@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""ha_addon_log.py – Add-on-Log des C6-Gateways über den Supervisor-Proxy lesen.
+"""ha_addon_log.py – 通过 Supervisor 代理读取 C6 网关的 add-on 日志。
 
-Warum nicht REST /api/hassio/...?  Der REST-Proxy antwortet einem
-Long-Lived-Token mit 401 (nur Session-Tokens werden durchgelassen).
-Der WebSocket-Befehl `supervisor/api` geht dagegen durch.
+为什么不用 REST /api/hassio/...？REST 代理对 Long-Lived Token 一律回 401
+（只放行 session token）。
+而 WebSocket 命令 `supervisor/api` 是能过的。
 
 Aufruf:
     python ha_addon_log.py list
@@ -83,7 +83,7 @@ async def main():
 
         if mode == "log":
             res = await ha.sup("/addons/%s/logs" % slug)
-            # Supervisor liefert {"content": "..."} – je nach Version str
+            # Supervisor 返回 {"content": "..."} —— 视版本不同可能是 str
             txt = res.get("content") if isinstance(res, dict) else None
             if txt is None:
                 print(json.dumps(res)[:800])
@@ -96,7 +96,7 @@ async def main():
             res = await ha.sup("/addons/%s/logs" % slug)
             base = (res.get("content") or "").splitlines()
             seen = len(base)
-            print("[follow] %s – Start bei Zeile %d, %d s" % (slug, seen, n),
+            print("[follow] %s —— 从第 %d 行开始，%d s" % (slug, seen, n),
                   file=sys.stderr, flush=True)
             t0 = time.time()
             while time.time() - t0 < n:

@@ -27,7 +27,7 @@ def main() -> int:
     bad = []
     for name, path in CHECKS:
         if not os.path.exists(path):
-            print(f"SKIP  {name}: {path} fehlt")
+            print(f"SKIP  {name}：{path} 不存在")
             bad.append(name)
             continue
         r = subprocess.run([sys.executable, path], cwd=ROOT,

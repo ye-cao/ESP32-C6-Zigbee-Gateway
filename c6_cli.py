@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""c6_cli.py – kleiner Serien-CLI fuer den ESP32-C6-Zigbee-Koordinator.
+"""c6_cli.py – 给 ESP32-C6 Zigbee 协调器用的小型串口命令行。
 
 Beispiele:
     python c6_cli.py listen --secs 10
     python c6_cli.py send '{"cmd":"permit_join","sec":180}' --watch 15
     python c6_cli.py send '{"cmd":"dev_cmd","addr":"0x07da","ep":16,"sw":"toggle"}' --watch 8
 
-Wichtig: Beim Oeffnen werden DTR/RTS auf False gesetzt, sonst kann der
-USB-Serial-JTAG des C6 einen Reset ausloesen.
+注意：打开端口时要把 DTR/RTS 置 False，否则 C6 的 USB-Serial-JTAG
+会触发一次复位。
 """
 import argparse
 import json
@@ -18,7 +18,7 @@ import time
 try:
     import serial
 except ImportError:
-    sys.exit("pyserial fehlt: pip install pyserial")
+    sys.exit("缺 pyserial：pip install pyserial")
 
 
 def open_port(port, baud):
@@ -59,7 +59,7 @@ def pump(ser, secs, tag="C6"):
             lines.append(txt)
     if buf.strip():
         txt = buf.decode("utf-8", errors="replace").strip()
-        print(f"[{tag}] {txt} (ohne Zeilenende)")
+        print(f"[{tag}] {txt}（不带换行）")
         lines.append(txt)
     return lines
 
@@ -77,7 +77,7 @@ def main():
     p_s.add_argument("payload")
     p_s.add_argument("--watch", type=float, default=8.0)
     p_s.add_argument("--pre", type=float, default=0.5,
-                     help="Sekunden Sammeln vor dem Senden")
+                     help="发送前先收集几秒")
 
     args = ap.parse_args()
     ser = open_port(args.port, args.baud)

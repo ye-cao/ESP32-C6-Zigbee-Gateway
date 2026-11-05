@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fragt das Basic-Cluster (Hersteller/Modell) eines bekannten Geräts ab.
+"""查询某台已知设备的 Basic 簇（厂商/型号）。
 
-Nützlich für Geräte, die schon im Netz sind, aber nichts von sich hören lassen
-(kein Announce, keine Reports) – ohne sie neu pairen zu müssen.
+对已经在网、但自己一声不吭的设备很有用
+（不 Announce、也不 Report）—— 不用重新配对就能问出型号。
 
     python probe_model.py COM9 0x07da 1 16 17 18
 """

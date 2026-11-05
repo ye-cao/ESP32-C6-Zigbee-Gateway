@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ha_ws.py – HA WebSocket API: Registries + MQTT-Discovery-Zustand auslesen."""
+"""ha_ws.py – HA WebSocket API：读出 registries 和 MQTT discovery 的现状。"""
 import asyncio, json, os, sys
 import websockets
 
@@ -32,7 +32,7 @@ async def main():
         json.dump(ent, open("ha_entreg.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         json.dump(dev, open("ha_devreg.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
-        # MQTT-Entities mit c6_-Praefix
+        # 带 c6_ 前缀的 MQTT 实体
         c6 = [e for e in ent if "c6_" in (e.get("unique_id") or "")]
         print("\n=== unique_id enthaelt 'c6_' : %d ===" % len(c6))
         for e in sorted(c6, key=lambda x: x["entity_id"]):
@@ -40,11 +40,11 @@ async def main():
                 e["entity_id"], e.get("unique_id", ""), e.get("disabled_by"),
                 e.get("hidden_by"), e.get("platform")))
 
-        # alle mqtt-Entities, deren unique_id NICHT mit bekannten Integrationen kollidiert
+        # 所有 unique_id 不与已知集成冲突的 mqtt 实体
         mq = [e for e in ent if e.get("platform") == "mqtt"]
         print("\nmqtt-Entities insgesamt: %d" % len(mq))
 
-        # Devices, die zu c6_-Entities gehoeren
+        # 属于 c6_ 实体的设备
         dids = {e.get("device_id") for e in c6 if e.get("device_id")}
         print("\n=== zugehoerige Devices ===")
         for d in dev:

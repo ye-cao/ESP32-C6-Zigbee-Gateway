@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Ende-zu-Ende-Simulation des Serial-OTA gegen einen 256-Byte-fgets-C6.
+"""串口 OTA 的端到端模拟，对手是一个按 256 字节 fgets 的假 C6。
 
-Hintergrund (echtes Log vom 17.10.):
-    [OTA] coordinator 7168/789804 Bytes gesendet      ← genau 1 Stoß
-    danach nie wieder ein "write"-ACK
+背景（10-17 的真日志）：
+    [OTA] coordinator 7168/789804 字节，已发送      ← 正好 1 批
+    之后再也没出现过 "write"-ACK
 
-Ursache: der C6 liest Kommandos mit fgets(buf, BUF_SIZE). Bei BUF_SIZE=256
-wird eine ~950 Zeichen lange fw_ota_data-Zeile in 255-Zeichen-Fragmente
-zerhackt; das erste Fragment endet mitten im Hex-String, strchr(pd,'"')
-findet kein Ende → Frame wird stillschweigend verworfen → kein ACK.
+原因：C6 用 fgets(buf, BUF_SIZE) 读命令。BUF_SIZE=256 时，
+一条 ~950 字符的 fw_ota_data 会被切成 255 字符的碎片；
+第一片就断在 hex 串中间，strchr(pd,'"') 找不到结尾
+→ 帧被静默丢弃 → 没有 ACK。
 
-Dieser Test baut beide Seiten nach:
+这个测试把两边都重建出来：
   * 网关侧：直接用 serial_gateway.py 里真实的函数（_fw_ota_start、
     _fw_ota_send_batch、_fw_ota_close）
   * C6 侧：一个 FakeSerial，精确复刻 fgets 的行为
     （行会在 buf_size-1 个字符处被切断）
 
 Erwartung:
-  FW_CHUNK=80  → Transfer läuft durch, Byte für Byte identisch, 0 Fragmente
-  FW_CHUNK=448 → bricht nach dem ersten Stoß ab, 0 Bytes geschrieben
-                 (= genau das beobachtete Verhalten)
+  FW_CHUNK=80  → 传输跑完，逐字节一致，0 个碎片
+  FW_CHUNK=448 → 第一批之后就断，写了 0 字节
+                 （= 正是当时观察到的现象）
 """
 import ast
 import json
@@ -35,7 +35,7 @@ WANT = ("_js", "_j", "_env_int", "_fw_ota_close", "_fw_ota_watchdog",
 ACK_EVERY = 16          # serial_ota.c: FW_ACK_EVERY
 
 
-# ── Gateway-Seite aus dem echten Quelltext laden ──────────────────────────
+# ── 从真实源码里加载网关那一侧 ────────────────────────────────────────────
 def load_gateway(chunk):
     src = SRC.read_text(encoding="utf-8")
     chunks = [ast.get_source_segment(src, n)
@@ -43,7 +43,7 @@ def load_gateway(chunk):
               if isinstance(n, ast.FunctionDef) and n.name in WANT]
     assert len(chunks) == len(WANT), f"{len(chunks)}/{len(WANT)} Funktionen gefunden"
 
-    class _NoThread:                        # Watchdog im Test nicht starten
+    class _NoThread:                        # 测试里不启动看门狗
         def __init__(self, *a, **k):
             pass
         def start(self):
@@ -76,7 +76,7 @@ class FakeC6:
         self.chunks = 0
         self.acks = 0
         self.fragments = 0          # zerschnittene Zeilen
-        self.dropped = 0            # Frames, die der Parser nicht versteht
+        self.dropped = 0            # 解析器看不懂的帧
         self.data = bytearray()
         self.ended = False
         self.maxline = 0
@@ -113,7 +113,7 @@ class FakeC6:
             if not self.active:
                 return
             if self.parser == "old":
-                # strstr(buf, "\"data\":\"") – nur kompaktes JSON passt
+                # strstr(buf, "\"data\":\"") —— 只有紧凑 JSON 能匹配上
                 marker = '"data":"'
                 k = frag.find(marker)
                 if k < 0:
@@ -141,7 +141,7 @@ class FakeC6:
                 end = rest.find('"')
                 if end < 0:
                     self.dropped += 1
-                    return          # <- genau der stille Verlust
+                    return          # <- 就是这里静默丢包
                 hexs = rest[:end]
                 off = self.written
 
@@ -188,42 +188,42 @@ def run(chunk, parser="old", size=20 * 1024):
                 c6.acks = 0
                 gw["_fw_ota_send_batch"]()
             else:
-                break                       # C6 schweigt → Gateway wartet ewig
+                break                       # C6 不吭声 → 网关会一直等
         return c6, payload, gw
     finally:
-        gw["_fw_ota_close"]()               # Datei-Handle schließen, sonst WinError 32
+        gw["_fw_ota_close"]()               # 关掉文件句柄，否则 WinError 32
         os.unlink(path)
 
 
 def main():
     ok = True
-    print("\n[A] chunk=80 + alter Parser (strstr mit \"data\":\") – der echte Fall")
+    print("\n[A] chunk=80 + 老解析器（strstr 找 \"data\":\"）—— 真实场景")
     c6, payload, gw = run(80, parser="old")
-    ok &= check(c6.fragments == 0, f"keine zerschnittenen Zeilen (ist {c6.fragments})")
-    ok &= check(c6.dropped == 0, f"keine verworfenen Frames (ist {c6.dropped})")
-    ok &= check(c6.ended, "fw_ota_end wurde empfangen")
+    ok &= check(c6.fragments == 0, f"没有被切碎的行（实际 {c6.fragments}）")
+    ok &= check(c6.dropped == 0, f"没有被丢掉的帧（实际 {c6.dropped}）")
+    ok &= check(c6.ended, "收到了 fw_ota_end")
     ok &= check(len(c6.data) == len(payload),
-                f"{len(c6.data)}/{len(payload)} Bytes geschrieben")
-    ok &= check(bytes(c6.data) == payload, "Binärinhalt Byte für Byte identisch")
+                f"{len(c6.data)}/{len(payload)} 字节已写入")
+    ok &= check(bytes(c6.data) == payload, "二进制内容逐字节一致")
 
-    print("\n[B] chunk=448 + alter Parser – der beobachtete Bug")
+    print("\n[B] chunk=448 + 老解析器 —— 当时观察到的 bug")
     c6, payload, gw = run(448, parser="old")
-    ok &= check(c6.fragments > 0, f"Zeilen werden zerschnitten (ist {c6.fragments})")
-    ok &= check(c6.dropped > 0, f"Frames werden still verworfen (ist {c6.dropped})")
-    ok &= check(not c6.ended, "Transfer endet NICHT (bleibt hängen)")
-    ok &= check(c6.written == 0, f"kein einziges Byte geschrieben (ist {c6.written})")
+    ok &= check(c6.fragments > 0, f"行被切碎（实际 {c6.fragments}）")
+    ok &= check(c6.dropped > 0, f"帧被静默丢弃（实际 {c6.dropped}）")
+    ok &= check(not c6.ended, "传输**没有**结束（卡住了）")
+    ok &= check(c6.written == 0, f"一个字节都没写（实际 {c6.written}）")
 
     print("\n[C] chunk=80 + neuer Parser (json_val)")
     c6, payload, gw = run(80, parser="new")
     ok &= check(c6.ended and bytes(c6.data) == payload,
-                f"ebenfalls vollständig ({len(c6.data)}/{len(payload)})")
+                f"同样完整（{len(c6.data)}/{len(payload)}）")
 
-    print("\n[D] tatsächliche Zeilenlänge (gemessen im Durchlauf)")
+    print("\n[D] 实际行长（跑的时候量出来的）")
     for chunk, parser, expect_ok in ((80, "old", True), (96, "old", True), (448, "old", False)):
         c6, _, _ = run(chunk, parser=parser, size=4096)
         ok &= check((c6.maxline <= 255) is expect_ok,
-                    f"chunk={chunk}: längste Zeile {c6.maxline} Zeichen "
-                    f"({'passt in 255' if c6.maxline <= 255 else 'zu lang für 255'})")
+                    f"chunk={chunk}：最长的一行 {c6.maxline} 字符 "
+                    f"({'放得进 255' if c6.maxline <= 255 else '超过 255 了'})")
 
     print()
     print("全部通过" if ok else "存在失败项")

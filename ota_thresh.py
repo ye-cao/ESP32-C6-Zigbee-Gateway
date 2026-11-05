@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ota_thresh.py – findet die data-Laenge, ab der fw_ota_data verstummt.
+"""ota_thresh.py – 找出 fw_ota_data 从多长的 data 开始就不吭声了。
 
-Ohne Session antwortet der Handler immer mit {"st":"error","why":"not_active"}.
-Bleibt die Antwort aus, wurde die Zeile nicht (vollstaendig) verarbeitet.
+没有会话时，handler 永远回 {"st":"error","why":"not_active"}。
+若应答干脆没了，说明那一行没被（完整地）处理。
 """
 import json
 import time
@@ -59,7 +59,7 @@ def pump(secs):
 
 pump(6)   # Boot
 
-print(f"{'data B':>7} {'Zeile':>6}  Antwort")
+print(f"{'data B':>7} {'行':>6}  回应")
 print("-" * 42)
 rows = []
 for nb in (1, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 128):

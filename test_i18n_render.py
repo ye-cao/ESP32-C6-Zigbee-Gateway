@@ -19,7 +19,7 @@ class _FakeSer:
 fake_serial.Serial = _FakeSer
 sys.modules["serial"] = fake_serial
 
-# ── Mocks: pymysql (DB, hier nicht genutzt) ──
+# ── 桩：pymysql（数据库，这里用不到） ──
 sys.modules["pymysql"] = types.ModuleType("pymysql")
 
 # ── Mocks: paho.mqtt.client ──
@@ -43,10 +43,10 @@ def load(path, name):
     try:
         spec.loader.exec_module(mod)   # type: ignore[attr-defined]
     except KeyboardInterrupt as e:
-        # Hauptschleife bricht per Fake-Serial (KeyboardInterrupt, damit der
-        # robuste `except Exception` im Lese-Loop ihn NICHT schluckt und
-        # endlos weiterschlief – genau daran hing dieser Smoketest stundenlang);
-        # dabei läuft auch der saubere Abbau (finally) einmal durch.
+        # 主循环靠假串口中断（用 KeyboardInterrupt，好让读循环里那个
+        # 稳健的 `except Exception` **不**把它吞掉、
+        # 以免它空转不休 —— 这个冒烟测试正是在这儿卡了好几个小时）；
+        # 顺便让干净的收尾（finally）也跑一遍。
         if "test-stop" not in str(e):
             raise
     return mod
@@ -170,7 +170,7 @@ for path, name in [
     page404 = f"<h2>设备 0xffff 不存在</h2>"  # via handler logic simuliert
     print("   404-Text ( Quelle ): ", "设备" in page404 and "不存在" in page404)
 
-# 404-String direkt aus der Handler-Quelle pruefen
+# 直接从 handler 源码里核对 404 字符串
 src = io.open("host/addon/esp32c6_gateway/serial_gateway.py", encoding="utf-8").read()
 if "设备 {addr} 不存在" in src and "← 返回" in src:
     print("== 404-Text: OK ( Quelle )")

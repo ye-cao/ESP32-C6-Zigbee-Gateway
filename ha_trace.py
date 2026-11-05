@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """ha_trace.py – Zeitlinie eines Schaltbefehls.
 
-Nach dem Befehl wird 4 s lang alle 0.1 s der Zustand gelesen. Interessant ist,
-ob nach dem sofortigen "optimistischen Echo" (~0.01 s) noch eine zweite
-Aktualisierung kommt – das waere der Read-Back des Geraets (~0.7 s).
-Bleibt der Zustand danach gleich, hat das Geraet den Befehl ausgefuehrt.
-Springt er zurueck, hat es ihn NICHT ausgefuehrt.
+发完命令之后，连续 4 s 每 0.1 s 读一次状态。要看的是：
+在那条立刻返回的"乐观回声"（~0.01 s）之后，还会不会来第二次更新
+—— 那就是设备的回读（~0.7 s）。
+若之后状态保持不变，说明设备确实执行了；若跳回去，说明它**没有**执行。
 """
 import json, os, time, urllib.request
 
@@ -46,7 +45,7 @@ def trace(eid, label, cmd):
         s, c, u = snap(eid)
         if (s, c, u) != last_key:
             events.append((round(time.time() - t0, 2), s,
-                           "state" if s != last_key[0] else "nur last_updated (MQTT erneut empfangen)"))
+                           "state" if s != last_key[0] else "只有 last_updated（又收到一次 MQTT）"))
             last_key = (s, c, u)
         time.sleep(0.1)
     final = last_key[0]
@@ -54,11 +53,11 @@ def trace(eid, label, cmd):
     for t, s, why in events:
         if why != "vorher":
             print("            +%.2fs  %-4s  %s" % (t, s, why))
-    print("            Endzustand nach 4 s: %s" % final)
+    print("            4 s 后的终态：%s" % final)
     return s0, final
 
 
-print("Zeitlinie: Befehl→Zustand (Sofort-Echo vs. echtes Read-Back)\n")
+print("时间线：命令→状态（立即回声 vs 真正的回读）\n")
 for eid, label in ENT:
     print("=== %s   %s" % (label, eid))
     trace(eid, label, "turn_on")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""dev_test.py – dev_cmd / probe gegen bekannte Adresse testen.
+"""dev_test.py – 用已知地址测 dev_cmd / probe。
 
-Ein Port-Öffnen für die ganze Sequenz (jedes Öffnen löst einen Reset aus).
+整段序列只开一次端口（每开一次都会触发一次复位）。
 """
 import argparse
 import json
@@ -93,7 +93,7 @@ def main():
         send(ser, {"cmd": "dev_cmd", "addr": args.addr, "ep": ep, "sw": "on"})
         pump(ser, 2.0, sink)
 
-    print("\n=== dev_cmd off (alle EP) ===")
+    print("\n=== dev_cmd off（所有端点）===")
     for ep in EP_LIST:
         send(ser, {"cmd": "dev_cmd", "addr": args.addr, "ep": ep, "sw": "off"})
         pump(ser, 2.0, sink)

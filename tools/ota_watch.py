@@ -15,7 +15,7 @@ try:
     with op.open(URL, timeout=5) as r:
         d = json.load(r)
 except Exception as e:
-    print("state nicht lesbar:", e)
+    print("读不出 state：", e)
     raise SystemExit(1)
 
 t0 = time.time()

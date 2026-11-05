@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Erzeugt aus den Zigbee2MQTT-Converter-Definitionen (zigbee-herdsman-converters)
-eine kompakte Modelldatenbank für die HA-Auto-Discovery.
+"""从 Zigbee2MQTT 的转换器定义（zigbee-herdsman-converters）生成
+给 HA 自动 discovery 用的紧凑型号库。
 
 Quelle:  .zhc/src/devices/*.ts   (GitLab-Mirror, Tag v16.7.0)
 Ziel:    host/addon/esp32c6_gateway/device_db.json
 
-Schlüssel = ZCL Basic-Attribut 0x0005 (ModelIdentifier) – genau das, was der
-Koordinator im Interview liest. Damit kann der Gateway ein frisch beigetretenes
-Gerät sofort richtig einordnen (Endpunkt-Namen, Entity-Typen) statt zu raten.
+键 = ZCL Basic 属性 0x0005（ModelIdentifier）—— 正是协调器在配对时读的那个。
+有了它，网关就能把刚入网的设备立刻归类正确（端点名、实体类型），
+不用瞎猜。
 
-Nur deklarative Teile werden extrahiert – die TS-Runtime-Logik (fromZigbee-
-Converter mit Code) kann nicht 1:1 übernommen werden, wohl aber die Fähigkeiten.
+只抽取声明性的部分 —— TS 的运行时逻辑（带代码的 fromZigbee 转换器）
+没法一比一搬过来，但能力可以。
 """
 import glob
 import json
@@ -21,29 +21,29 @@ import sys
 SRC_DIR = ".zhc/src/devices"
 OUT = os.path.join("host", "addon", "esp32c6_gateway", "device_db.json")
 
-# Ein Definitions-Objekt im Array: Einrückung genau 4 Leerzeichen.
-# ACHTUNG: Abschluss als Lookahead – sonst frisst der Match den Zeilenumbruch
-# und jeder zweite Block wird übersprungen.
+# 数组里的一个定义对象：缩进正好 4 个空格。
+# 注意：收尾必须用 lookahead —— 否则匹配会把换行一起吃掉，
+# 结果每隔一块就被跳过。
 BLOCK = re.compile(r"\n    \{\n(.*?)(?=\n    \},?\n)", re.S)
 
 RE_ZBMODEL = re.compile(r"zigbeeModel:\s*\[", re.S)
 RE_FP_ID   = re.compile(r"modelID:\s*")
-# ★ v16.7.0 schrieb 'einfache' Anführungszeichen, ab v26.x sind es
-# "doppelte" (Prettier-Umstellung). Beide zulassen, sonst liefert der
-# Generator nach dem Update eine leere Datenbank – ohne Fehlermeldung.
+# ★ v16.7.0 写的是 '单引号'，从 v26.x 起变成
+# "双引号"（Prettier 改的）。两种都得允许，否则更新之后
+# 生成器会产出一个空数据库 —— 而且不报错。
 #
-# ★★ Kein Regex mehr für die Strings: einige Hersteller (z. B. EcoSmart)
-# benutzen BINÄRE ModelIDs. In ecosmart.ts steht dann
+# ★★ 字符串不再用正则：有些厂商（例如 EcoSmart）
+# 用的是**二进制** ModelID。ecosmart.ts 里就长这样：
 #     '\u0000\u0002\u0000\u0004\u0003"…'
-# – ein einfach-quotierter String, der ein LITERALES " enthält. Ein Muster
-# wie ['"]([^'"]+)['"] schneidet dort mitten im String ab und liefert
-# Bruchstücke wie ',' oder '1' als ModelID. Deshalb: echter Scanner, der
-# Escape-Sequenzen und beide Quote-Arten versteht.
+# —— 一个单引号字符串，里面含一个**字面**的 "。像
+# ['"]([^'"]+)['"] 这样的模式会在字符串中间截断，
+# 把 ',' 或 '1' 这种碎片当成 ModelID。所以改用真正的扫描器，
+# 它能理解转义序列和两种引号。
 RE_STR     = lambda k: re.compile(r"""\n\s*%s:\s*(?=['"%s])""" % (k, "`"))
 
 
 def _ts_unescape(s):
-    """Wandelt die Escape-Sequenzen eines TS-String-Literals in echte Zeichen."""
+    """把 TS 字符串字面量里的转义序列还原成真正的字符。"""
     out, i, n = [], 0, len(s)
     SIMPLE = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
               "v": "\v", "0": "\0", "'": "'", '"': '"', "`": "`", "\\": "\\"}
@@ -83,10 +83,10 @@ def _ts_unescape(s):
 
 
 def ts_string(text, pos=0):
-    """Liest ab pos (nach Whitespace) EIN String-Literal.
+    """从 pos（先跳过空白）开始读**一个**字符串字面量。
 
-    Rückgabe: (wert, endposition) oder (None, pos).
-    Behandelt '…', "…" und `…` inkl. Backslash-Escapes.
+    返回：(值, 结束位置)，或 (None, pos)。
+    支持 '…'、"…" 和 `…`，含反斜杠转义。
     """
     n = len(text)
     while pos < n and text[pos] in " \t\r\n":
@@ -110,7 +110,7 @@ def ts_string(text, pos=0):
 
 
 def ts_string_array(text, pos):
-    """Liest `[ 'a', "b", … ]` ab pos. Rückgabe: (liste, endposition)."""
+    """从 pos 开始读 `[ 'a', "b", … ]`。返回：(列表, 结束位置)。"""
     n = len(text)
     while pos < n and text[pos] in " \t\r\n":
         pos += 1
@@ -134,10 +134,10 @@ def ts_string_array(text, pos):
 def _id_ok(s):
     """Nur brauchbare ModelIDs durchlassen.
 
-    EcoSmart & Co. benutzen echte Binärstrings (\u0000 …) als ModelID. Die
-    sind im Basic-Attribut 0x0005 nicht als UTF-8 lesbar und für die
-    Zuordnung nutzlos – sie würden die DB nur aufblähen und beim Log-Match
-    nie treffen. Steuerzeichen ⇒ verwerfen.
+    EcoSmart 之类的厂商拿真正的二进制串（\u0000 …）当 ModelID。它们
+    在 Basic 属性 0x0005 里根本不是合法 UTF-8，对归类毫无用处 ——
+    只会把库撑大，日志里也永远匹配不上。
+    有控制字符 ⇒ 直接丢掉。
     """
     if not s:
         return False
@@ -154,21 +154,21 @@ RE_ENDP    = re.compile(r"endpoints:\s*\{([^}]*)\}")
 
 
 def ts_field(block, key):
-    """Sucht `key: "…"` im Block und liest den Wert mit dem Scanner.
+    """在块里找 `key: "…"`，用扫描器读出它的值。
 
-    Gleiche Falle wie oben: `description: "16\" Deckenlampe"` enthält ein
-    escaptes " – ein Regex würde dort abschneiden.
+    同样的坑：`description: "16\" 吸顶灯"` 里有一个
+    转义的 " —— 正则在这里会截断。
     """
-    pad = "\n" + block                 # führender \n, damit `\n\s*key` greift
+    pad = "\n" + block                 # 前面补个 \n，好让 `\n\s*key` 匹配得上
     for m in RE_STR(key).finditer(pad):
         val, _ = ts_string(pad, m.end())
         if val is not None:
             return val
     return ""
 
-# Fähigkeitserkennung: (Regex im Blocktext) → HA-Komponente / Merkmal
+# 能力识别：（在块文本里跑的正则）→ HA 组件 / 特征
 CAPS = [
-    # onOff() und onOff({...}) – ohne Argument genauso ein Schalter
+    # onOff() 和 onOff({...}) —— 不带参数也一样是开关
     (re.compile(r"\bonOff\(\s*[\{\)]|extend\.light_onoff_brightness|e\.switch\(\)|tz\.on_off"), "switch"),
     (re.compile(r"\blight\(\s*[\{\)]|extend\.light_onoff_brightness|m\.light\("),              "light"),
     (re.compile(r"ias_contact_alarm_1|e\.contact\(\)"),                        "contact"),
@@ -187,7 +187,7 @@ CAPS = [
     (re.compile(r"fz\.metering|e\.power\(\)|e\.energy\(\)"),                   "power"),
 ]
 
-# HA-Komponente je erkanntem Merkmal (für die Discovery-Vorbesetzung)
+# 每种识别出的特征对应的 HA 组件（用于 discovery 预置）
 HA_COMP = {
     "switch": "switch", "light": "light", "contact": "binary_sensor",
     "moisture": "binary_sensor", "smoke": "binary_sensor", "gas": "binary_sensor",
@@ -218,7 +218,7 @@ def parse_endpoints(block, caps):
 
 def main():
     if not os.path.isdir(SRC_DIR):
-        sys.exit(f"Quelle fehlt: {SRC_DIR}")
+        sys.exit(f"源目录不存在：{SRC_DIR}")
 
     db = {}
     stats = {"files": 0, "blocks": 0, "keys": 0, "no_model": 0, "bin_id": 0}
@@ -270,9 +270,9 @@ def main():
     size = os.path.getsize(OUT)
     print(f"Dateien        : {stats['files']}")
     print(f"Definitionen   : {stats['blocks']}")
-    print(f"Einträge       : {len(db)}  (Schlüssel inkl. Aliase: {stats['keys']})")
-    print(f"ohne ModelID   : {stats['no_model']}")
-    print(f"Binär-IDs weg  : {stats['bin_id']}  (Steuerzeichen im ModelID)")
+    print(f"条目           : {len(db)}  （含别名的键：{stats['keys']}）")
+    print(f"没有 ModelID   : {stats['no_model']}")
+    print(f"丢掉二进制 ID  : {stats['bin_id']}  （ModelID 里有控制字符）")
     print(f"Ausgabe        : {OUT}  ({size/1024:.0f} KiB)")
     return db
 

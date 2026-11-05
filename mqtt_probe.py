@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""mqtt_probe.py – minimaler MQTT-3.1.1-Client (nur stdlib), um zu sehen,
-was der Broker wirklich enthaelt.
+"""mqtt_probe.py – 极简 MQTT 3.1.1 客户端（只用标准库），用来看看
+broker 里到底装了什么。
 
-    python mqtt_probe.py connect                 # nur CONNACK pruefen
+    python mqtt_probe.py connect                 # 只验 CONNACK
     python mqtt_probe.py dump SECONDS [FILTER]   # '#' oder 'gw/#' …
 """
 import socket, sys, time, json, os
@@ -50,9 +50,9 @@ class Cli:
                 body += s(PASS)
         self.sk = socket.create_connection((HOST, PORT), timeout=10)
         self.sk.sendall(pkt(0x10, body))
-        # Fixkopf = 1 Byte Typ + variable Laenge. Vorher wurden hier 2 Bytes
-        # gelesen – dann ist das Laengenbyte schon weg und _varlen() liest
-        # ein Byte zu viel (IndexError in body[1]).
+        # 固定头 = 1 字节类型 + 变长长度。原先这里读了 2 个字节，
+        # 于是长度字节被吃掉，_varlen() 读的
+        # 就多了一个字节（body[1] 处 IndexError）。
         h = self._recv_exact(1)
         n = self._varlen()
         body = self._recv_exact(n)
@@ -63,7 +63,7 @@ class Cli:
         while len(buf) < n:
             c = self.sk.recv(n - len(buf))
             if not c:
-                raise IOError("Broker hat Verbindung geschlossen")
+                raise IOError("broker 把连接关了")
             buf += c
         return buf
 
@@ -110,7 +110,7 @@ def do_dump(secs, filt):
     c = Cli()
     typ, fl, rc = c.connect("probe-dump")
     if rc != 0:
-        sys.exit("CONNACK rc=%d – keine Berechtigung" % rc)
+        sys.exit("CONNACK rc=%d —— 没有权限" % rc)
     c.subscribe(filt, 0)
     print("abonniert %r – sammle %.1f s …\n" % (filt, secs))
     t0 = time.time()
@@ -135,11 +135,11 @@ def do_dump(secs, filt):
 
 
 def do_pub(topic, payload="", retain=True):
-    """Retained-Nachricht setzen bzw. mit leerem Payload loeschen."""
+    """设置 retained 消息，或用空负载把它删掉。"""
     c = Cli()
     typ, fl, rc = c.connect("probe-pub")
     if rc != 0:
-        sys.exit("CONNACK rc=%d – keine Berechtigung" % rc)
+        sys.exit("CONNACK rc=%d —— 没有权限" % rc)
     body = s(topic) + payload.encode()
     hdr = 0x30 | (0x01 if retain else 0x00)          # PUBLISH, QoS 0
     c.sk.sendall(pkt(hdr, body))

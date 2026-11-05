@@ -4,7 +4,7 @@ ESP32-C6 Matter over Thread – Linux Host Gateway Service
 =========================================================
 
 Datenfluss:
-  ESP32-C6 (RCP) ──USB/spinel──► otbr-agent ──Thread──► Matter-Geräte
+  ESP32-C6 (RCP) ──USB/spinel──► otbr-agent ──Thread──► Matter 设备
                                                                 │
   python-matter-server ◄──────────────────────────────────────┘
          │  (WebSocket ws://localhost:5580/ws)
@@ -158,9 +158,9 @@ def _load_names():
     try:
         if DEVICES_FILE.exists():
             _names = json.loads(DEVICES_FILE.read_text())
-            log.info("Gerätenamen geladen: %d Einträge", len(_names))
+            log.info("已加载设备名：%d 条", len(_names))
     except Exception as e:
-        log.warning("Gerätenamen laden: %s", e)
+        log.warning("加载设备名失败：%s", e)
 
 
 def _save_names():
@@ -168,7 +168,7 @@ def _save_names():
         DEVICES_FILE.parent.mkdir(parents=True, exist_ok=True)
         DEVICES_FILE.write_text(json.dumps(_names, indent=2))
     except Exception as e:
-        log.warning("Gerätenamen speichern: %s", e)
+        log.warning("保存设备名失败：%s", e)
 
 
 def _node(node_id):
@@ -208,7 +208,7 @@ def _on_attribute_updated(node_id, endpoint_id, cluster_id, attribute_id, value)
         else:
             return  # anderer Cluster → ignorieren
 
-        # Nach jeder Vital-Änderung in DB schreiben (wenn alle Werte vorhanden)
+        # 每次生命体征变化都写库（前提是所有值都齐了）
         if v["bpm"] is not None and v["rpm"] is not None:
             db_upsert_node(node_id, "online")
             db_insert_vitals(node_id, v)
@@ -221,7 +221,7 @@ def _on_node_added(node_id):
     with _lock:
         _node(node_id)["status"] = "online"
     db_upsert_node(node_id, "online")
-    log.info("[node %d] hinzugefügt / online", node_id)
+    log.info("[node %d] 已加入 / 在线", node_id)
 
 
 def _on_node_removed(node_id):
@@ -229,18 +229,18 @@ def _on_node_removed(node_id):
         if node_id in _nodes:
             _nodes[node_id]["status"] = "offline"
     db_upsert_node(node_id, "offline")
-    log.info("[node %d] entfernt / offline", node_id)
+    log.info("[node %d] 已移除 / 离线", node_id)
 
 
 # ── python-matter-server WebSocket Client ─────────────────────────────────────
 async def _matter_ws_loop():
-    """Dauerhafter WebSocket-Client für python-matter-server."""
+    """给 python-matter-server 用的常驻 WebSocket 客户端。"""
     retry_delay = 5
     msg_id = 0
 
     while True:
         try:
-            log.info("Verbinde mit Matter-Server: %s", MATTER_WS_URL)
+            log.info("正在连接 Matter 服务器：%s", MATTER_WS_URL)
             async with websockets.connect(
                 MATTER_WS_URL,
                 ping_interval=30,
@@ -265,7 +265,7 @@ async def _matter_ws_loop():
 
                     msg_type = msg.get("type") or msg.get("message_type", "")
 
-                    # ── Antwort auf get_nodes ────────────────────────────────
+                    # ── get_nodes 的应答 ────────────────────────────────────
                     if msg.get("result") and isinstance(msg["result"], list):
                         for node in msg["result"]:
                             nid = node.get("node_id")
@@ -318,13 +318,13 @@ async def _matter_ws_loop():
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
         except Exception as e:
-            log.error("Matter WS Fehler: %s", e)
+            log.error("Matter WS 出错：%s", e)
             await asyncio.sleep(retry_delay)
 
 
 # ── OTBR REST API Poller ──────────────────────────────────────────────────────
 async def _otbr_poll_loop():
-    """Pollt OTBR REST API alle 30 s für Thread-Netzwerk-Status."""
+    """每 30 s 轮询一次 OTBR REST API，取 Thread 网络状态。"""
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -427,7 +427,7 @@ def _html_dashboard():
    <a href="/api/state" style="color:#7ecbff">JSON API</a> &nbsp;|&nbsp;
    <a href="/api/otbr" style="color:#7ecbff">OTBR Status</a>
 </p>
-{node_html or '<p><em>Noch keine Matter-Geräte verbunden.</em></p>'}
+{node_html or '<p><em>还没有连上任何 Matter 设备。</em></p>'}
 <footer>
   Matter Server: {MATTER_WS_URL}<br>
   OTBR REST API: {OTBR_REST_URL}
@@ -500,7 +500,7 @@ def main():
     _db_init()
     _load_names()
 
-    # asyncio loop für WebSocket + OTBR Poller
+    # 给 WebSocket + OTBR 轮询用的 asyncio 事件循环
     loop = asyncio.new_event_loop()
     t_async = threading.Thread(target=_run_async_loop, args=(loop,), daemon=True)
     t_async.start()

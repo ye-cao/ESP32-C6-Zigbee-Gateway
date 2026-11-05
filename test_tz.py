@@ -49,7 +49,7 @@ def resolve_with(ns, **env):
         for k, v in env.items():
             os.environ[k] = v
         tz, name = ns["_resolve_local_tz"]()
-        ns["_LOG_TZ"] = tz          # _ts() liest diese Modulglobale
+        ns["_LOG_TZ"] = tz          # _ts() 读的就是这个模块级全局
         return tz, name, ns["_ts"]()
     finally:
         for k in TZ_KEYS:

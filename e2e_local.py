@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""e2e_local.py – End-to-End-Test der Produktionskette ohne Home Assistant.
+"""e2e_local.py – 不带 Home Assistant，跑一遍生产链路的端到端测试。
 
     echter Broker (amqtt, 127.0.0.1:18830)
-      + echtes serial_gateway.py als Prozess
+      + 真的 serial_gateway.py，当进程跑
       + echter ESP32-C6 auf COM9
-      + ein "Fake-HA", das genau das tut, was die HA-MQTT-Integration tut:
+      + 一个"假 HA"，做的事和 HA 的 MQTT 集成一模一样：
         Discovery-Config lesen, auf command_topic publizieren, state_topic lesen
 
-Damit ist die Kette geprüft, die auf dem HA-Host läuft – nur eben lokal:
-  MQTT-Befehl → add-on → UART → Gerät → Antwort → UART → add-on → state_topic
+这样就把 HA 主机上跑的那条链整个验过了 —— 只是搬到了本地：
+  MQTT 命令 → add-on → UART → 设备 → 应答 → UART → add-on → state_topic
 
 Aufruf:
     python e2e_local.py [--port COM9] [--addr 0x07da]
@@ -35,12 +35,12 @@ HA_PREFIX = "homeassistant"
 try:
     import paho.mqtt.client as mqtt
 except ImportError:
-    sys.exit("paho-mqtt fehlt")
+    sys.exit("缺 paho-mqtt")
 
 try:
     from amqtt.broker import Broker
 except ImportError:
-    sys.exit("amqtt fehlt – mit --target ./.mqttenv installiert (PYTHONPATH setzen)")
+    sys.exit("缺 amqtt —— 已装到 --target ./.mqttenv（要设 PYTHONPATH）")
 
 
 # ── Broker im Hintergrund-Thread ──────────────────────────────────────────
@@ -93,7 +93,7 @@ class FakeHA:
         self.c.connect("127.0.0.1", MQTT_PORT, 30)
         self.c.loop_start()
         if not self.connected.wait(8):
-            raise RuntimeError("Fake-HA konnte nicht verbinden")
+            raise RuntimeError("假 HA 连不上")
 
     def stop(self):
         self.c.loop_stop()
@@ -116,7 +116,7 @@ class FakeHA:
 
 
 def retained_value(topic, timeout=3.0):
-    """Frischer Client: beweist, dass der Wert retained im Broker liegt."""
+    """一个全新客户端：用来证明这个值是以 retained 存在 broker 里的。"""
     got = {}
 
     def on_c(cl, ud, flags, rc):
@@ -171,10 +171,10 @@ def main():
     ready = threading.Event()
     threading.Thread(target=start_broker, args=(ready,), daemon=True).start()
     if not ready.wait(10):
-        sys.exit("Broker startet nicht")
+        sys.exit("broker 起不来")
     print("  Broker auf 127.0.0.1:%d" % MQTT_PORT)
 
-    print("\n== 2. serial_gateway.py als Prozess starten ==")
+    print("\n== 2. 把 serial_gateway.py 当进程启动 ==")
     env = dict(os.environ)
     env.update({"WEB_PORT": str(WEB_PORT), "DB_HOST": "", "HA_DISCOVERY": "1",
                 "LOG_TZ": "Asia/Shanghai"})
@@ -191,10 +191,10 @@ def main():
         st = ha.find(BASE + "/status", timeout=15)
         check("add-on meldet online", st == "online", st)
 
-        print("\n== 3. %.0f s warten (Zigbee-Netz braucht Anlauf) ==" % args.boot_wait)
+        print("\n== 3. 等 %.0f s（Zigbee 网络要启动时间）==" % args.boot_wait)
         time.sleep(args.boot_wait)
 
-        print("\n== 4. Gerät per MQTT abfragen (probe) -> Discovery ==")
+        print("\n== 4. 通过 MQTT 问设备（probe）-> discovery ==")
         ha.publish(BASE + "/cmd/probe", "%s,%d" % (args.addr, ep))
         cfg = ha.find(disc_topic, timeout=15)
         check("Discovery-Config fuer ep%d angekommen" % ep, cfg is not None, disc_topic)
@@ -210,7 +210,7 @@ def main():
         v = ha.find(state_topic, timeout=8, pred=lambda p: p == {"v": 1})
         check("state_topic = {v:1}", v == {"v": 1}, v)
         rv = retained_value(state_topic)
-        check("Wert ist retained (neuer Client sieht ihn sofort)", rv == {"v": 1}, rv)
+        check("值是 retained（新客户端立刻就能看到）", rv == {"v": 1}, rv)
 
         print("\n== 6. HA schaltet AUS (set -> off) ==")
         ha.publish(cmd_topic, "0")
@@ -220,13 +220,13 @@ def main():
         print("\n== 7. toggle dreht weiter ==")
         ha.publish(cmd_topic, "toggle")
         v = ha.find(state_topic, timeout=8, pred=lambda p: p == {"v": 1})
-        check("toggle aus 0 -> {v:1}", v == {"v": 1}, v)
+        check("从 0 toggle -> {v:1}", v == {"v": 1}, v)
 
-        print("\n== 8. Geraet hat die Befehle wirklich quittiert ==")
-        # console-Zeilen sind JSON-Strings – json.loads() im FakeHA macht daraus
-        # dicts. Deshalb hier beide Formen wieder auf Text normalisieren.
-        # Der Zustands-Echo des add-ons kommt sofort, das Funk-ACK des Geräts
-        # erst ein paar hundert ms später -> bis zu 8 s nachpollen.
+        print("\n== 8. 设备真的把命令都回执了 ==")
+        # console 里的行是 JSON 字符串 —— FakeHA 里的 json.loads() 会把它们变成
+        # dict。所以这里两种形态都还原成文本。
+        # add-on 的状态回声立刻就到，设备的无线 ACK 要等几百 ms
+        # 之后 -> 最多轮询 8 s。
         acked = []
         end = time.time() + 8
         while time.time() < end:
@@ -237,11 +237,11 @@ def main():
             if len(acked) >= 3:
                 break
             time.sleep(0.3)
-        check("mind. 3 Default-Response-Frames vom Geraet", len(acked) >= 3, len(acked))
+        check("至少 3 帧 Default-Response 来自设备", len(acked) >= 3, len(acked))
         for c in acked[:3]:
             print("      " + c)
 
-        print("\n== 9. Bulk: alle drei Endpunkte bekommen Entities ==")
+        print("\n== 9. 批量：三个端点都拿到实体 ==")
         ha.publish(BASE + "/cmd/probe", "%s,17" % args.addr)
         time.sleep(3)
         ha.publish(BASE + "/cmd/probe", "%s,18" % args.addr)

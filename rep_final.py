@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""rep_final.py – entscheidender Test fuer die Zustands-Rueckmeldung.
+"""rep_final.py – 关于状态回传的关键测试。
 
-Wichtig: Jedes Oeffnen des Ports resettet den C6 und damit die Interview-Flags.
+注意：每打开一次端口都会复位 C6，配对标志也跟着清零。
 Deshalb:
   1. Boot abwarten
-  2. toggle #1 -> loest (falls noetig) IEEE-Abfrage + Interview aus
-  3. warten, bis das Interview "done" meldet und Configure Reporting mit
-     SUCCESS quittiert ist
-  4. toggle #2 -> DAS ist die Zustandsaenderung, auf die ein Report folgen muss
-  5. 60 s auf ZCL 0x0A (Report Attributes) warten
+  2. toggle #1 -> 触发（必要时）IEEE 查询 + 配对流程
+  3. 等到配对报 "done"，并且 Configure Reporting 回了 SUCCESS
+  4. toggle #2 -> **这**才是状态变化，之后必须跟一条 Report
+  5. 等 60 s，看有没有 ZCL 0x0A（Report Attributes）
 """
 import json
 import sys
