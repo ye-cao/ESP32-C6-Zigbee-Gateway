@@ -1,99 +1,107 @@
-# ESP32-C6 Zigbee → MQTT Gateway
+# ESP32-C6 Zigbee → MQTT 网关
 
-## Übersicht
+> ⚠️ **历史文档**：描述的是树莓派上 systemd 直跑 `host/serial_gateway.py` 的部署方式。
+> 该脚本已于 2026-11-05 删除（早已分流、不再同步）；现行部署是 HAOS 上的 add-on
+> `host/addon/esp32c6_gateway/`，端口 8082，话题前缀 `gw/coordinator`。
 
-Der Gateway verbindet einen **ESP32-C6** (Zigbee-Koordinator) über USB-Serial mit dem MQTT-Broker. Der ESP32-C6 sendet JSON-Lines über UART, der Gateway parsed diese und published sie als MQTT-Topics.
+## 概览
+
+网关把 **ESP32-C6**（Zigbee 协调器）通过 USB 串口接到 MQTT broker。ESP32-C6 通过
+UART 发 JSON-Lines，网关解析后发布成 MQTT 话题。
 
 ```
-Zigbee-Geräte → ESP32-C6 → /dev/ttyACM1 → serial_gateway.py → MQTT (192.168.178.218:1883)
+Zigbee 设备 → ESP32-C6 → /dev/ttyACM1 → serial_gateway.py → MQTT (192.168.178.218:1883)
 ```
 
 ---
 
-## Dateien
+## 文件
 
-| Pfad | Beschreibung |
+| 路径 | 说明 |
 |------|-------------|
-| `/home/pi/python/esp32c6-zigbee-vital-gateway/host/serial_gateway.py` | Haupt-Gateway-Skript |
-| `/etc/systemd/system/zigbee-mqtt-gateway.service` | systemd-Service |
+| `/home/pi/python/esp32c6-zigbee-vital-gateway/host/serial_gateway.py` | 网关主脚本 |
+| `/etc/systemd/system/zigbee-mqtt-gateway.service` | systemd 服务 |
 
 ---
 
-## systemd-Service
+## systemd 服务
 
-### Steuerbefehle
+### 管理命令
 
 ```bash
-sudo systemctl start zigbee-mqtt-gateway     # starten
-sudo systemctl stop zigbee-mqtt-gateway      # stoppen
-sudo systemctl restart zigbee-mqtt-gateway   # neu starten
-sudo systemctl status zigbee-mqtt-gateway    # Status anzeigen
-journalctl -u zigbee-mqtt-gateway -f         # Live-Log
-journalctl -u zigbee-mqtt-gateway -n 100     # letzte 100 Zeilen
+sudo systemctl start zigbee-mqtt-gateway     # 启动
+sudo systemctl stop zigbee-mqtt-gateway      # 停止
+sudo systemctl restart zigbee-mqtt-gateway   # 重启
+sudo systemctl status zigbee-mqtt-gateway    # 查看状态
+journalctl -u zigbee-mqtt-gateway -f         # 实时日志
+journalctl -u zigbee-mqtt-gateway -n 100     # 最近 100 行
 ```
 
-### Service-Konfiguration
+### 服务配置
 
 ```ini
 User=pi  Group=dialout
 Port:   /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B0:A6:04:87:10:E0-if00
 Broker: 192.168.178.218:1883
 Base:   gw/coordinator
-Restart: on-failure, nach 5 s
+Restart: on-failure (delay 5 s)
 ```
 
-Der stabile `by-id`-Pfad stellt sicher, dass der korrekte ESP32-C6 auch nach USB-Reconnect gebunden wird (MAC `B0:A6:04:87:10:E0`).
+用稳定的 `by-id` 路径，可以保证 USB 重新插拔后仍绑定到正确的那块 ESP32-C6
+（MAC `B0:A6:04:87:10:E0`）。
 
 ---
 
-## Serial-Protokoll (ESP32-C6 → Pi)
+## 串口协议（ESP32-C6 → Pi）
 
-Der ESP32-C6 sendet JSON-Lines über UART1 (`115200 8N1`). DTR/RTS bleiben LOW, damit kein ungewollter Reset ausgelöst wird.
+ESP32-C6 通过 UART1（`115200 8N1`）发 JSON-Lines。DTR/RTS 保持 LOW，避免意外触发复位。
 
-### Nachrichtentypen
+### 消息类型
 
-| `"t"` | Bedeutung | Beispiel |
+| `"t"` | 含义 | 示例 |
 |-------|-----------|---------|
-| `boot` | ESP32-C6 gestartet | `{"t":"boot"}` |
-| `heartbeat` | Lebenszeichen, alle ~30 s | `{"t":"heartbeat","uptime":120,"ch":15,"pan":4660}` |
-| `vitals` | MR60BHA2-Vitaldaten | `{"t":"vitals","p":{"hr":72,"rr":16,...}}` |
-| `zigbee` | Zigbee-Gerätedaten | `{"t":"zigbee","addr":4919,"sub":"temp","p":{"temp":21.5}}` |
-| `permit_join` | Pairing-Fenster Status | `{"t":"permit_join","p":{"open":true,"seconds":180}}` |
+| `boot` | ESP32-C6 已启动 | `{"t":"boot"}` |
+| `heartbeat` | 心跳，约每 30 s | `{"t":"heartbeat","uptime":120,"ch":15,"pan":4660}` |
+| `vitals` | MR60BHA2 生命体征 | `{"t":"vitals","p":{"hr":72,"rr":16,...}}` |
+| `zigbee` | Zigbee 设备数据 | `{"t":"zigbee","addr":4919,"sub":"temp","p":{"temp":21.5}}` |
+| `permit_join` | 配对窗口状态 | `{"t":"permit_join","p":{"open":true,"seconds":180}}` |
 
 ---
 
-## MQTT-Topics
+## MQTT 话题
 
-### Vom Gateway published (ESP32-C6 → Broker)
+### 网关发布（ESP32-C6 → broker）
 
-| Topic | Inhalt | Retain | QoS |
+| 话题 | 内容 | Retain | QoS |
 |-------|--------|--------|-----|
-| `gw/coordinator/status` | `online` / `offline` | ja | 1 |
-| `gw/coordinator/console` | Rohe Serial-Ausgabe (jede Zeile) | nein | 0 |
-| `gw/coordinator/heartbeat` | Heartbeat-JSON | ja | 1 |
-| `gw/coordinator/mr60bha2` | Vitaldaten-JSON | nein | 0 |
-| `gw/coordinator/zigbee/0x{addr}/{sub}` | Zigbee-Gerätedaten | nein | 0 |
-| `gw/coordinator/permit_join` | Pairing-Status JSON | nein | 1 |
+| `gw/coordinator/status` | `online` / `offline` | 是 | 1 |
+| `gw/coordinator/console` | 串口原始输出（每一行） | 否 | 0 |
+| `gw/coordinator/heartbeat` | 心跳 JSON | 是 | 1 |
+| `gw/coordinator/mr60bha2` | 生命体征 JSON | 否 | 0 |
+| `gw/coordinator/zigbee/0x{addr}/{sub}` | Zigbee 设备数据 | 否 | 0 |
+| `gw/coordinator/permit_join` | 配对状态 JSON | 否 | 1 |
 
-**Last Will:** `gw/coordinator/status` → `"offline"` (retain, QoS 1) — wird automatisch beim Verbindungsabbruch gesetzt.
+**遗嘱（Last Will）：** `gw/coordinator/status` → `"offline"`（retain，QoS 1）——
+断连时自动写入。
 
-### Kommandos (Broker → ESP32-C6)
+### 命令（broker → ESP32-C6）
 
-Der Gateway abonniert `gw/coordinator/cmd/+` und leitet Kommandos über Serial an den ESP32-C6 weiter.
+网关订阅 `gw/coordinator/cmd/+`，把命令经串口转发给 ESP32-C6。
 
-| Topic | Payload | Beschreibung |
+| 话题 | 负载 | 说明 |
 |-------|---------|-------------|
-| `gw/coordinator/cmd/permit_join` | Sekunden (z. B. `180`) | Pairing-Fenster öffnen, `0` = schließen |
-| `gw/coordinator/cmd/set_channel` | Kanal `11`–`26` | Zigbee-Kanal wechseln |
+| `gw/coordinator/cmd/permit_join` | 秒数（如 `180`） | 开配对窗口，`0` = 关闭 |
+| `gw/coordinator/cmd/set_channel` | 信道 `11`–`26` | 切换 Zigbee 信道 |
 
-**Beispiel – Pairing öffnen:**
+**示例 —— 打开配对：**
+
 ```bash
 mosquitto_pub -h 192.168.178.218 -t gw/coordinator/cmd/permit_join -m 180
 ```
 
 ---
 
-## Skript-Parameter
+## 脚本参数
 
 ```
 serial_gateway.py [--port PORT] [--baud BAUD] [--broker HOST]
@@ -101,45 +109,47 @@ serial_gateway.py [--port PORT] [--baud BAUD] [--broker HOST]
                   [--base BASE_TOPIC]
 ```
 
-| Parameter | Standard | Beschreibung |
+| 参数 | 默认值 | 说明 |
 |-----------|----------|-------------|
-| `--port` | `/dev/ttyACM0` | Serieller Port |
-| `--baud` | `115200` | Baudrate |
-| `--broker` | `192.168.178.218` | MQTT-Broker-Host |
-| `--mqport` | `1883` | MQTT-Port |
-| `--user` | – | MQTT-Benutzername (optional) |
-| `--pass` | – | MQTT-Passwort (optional) |
-| `--base` | `gw/c6serial` | MQTT-Basis-Topic |
+| `--port` | `/dev/ttyACM0` | 串口设备 |
+| `--baud` | `115200` | 波特率 |
+| `--broker` | `192.168.178.218` | MQTT broker 地址 |
+| `--mqport` | `1883` | MQTT 端口 |
+| `--user` | – | MQTT 用户名（可选） |
+| `--pass` | – | MQTT 密码（可选） |
+| `--base` | `gw/c6serial` | MQTT 基础话题 |
 
 ---
 
-## Hardware
+## 硬件
 
-| Komponente | Details |
+| 部件 | 详情 |
 |-----------|---------|
-| Mikrocontroller | ESP32-C6 |
-| USB-ID | `Espressif USB JTAG/serial debug unit` |
+| 微控制器 | ESP32-C6 |
+| USB ID | `Espressif USB JTAG/serial debug unit` |
 | MAC | `B0:A6:04:87:10:E0` |
-| Gerät | `/dev/ttyACM1` (via USB-JTAG) |
-| Sensor | Seeed MR60BHA2 (Atem- & Herzfrequenz) |
-| Protokoll | Zigbee (Koordinator-Modus) |
+| 设备节点 | `/dev/ttyACM1`（走 USB-JTAG） |
+| 传感器 | Seeed MR60BHA2（呼吸与心率） |
+| 协议 | Zigbee（协调器模式） |
 
 ---
 
-## Troubleshooting
+## 排错
 
-**Service startet nicht:**
+**服务起不来：**
+
 ```bash
 journalctl -u zigbee-mqtt-gateway -n 50
 ls -l /dev/serial/by-id/usb-Espressif*
 ```
 
-**Port nicht gefunden** → USB-Kabel prüfen, `lsusb | grep Espressif`
+**找不到端口** → 检查 USB 线，`lsusb | grep Espressif`
 
-**Kein MQTT** → `mosquitto_sub -h 192.168.178.218 -t 'gw/coordinator/#' -v`
+**没有 MQTT 数据** → `mosquitto_sub -h 192.168.178.218 -t 'gw/coordinator/#' -v`
 
-**Pi-Benutzer nicht in dialout:**
+**Pi 用户不在 dialout 组：**
+
 ```bash
 sudo usermod -aG dialout pi
-# danach neu anmelden oder Service neu starten
+# 之后重新登录，或重启服务
 ```

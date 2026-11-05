@@ -1,21 +1,26 @@
-# OTA-Flash ESP32C6 Zigbee-Firmware
+# ESP32-C6 Zigbee 固件的 OTA 刷机
 
-## Voraussetzungen
+> ⚠️ **历史文档**：这里走的是 **ESPHome espota2（TCP 3232）** 那条老路，只在设备
+> 还跑着 ESPHome 固件时可用。首次刷成 Zigbee 固件后 3232 端口就不存在了。
+> 现行刷协调器的方式是 add-on 侧直刷：`POST /api/fw_flash`（esptool，约 2 秒），
+> 见 `CHANGELOG.md` 与 `main/` 相关说明。
 
-- ESP32C6 im gleichen Netzwerk erreichbar (IPv4 bekannt)
-- `esphome` Python-Paket installiert (`pip install esphome`)
-- Firmware-Binary vorhanden: `firmware/zigbee-vital-sensor.bin`
-- ESP32C6 läuft aktuell **ESPHome-Firmware** (Port 3232 offen)
+## 前提
 
-## Schritt 1: Offene Ports prüfen
+- ESP32C6 在同一网络可达（已知 IPv4）
+- 装了 `esphome` Python 包（`pip install esphome`）
+- 固件二进制已就绪：`firmware/zigbee-vital-sensor.bin`
+- ESP32C6 当前跑的是 **ESPHome 固件**（3232 端口开着）
+
+## 第 1 步：探测开放端口
 
 ```bash
 nmap -p 3232,80,8080,8266 <IP>
 ```
 
-Port 3232 (ESPHome OTA) muss `open` sein.
+3232 端口（ESPHome OTA）必须是 `open`。
 
-## Schritt 2: OTA-Protokoll testen
+## 第 2 步：测试 OTA 协议
 
 ```bash
 python3 -c "
@@ -29,9 +34,9 @@ s.close()
 "
 ```
 
-Erwartete Antwort: `['0x0', '0x2']` → RESPONSE_OK, OTA-Version 2.0
+预期返回：`['0x0', '0x2']` → RESPONSE_OK，OTA 版本 2.0
 
-## Schritt 3: Firmware flashen (OTA via espota2)
+## 第 3 步：烧写固件（经 espota2 做 OTA）
 
 ```bash
 python3 -c "
@@ -50,17 +55,17 @@ sock.close()
 "
 ```
 
-Dauer: ca. 8 Sekunden für ~1,47 MB.
+耗时：约 1.47 MB 大致 8 秒。
 
-## Schritt 4: MQTT-Broker-Adresse anpassen
+## 第 4 步：改 MQTT broker 地址
 
-Datei: `main/main.c`, Zeile 21:
+文件：`main/main.c` 第 21 行：
 
 ```c
 #define MQTT_BROKER_URI  "mqtt://192.168.178.218"
 ```
 
-## Schritt 5: Firmware neu bauen
+## 第 5 步：重新编译固件
 
 ```bash
 cd /home/pi/esp32c6-repo
@@ -69,17 +74,17 @@ idf.py build
 cp build/zigbee-vital-sensor.bin firmware/zigbee-vital-sensor.bin
 ```
 
-## Schritt 6: Neu gebaute Firmware flashen
+## 第 6 步：烧写新编译的固件
 
-Schritt 3 wiederholen mit der aktualisierten Binary.
+用更新后的二进制重复第 3 步。
 
-## Wichtiger Hinweis
+## 重要提示
 
-Nach dem ersten Flash auf die **Zigbee-Firmware** ist Port 3232 (ESPHome OTA)
-**nicht mehr verfügbar** — die Zigbee-Firmware implementiert kein ESPHome-OTA.
-Weiterer OTA-Flash nur noch möglich wenn:
-- Die Zigbee-Firmware ein eigenes OTA implementiert, oder
-- Das Gerät per **USB/Seriell** neu geflasht wird:
+第一次刷成 **Zigbee 固件**之后，3232 端口（ESPHome OTA）**就不存在了**——
+Zigbee 固件没有实现 ESPHome OTA。后续想再刷固件只有两条路：
+
+- Zigbee 固件自己实现一套 OTA，或者
+- 用 **USB/串口** 重新烧写：
 
 ```bash
 python3 -m esptool --chip esp32c6 -b 460800 \
@@ -90,13 +95,16 @@ python3 -m esptool --chip esp32c6 -b 460800 \
   0x10000 build/zigbee-vital-sensor.bin
 ```
 
-## WiFi-Credentials
+> 注：现行分区表把 app 放在 `0x20000`（不是这里的 `0x10000`），
+> 且有两份 ota 槽；以上命令仅适用于文档当时那版固件。
 
-In `main/main.c` vor dem Build eintragen (aktuell Platzhalter):
+## WiFi 凭据
+
+编译前在 `main/main.c` 里填（当前是占位符）：
 
 ```c
 #define WIFI_SSID        "DeinNetzwerk"
 #define WIFI_PASSWORD    "DeinPasswort"
 ```
 
-Das Pre-Built-Binary in `firmware/` hatte die echten Credentials kompiliert.
+`firmware/` 里那份预编译二进制当初是把真实凭据编进去的。

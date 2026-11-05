@@ -1,61 +1,66 @@
-# ESP32-C6 Zigbee Gateway – Systembeobachtungen
+# ESP32-C6 Zigbee 网关 —— 系统观察记录
 
-Dokumentiert die tatsächliche Hardware- und Software-Architektur des laufenden Systems
-(Stand: 2026-03-22, Analyse über SSH/MQTT-Monitoring).
+记录当时运行中系统的真实软硬件结构（2026-03-22，通过 SSH/MQTT 监控分析）。
+
+> ⚠️ **历史文档**：文中提到的 `host/serial_gateway.py`（树莓派 systemd 直跑的那份）
+> 已于 2026-11-05 删除（它早已分流、不再同步）。现行部署是 HAOS 上的 add-on，
+> 见 `README.md` / `CHANGELOG.md`。
 
 ---
 
-## Hardware
+## 硬件
 
-### Gerät
-- **ESP32-C6 DevKit** (QFN40, Revision v0.2)
-- Features: Wi-Fi 6, BT 5 (LE), IEEE 802.15.4, Single Core + LP Core, 160 MHz, 40 MHz Crystal
-- **MAC:** `b0:a6:04:87:10:e0`
+### 设备
 
-### Zwei USB-Ports am Devboard
+- **ESP32-C6 DevKit**（QFN40，Revision v0.2）
+- 特性：Wi-Fi 6、BT 5 (LE)、IEEE 802.15.4、单核 + LP 核、160 MHz、40 MHz 晶振
+- **MAC：** `b0:a6:04:87:10:e0`
 
-| Port (Pi-Seite) | USB-Chip | ESP32-C6-Seite | Verwendung |
+### 开发板上的两个 USB 口
+
+| 端口（Pi 侧） | USB 芯片 | ESP32-C6 侧 | 用途 |
 |-----------------|----------|----------------|------------|
-| `/dev/ttyACM0` | CH340 (`usb-1a86_USB_Single_Serial`) | UART0 (Hardware-Brücke) | **Nur Flashen** (esptool) |
-| `/dev/ttyACM1` | USB-JTAG (`usb-Espressif_USB_JTAG_serial_debug_unit`) | USB-JTAG / USB-CDC (built-in) | **Datenkommunikation** (laufender Betrieb) |
+| `/dev/ttyACM0` | CH340（`usb-1a86_USB_Single_Serial`） | UART0（板载硬件桥） | **仅用于烧写**（esptool） |
+| `/dev/ttyACM1` | USB-JTAG（`usb-Espressif_USB_JTAG_serial_debug_unit`） | USB-JTAG / USB-CDC（内置） | **数据通信**（运行期） |
 
-> **Wichtig:** `ttyACM0` (CH340) ist im laufenden Betrieb stumm – kein Output.  
-> Alle JSON-Daten kommen ausschließlich über `ttyACM1` (USB-JTAG).
+> **重要：** `ttyACM0`（CH340）在运行期是哑的——没有任何输出。
+> 所有 JSON 数据只从 `ttyACM1`（USB-JTAG）出来。
 
 ---
 
-## Firmware-Kommunikation (`ha_mqtt.c`)
+## 固件通信（`ha_mqtt.c`）
 
-### Design-Entscheidung
+### 设计取舍
+
 ```c
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y   // IDF-Console = USB-JTAG-Port
-esp_log_set_vprintf(null_vprintf)       // alle ESP_LOGI vollständig stumm
-printf() / fflush(stdout)              // nur sauberes JSON über stdout → ttyACM1
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y   // IDF 控制台 = USB-JTAG 口
+esp_log_set_vprintf(null_vprintf)      // 所有 ESP_LOGI 完全静默
+printf() / fflush(stdout)              // 只有干净的 JSON 经 stdout → ttyACM1
 ```
 
-- **Kein Debug-Müll** auf der Leitung – ausschließlich JSON-Lines
-- `ESP_LOGI`-Ausgaben werden in `null_vprintf` verworfen (inkl. der Boot-Kommentare in `main.c`)
-- Der Kommentar in `main.c` (`UART1 TX=GPIO16 RX=GPIO17`) ist **veraltet** – UART1 wird nicht benutzt
+- 线上**没有调试垃圾**，只有 JSON-Lines
+- `ESP_LOGI` 的输出在 `null_vprintf` 里被丢弃（包括 `main.c` 里的启动注释）
+- `main.c` 里那句注释（`UART1 TX=GPIO16 RX=GPIO17`）**已过时**——UART1 并未使用
 
-### Protokoll C6 → Pi (stdout → ttyACM1)
+### 协议 C6 → Pi（stdout → ttyACM1）
 
-| Message | JSON |
+| 消息 | JSON |
 |---------|------|
-| Boot | `{"t":"boot"}` |
-| Heartbeat (alle 10 s) | `{"t":"heartbeat","uptime":<s>,"ch":<n>,"pan":"0x<hex>"}` |
-| Zigbee-Daten | `{"t":"zigbee","addr":<uint>,"sub":"<name>","p":{...}}` |
-| Permit Join Status | `{"t":"permit_join","p":{"open":true/false,"seconds":<n>}}` |
+| 启动 | `{"t":"boot"}` |
+| 心跳（每 10 s） | `{"t":"heartbeat","uptime":<s>,"ch":<n>,"pan":"0x<hex>"}` |
+| Zigbee 数据 | `{"t":"zigbee","addr":<uint>,"sub":"<name>","p":{...}}` |
+| 配对窗口状态 | `{"t":"permit_join","p":{"open":true/false,"seconds":<n>}}` |
 
-### Protokoll Pi → C6 (stdin ← ttyACM1)
+### 协议 Pi → C6（stdin ← ttyACM1）
 
-| Kommando | JSON |
+| 命令 | JSON |
 |----------|------|
-| Permit Join öffnen | `{"cmd":"permit_join","sec":<n>}` |
-| Kanal wechseln | `{"cmd":"set_channel","ch":<11-26>}` |
+| 开配对窗口 | `{"cmd":"permit_join","sec":<n>}` |
+| 换信道 | `{"cmd":"set_channel","ch":<11-26>}` |
 
 ---
 
-## Systemd-Service
+## systemd 服务
 
 ```ini
 # /etc/systemd/system/zigbee-mqtt-gateway.service
@@ -66,69 +71,69 @@ ExecStart=/usr/bin/python3 -u \
     --base gw/coordinator
 ```
 
-`serial_gateway.py` liest von `ttyACM1` und bridged nach MQTT.
+`serial_gateway.py` 从 `ttyACM1` 读取，并桥接到 MQTT。
 
 ---
 
-## MQTT-Topics (`gw/coordinator/...`)
+## MQTT 话题（`gw/coordinator/...`）
 
-| Topic | Inhalt | Quelle |
+| 话题 | 内容 | 来源 |
 |-------|--------|--------|
-| `gw/coordinator/status` | `online` / `offline` (LWT) | Service-Start / Disconnect |
-| `gw/coordinator/heartbeat` | `{"t":"heartbeat","uptime":...,"ch":...,"pan":"..."}` | Jede Heartbeat-Zeile von ttyACM1 |
-| `gw/coordinator/console` | identisch mit heartbeat-Payload (roh) | **jede** Zeile von ttyACM1 |
-| `gw/coordinator/zigbee/0x<addr>/<sub>` | Sensor-Daten | Zigbee-Events |
-| `gw/coordinator/permit_join` | `{"open":...,"seconds":...}` | Permit-Join-Status |
+| `gw/coordinator/status` | `online` / `offline`（LWT） | 服务启动 / 断连 |
+| `gw/coordinator/heartbeat` | `{"t":"heartbeat","uptime":...,"ch":...,"pan":"..."}` | 每一条来自 ttyACM1 的心跳行 |
+| `gw/coordinator/console` | 与 heartbeat 负载相同（原始） | ttyACM1 的**每一行** |
+| `gw/coordinator/zigbee/0x<addr>/<sub>` | 传感器数据 | Zigbee 事件 |
+| `gw/coordinator/permit_join` | `{"open":...,"seconds":...}` | 配对窗口状态 |
 
-### Bekanntes Problem: `console` = `heartbeat`
+### 已知问题：`console` = `heartbeat`
 
-In `serial_gateway.py` / `dispatch()`:
+在 `serial_gateway.py` 的 `dispatch()` 里：
+
 ```python
 def dispatch(line: str):
-    mq.publish(f"{BASE}/console", line, qos=0)   # ← jede Zeile roh publizieren
+    mq.publish(f"{BASE}/console", line, qos=0)   # ← 每一行原样发布
     ...
     elif t == "heartbeat":
-        mq.publish(f"{BASE}/heartbeat", line, retain=True, qos=1)  # ← nochmal
+        mq.publish(f"{BASE}/heartbeat", line, retain=True, qos=1)  # ← 又发一次
 ```
 
-Da der C6 **nur** strukturiertes JSON sendet (kein Debug-Output), landen Heartbeats
-doppelt – auf `console` und `heartbeat` mit identischem Payload.
+由于 C6 **只**发结构化 JSON（没有调试输出），心跳会落地两次——`console` 和
+`heartbeat` 各一份，负载完全相同。
 
-**Fix:** `mq.publish(f"{BASE}/console", line)` aus `dispatch()` entfernen,
-oder nur Nicht-Heartbeat-Zeilen auf `console` publishen.
+**修法：** 把 `dispatch()` 里的 `mq.publish(f"{BASE}/console", line)` 去掉，
+或者只把非心跳行发到 `console`。
 
 ---
 
-## Flash-Partitionen
+## Flash 分区表
 
-Ausgelesen mit `esptool` von `ttyACM0` (Offset `0x8000`):
+用 `esptool` 从 `ttyACM0` 读出（偏移 `0x8000`）：
 
-| Name | Typ | SubTyp | Offset | Größe |
+| 名称 | 类型 | 子类型 | 偏移 | 大小 |
 |------|-----|--------|--------|-------|
 | `nvs` | data | nvs | `0x9000` | 24 KB |
 | `otadata` | data | ota | `0xf000` | 8 KB |
 | `phy_init` | data | phy | `0x11000` | 4 KB |
-| `ota_0` | app | ota_0 | `0x20000` | 1,75 MB |
-| `ota_1` | app | ota_1 | `0x1e0000` | 1,75 MB |
+| `ota_0` | app | ota_0 | `0x20000` | 1.75 MB |
+| `ota_1` | app | ota_1 | `0x1e0000` | 1.75 MB |
 | `zb_storage` | data | fat | `0x3a0000` | 512 KB |
 | `zb_fct` | data | fat | `0x3a8000` | 64 KB |
 
-- OTA-fähig (zwei App-Slots ota_0 / ota_1)
-- Zigbee-Netzwerk-Persistenz in `zb_storage` (FAT, 512 KB)
-- Zigbee Factory-Calibration in `zb_fct` (FAT, 64 KB)
+- 支持 OTA（两个 app 槽 ota_0 / ota_1）
+- Zigbee 网络持久化在 `zb_storage`（FAT，512 KB）
+- Zigbee 出厂校准在 `zb_fct`（FAT，64 KB）
 
 ---
 
-## Aktive MQTT-Gateways (Überblick)
+## 当时在跑的 MQTT 网关（总览）
 
 ```
 mosquitto_sub -h 192.168.178.218 -t 'gw/#' -v
 ```
 
-| Base-Topic | Gerät | Script | Status |
+| 基础话题 | 设备 | 脚本 | 状态 |
 |------------|-------|--------|--------|
-| `gw/coordinator` | ESP32-C6 DevKit (ttyACM1) | `serial_gateway.py` (Service) | ✅ aktiv |
-| `gw/c6serial` | ESP32-C6 DevKit (ttyACM1) | `c6_serial_gw.py` (kein Service) | ⚠️ veraltet |
-| `gw/c6` | ESP32-C6 DevKit (ttyACM0) | `c6_serial_gw.py` | ❌ offline |
-| `gw/client` | Zigbee-Client-Firmware | — | offline |
-
+| `gw/coordinator` | ESP32-C6 DevKit（ttyACM1） | `serial_gateway.py`（服务） | ✅ 在用 |
+| `gw/c6serial` | ESP32-C6 DevKit（ttyACM1） | `c6_serial_gw.py`（非服务） | ⚠️ 已过时 |
+| `gw/c6` | ESP32-C6 DevKit（ttyACM0） | `c6_serial_gw.py` | ❌ 离线 |
+| `gw/client` | Zigbee 客户端固件 | — | 离线 |
