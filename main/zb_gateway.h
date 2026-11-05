@@ -24,6 +24,15 @@ void zb_gateway_list_devices(void);
 /* Geräteliste als JSON-Array in buf schreiben (thread-safe) */
 void zb_gateway_devices_json(char *buf, size_t len);
 
+/* 设备彻底移除：从 RAM 表 + NVS 副本里删掉，并向设备补发一次 ZDO
+ * Mgmt_Leave（IEEE 已知时才发，失败不影响删除）。
+ * 结果：{"t":"dev_removed","addr":"0x…","ieee":"…","found":bool,"leave":bool}
+ *
+ * 必须在固件侧删，不能只在 add-on 删：每 60 s 的心跳会把本表整份发给
+ * add-on，add-on 的 `t=="lqi"` 处理会用 setdefault 把缺的补回来 ——
+ * 只删 add-on 的话，网页上删掉的设备 60 秒后自己回来。 */
+void zb_gateway_remove_device(uint16_t addr);
+
 /* Zigbee-Kanal setzen (11-26), speichert in NVS und startet neu.
  * Default: 20, Fallback: 25 (beim nächsten Neustart wirksam). */
 void zb_gateway_set_channel(uint8_t ch);

@@ -116,6 +116,11 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         unsigned long a = strtoul(payload, NULL, 0);
         ESP_LOGI(TAG, "node_desc 0x%04x", (uint16_t)a);
         zb_gateway_node_desc((uint16_t)a);
+    } else if (strcmp(cmd, "dev_remove") == 0) {
+        /* payload: "ADDR" – Gerät endgültig aus der Liste (+ NVS-Kopie) nehmen */
+        unsigned long a = strtoul(payload, NULL, 0);
+        ESP_LOGI(TAG, "dev_remove 0x%04x", (uint16_t)a);
+        zb_gateway_remove_device((uint16_t)a);
     } else if (strcmp(cmd, "read_onoff") == 0) {
         /* payload: "ADDR,EP" – On/Off-Attribut aktiv lesen (Zustands-Bestätigung) */
         unsigned long a = strtoul(payload, NULL, 0);

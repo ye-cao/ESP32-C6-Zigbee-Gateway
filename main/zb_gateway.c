@@ -1596,6 +1596,91 @@ void zb_gateway_list_devices(void) {
     xSemaphoreGive(s_dev_mutex);
 }
 
+/* ── Gerät endgültig entfernen (manuell aus der Liste) ──────────────────── */
+/* Anlass: ein Gerät zieht in ein anderes Netz um (oder ist defekt/ausgebaut).
+ *
+ * Warum das überhaupt nötig ist: die Gerätetabelle hier ist die einzige
+ * Quelle, aus der das Add-on seine Geräteliste baut – jeder Heartbeat
+ * (60 s) schickt s_devices als LQI-Array mit, und `t == "lqi"` legt daraus
+ * fehlende Einträge neu an. Ein lokales "Löschen" im Web-UI hält deshalb
+ * exakt 60 Sekunden: die Kachel kommt zurück, weil WIR die tote Adresse
+ * weiter melden. Entfernen muss also hier passieren, nicht im Add-on.
+ *
+ * ★ Grenze: ZBOSS' eigene Nachbar-/Routing-Tabelle räumt dieser Aufruf NICHT
+ *   auf – dafür gibt es in esp-zigbee-lib keine API (kein bdb_dev_remove).
+ *   Ein toter Nachbar fällt dort von selbst raus, wenn das Link-Status-Aging
+ *   zuschlägt. Der Eintrag, der HA und die Weboberfläche speist, ist unserer,
+ *   und genau der muss sauber werden.
+ *
+ * Reihenfolge: erst RAM + NVS (deterministisch, ohne Funk), dann im
+ * Hintergrund Mgmt_Leave_req. Das Leave ist reine Höflichkeit für Geräte,
+ * die noch in unserem Netz hängen; ein Gerät, das schon woanders pairt,
+ * antwortet nie darauf – deshalb darf das Entfernen nicht davon abhängen. */
+static uint16_t s_rm_addr     = 0;
+static uint8_t  s_rm_ieee[8]  = {0};
+static bool     s_rm_has_ieee = false;
+
+static void rm_leave_ack_cb(esp_zb_zdp_status_t status, void *ctx) {
+    ESP_LOGW(TAG, "Mgmt_Leave 0x%04x: status=0x%02x%s",
+             s_rm_addr, (unsigned)status,
+             (status == ESP_ZB_ZDP_STATUS_SUCCESS) ? "" : " (keine Antwort)");
+}
+
+static void rm_leave_task(void *arg) {
+    /* FREMDER Task ⇒ ZBOSS-Lock Pflicht, und nur um den Request herum halten:
+     * ein Gerät, das nicht mehr da ist, lässt den Callback erst nach dem
+     * ZDO-Timeout (mehrere Sekunden) feuern. */
+    if (s_rm_has_ieee && s_zb_ready && esp_zb_lock_acquire(portMAX_DELAY)) {
+        esp_zb_zdo_mgmt_leave_req_param_t req;
+        memset(&req, 0, sizeof(req));
+        memcpy(req.device_address, s_rm_ieee, sizeof(req.device_address));
+        req.dst_nwk_addr    = s_rm_addr;
+        req.rejoin          = 0;   /* endgültig raus, kein Rejoin erlauben */
+        req.remove_children = 0;
+        esp_zb_zdo_device_leave_req(&req, rm_leave_ack_cb, NULL);
+        esp_zb_lock_release();
+    }
+    vTaskDelete(NULL);
+}
+
+void zb_gateway_remove_device(uint16_t addr) {
+    if (addr == 0x0000 || addr >= 0xFFF8) return;   /* Koordinator / Broadcast */
+
+    s_rm_addr     = addr;
+    s_rm_has_ieee = false;
+    memset(s_rm_ieee, 0, sizeof(s_rm_ieee));
+
+    bool found = false;
+    xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (!s_devices[i].used || s_devices[i].short_addr != addr) continue;
+        found = true;
+        if (s_devices[i].ieee[0]) {
+            memcpy(s_rm_ieee, s_devices[i].ieee, sizeof(s_rm_ieee));
+            s_rm_has_ieee = true;
+        }
+        memset(&s_devices[i], 0, sizeof(s_devices[i]));
+    }
+    xSemaphoreGive(s_dev_mutex);
+    devtab_save();
+
+    char ieee_str[24] = "unbekannt";
+    if (s_rm_has_ieee) iv_ieee_str(s_rm_ieee, ieee_str, sizeof(ieee_str));
+
+    char line[160];
+    snprintf(line, sizeof(line),
+             "{\"t\":\"dev_removed\",\"addr\":\"0x%04x\",\"ieee\":\"%s\","
+             "\"found\":%s,\"leave\":%s}",
+             addr, ieee_str,
+             found ? "true" : "false",
+             s_rm_has_ieee ? "true" : "false");
+    ha_mqtt_emit_raw(line);
+    ESP_LOGW(TAG, "Gerät 0x%04x entfernt (war in Tabelle: %s, IEEE: %s)",
+             addr, found ? "ja" : "nein", ieee_str);
+
+    xTaskCreate(rm_leave_task, "dev_leave", 3072, NULL, 2, NULL);
+}
+
 /* ── Channel-Scan (Kanal 11-26, ~4s je Kanal) ──────────────────────────── */
 /* forward decl: library exports zdo variant */
 void esp_zb_zdo_active_scan_request(uint32_t channel_mask, uint8_t scan_duration, esp_zb_zdo_scan_complete_callback_t user_cb);

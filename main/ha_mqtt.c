@@ -211,6 +211,24 @@ static void rx_task(void *arg) {
                 snprintf(payload, sizeof(payload), "%lu", addr);
                 s_cmd_cb("node_desc", payload, strlen(payload));
             }
+        } else if (strstr(buf, "dev_remove")) {
+            /* Gerät endgültig entfernen: {"cmd":"dev_remove","addr":"0x023b"}
+             * payload = "ADDR" – wie node_desc, nur ohne EP.
+             * ★★ Diese Datei ist die zweite Hälfte der Verdrahtung: main.c
+             *    kennt den Befehl allein nicht, hier muss er ebenfalls
+             *    eingetragen werden. Genau daran sind schon node_desc und
+             *    fw_ota_data stumm gestorben ("unknown_cmd" in der Antwort,
+             *    im Log aber nur ein nichtssagender Fehler).
+             *    Der Zweig muss VOR allen anderen stehen, deren Muster
+             *    zufällig als Teilstring passt ("dev_remove" enthält kein
+             *    anderes Kommando, deshalb ist die Position frei wählbar). */
+            const char *pa = json_val(buf, "\"addr\"");
+            if (pa) {
+                unsigned long addr = strtoul((*pa == '"') ? pa + 1 : pa, NULL, 16);
+                char payload[16];
+                snprintf(payload, sizeof(payload), "%lu", addr);
+                s_cmd_cb("dev_remove", payload, strlen(payload));
+            }
         } else if (strstr(buf, "read_onoff")) {
             /* Zustands-Rücklesen: {"cmd":"read_onoff","addr":"0x07da","ep":16}
              * payload = "ADDR,EP" (ADRESS-Modus wie probe)
