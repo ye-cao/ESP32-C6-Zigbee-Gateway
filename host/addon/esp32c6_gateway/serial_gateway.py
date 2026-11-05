@@ -942,10 +942,10 @@ def on_message(client, userdata, msg):
     """Kommandos vom Host → an C6 über Serial weiterleiten."""
     # Echo-Schutz: was wir gerade selbst gesendet haben, ist kein Kommando.
     #
-    # Ausnahme {BASE}/cmd/*: dorthin publiziert das Web-Formular seine Befehle
-    # (permit_join, tx_power …), damit Web und MQTT denselben Weg nehmen.
-    # Ohne die Ausnahme frisst der Schutz genau diese Kommandos – der Knopf
-    # im Web-Frontend tut dann nichts, ohne dass irgendwo etwas zu sehen ist.
+    # 例外 {BASE}/cmd/*：网页表单把命令发到这里
+    # （permit_join、tx_power 等），好让网页和 MQTT 走同一条路径。
+    # 没有这个例外，保护机制正好会吃掉这些命令 —— 网页上的按钮按下去
+    # 什么都不发生，而且哪里都看不到报错。
     if not msg.topic.startswith(f"{BASE}/cmd/") and _self_pub.get(msg.topic, 0) > time.time():
         return
     payload = msg.payload.decode(errors="replace")
@@ -1552,11 +1552,9 @@ def _disc_purge_orphans():
     """Retained Discovery-Configs entfernen, die zu nichts mehr gehören.
 
     Zwei Fälle, beide schon aufgetreten:
-      * Gerät ist nicht mehr da (Kurzadresse unbekannt) → der ganze Satz
-        bleibt sonst als Waise im Broker und in HA als nicht verfügbare
-        Karteileiche stehen.
-      * Endpunkt wurde als reiner Sender eingestuft → ein switch darf dort
-        nicht (mehr) existieren.
+      * 设备已经不在了（短地址未知）→ 否则整套配置会变成孤儿留在 broker 里，
+        在 HA 里留一张"不可用"的僵尸卡片。
+      * 端点被判定为纯发送端 → 那里不该（再）存在 switch。
     """
     if not HA_ENABLED or not _disc_remote:
         return
@@ -2211,12 +2209,12 @@ def _ha_db_hint(addr):
     von echten Schaltern nur über die Beschreibung. Die naheliegenden
     Felder taugen nicht (am 2026-10-17 gegen alle 3188 Einträge geprüft):
 
-      * caps enthält "action": 31 Treffer, darunter MEAZON_BIZY_PLUG,
-        DinRail 1-phase meter, Power switch S1, LK FUGA wiser wireless
-        double relay – alles Geräte MIT Relais. Würde sie zu Panels machen.
-      * endpoints leer: 219 der reinen switch-Modelle haben keine
-        Endpunkt-Map, obwohl sie schalten (Z2M benennt sie nur nicht).
-      * components=switch: 618 Modelle, davon nur 7 mit "scene" im Text.
+      * caps 里含 "action"：31 条命中，其中包括 MEAZON_BIZY_PLUG、
+        DinRail 单相电表、Power switch S1、LK FUGA wiser 无线双联继电器 ——
+        全都是有继电器的设备。按它判会把它们误判成情景面板。
+      * endpoints 为空：219 个纯开关型号没有端点映射，但它们确实能开关
+        （只是 Z2M 没写出来）。
+      * components=switch：618 个型号，其中只有 7 个在文字里带 "scene"。
 
     Und das Gerät, um das es hier geht (FTB56+ZSN18ZY1.1), steht gar nicht
     in der DB – deshalb der Familien-Umweg über _ha_db_family().

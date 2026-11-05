@@ -22,21 +22,20 @@
 #define OTA_IMAGE_TYPE_ENDDEVICE  0x0001
 #define OTA_IMAGE_TYPE_REPEATER   0x0002
 
-/* Erstellt das OTA-Server-Attribut-Cluster (SERVER_ROLE) */
+/* 创建 OTA 服务端的属性簇（SERVER_ROLE） */
 esp_zb_attribute_list_t *zb_ota_server_cluster_create(void);
 
-/* Startet OTA-Session nach ota_start-Kommando vom Pi.
+/* 收到树莓派的 ota_start 命令后开始一个 OTA 会话。
  * image_type 决定这次给哪一类设备推固件（见上面的常量）。 */
 void zb_ota_server_start(uint32_t size, uint32_t version, uint16_t image_type);
 
-/* Liefert einen Daten-Chunk: payload = "OFF,HEX".
- * ★ OFF wird gebraucht, um den Block an der richtigen Stelle im Fenster
- *   abzulegen (vorher wurde stumpf angehängt → Verschiebung bei Retransmit).
- * ★ uint16_t statt uint8_t: ein ota_req holt OTA_FETCH=1024 Bytes
- *   (= 2048 Hex-Zeichen) in einem Rutsch. Mit uint8_t brach das bei 255 ab. */
+/* 送入一块数据：payload = "OFF,HEX"。
+ * ★ 带 OFF 是为了把这块放到窗口里正确的位置（以前是无脑追加 ⇒ 重传时整体错位）。
+ * ★ 参数用 uint16_t 而不是 uint8_t：一次 ota_req 要取 OTA_FETCH=1024 字节
+ *   （= 2048 个十六进制字符），用 uint8_t 到 255 就断了。 */
 void zb_ota_server_feed_data(const char *payload, uint16_t len);
 
-/* Beendet die Session (Client fertig oder abgebrochen) und räumt das Fenster. */
+/* 结束会话（客户端完成或中止），并清空窗口。 */
 void zb_ota_server_stop(void);
 
 /* ★ Der OTA-Callback der SDK liefert KEINEN Datei-Offset (`index` = 镜像表

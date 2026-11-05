@@ -87,7 +87,7 @@ static void dispatch(uint8_t t, uint8_t cmd, const uint8_t *data, uint16_t len) 
     }
 }
 
-/* ── Byte-Parser ────────────────────────────────────────────────────────── */
+/* ── 字节流解析 ─────────────────────────────────────────────────────────── */
 static void parse_byte(uint8_t b) {
     switch (s_state) {
     case S_SOF1:
@@ -141,7 +141,7 @@ static void uart_task(void *arg) {
     }
 }
 
-/* ── Öffentliche API ────────────────────────────────────────────────────── */
+/* ── 对外接口 ───────────────────────────────────────────────────────────── */
 esp_err_t mr60_init(uart_port_t port, int tx_pin, int rx_pin,
                     mr60_callback_t cb) {
     s_port = port;

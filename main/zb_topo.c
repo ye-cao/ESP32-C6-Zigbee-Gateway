@@ -314,14 +314,12 @@ static void mesh_send(uint16_t addr, uint8_t start) {
         mesh_finish();
         return;
     }
-    /* ★★★ 2026-10-26: hier lag der Fehler.
-     * Erst mit zb_buf_begin() in den Puffer geschrieben, aber die Länge blieb
-     * 0 ⇒ ZBOSS hat die Parameter nicht übernommen und mit dst_addr = 0x0000
-     * an SICH SELBST geschickt. Ergebnis: jede "Gerätetabelle" war in
-     * Wahrheit die Nachbartabelle des Koordinators (gleiche Adressen, gleiche
-     * LQI) – und damit die Topologie genauso wertlos wie vorher.
-     * ZB_BUF_GET_PARAM() (= zb_buf_get_tail_func) reserviert den Platz UND
-     * zählt ihn zur Pufferlänge – genau wie esp_zb_zdo_*_req() es intern tut. */
+    /* ★★★ 2026-10-26：坑就在这里。
+     * 当初用 zb_buf_begin() 往缓冲里写，但长度一直是 0 ⇒ ZBOSS 根本没取到参数，
+     * 按 dst_addr = 0x0000 发给了**自己**。结果每一份"设备表"其实是协调器自己的
+     * 邻居表（地址一样、LQI 一样）—— 拓扑跟没做一样。
+     * ZB_BUF_GET_PARAM()（= zb_buf_get_tail_func）既占位又把它算进缓冲长度 ——
+     * 这正是 esp_zb_zdo_*_req() 内部的做法。 */
     zb_zdo_mgmt_lqi_param_t *p =
         ZB_BUF_GET_PARAM((zb_uint8_t)buf, zb_zdo_mgmt_lqi_param_t);
     if (!p) {
@@ -333,7 +331,7 @@ static void mesh_send(uint16_t addr, uint8_t start) {
     p->dst_addr    = addr;
     p->start_index = start;
 
-    /* Rückgabe: ZDP-TSN oder 0xFF, wenn gerade kein ZDP-Transaktion frei ist. */
+    /* 返回：ZDP-TSN；若当前没有空闲的 ZDP 事务则返回 0xFF。 */
     zb_uint8_t tsn = zb_zdo_mgmt_lqi_req((zb_uint8_t)buf, mesh_lqi_cb);
     if (tsn == 0xFF) {
         zb_buf_free(buf);

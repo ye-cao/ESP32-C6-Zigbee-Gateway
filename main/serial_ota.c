@@ -1,10 +1,9 @@
 /*
- * serial_ota.c – Coordinator-Firmware-Update über USB-Serial
+ * serial_ota.c —— 通过 USB 串口给协调器刷固件
  *
- * Die Pi-Seite (serial_gateway.py) hält die Binary und schiebt sie in
- * Blöcken über UART; der C6 schreibt sie via esp_ota in die nächste
- * OTA-Partition (ota_1, wenn aus ota_0 gebootet wurde) und wechselt
- * danach die Boot-Partition. Kein WiFi, kein HTTPS – nur USB-Serial.
+ * 树莓派侧（serial_gateway.py）持有镜像文件，按块经 UART 推下来；C6 用
+ * esp_ota 写进下一个 OTA 分区（从 ota_0 启动时即 ota_1），写完后切换
+ * 启动分区。不走 WiFi、不走 HTTPS —— 只有 USB 串口。
  */
 #include <string.h>
 #include <stdlib.h>
@@ -18,8 +17,8 @@
 #include "serial_ota.h"
 
 #define TAG          "serial_ota"
-#define FW_MAX_CHUNK 1024          /* dekodierte Bytes pro Frame */
-#define FW_ACK_EVERY 16            /* Statusmeldung alle N Blöcke (Flow-Control) */
+#define FW_MAX_CHUNK 1024          /* 每帧解码后的字节数 */
+#define FW_ACK_EVERY 16            /* 每 N 块回报一次状态（流控） */
 
 static esp_ota_handle_t   s_handle;
 static const esp_partition_t *s_part;
@@ -47,7 +46,7 @@ void serial_ota_start(uint32_t size)
         fw_emit("error", "\"why\":\"busy\"");
         return;
     }
-    if (size < 0x10000) {           /* kleiner als 64 KB ist kein App-Image */
+    if (size < 0x10000) {           /* 小于 64 KB 不可能是 App 镜像 */
         fw_emit("error", "\"why\":\"size\"");
         return;
     }
@@ -84,7 +83,7 @@ void serial_ota_data(uint32_t off, const char *hex, int hex_len)
         return;
     }
     if (off != s_written) {
-        /* nur sequenzielles Schreiben – vereinfacht die Fehlerbehandlung */
+        /* 只允许顺序写 —— 这样错误处理最简单 */
         fw_emit("error", "\"why\":\"offset\"");
         return;
     }
@@ -145,7 +144,7 @@ void serial_ota_end(void)
     fw_emit("done", extra);
     ESP_LOGI(TAG, "OTA done – %lu bytes, Neustart …", (unsigned long)s_written);
 
-    /* Zeile noch rauslassen, dann neu starten */
+    /* 先让这一行发出去，再重启 */
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_restart();
 }

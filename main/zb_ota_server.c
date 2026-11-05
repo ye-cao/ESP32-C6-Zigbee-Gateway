@@ -1,34 +1,31 @@
 /*
- * zb_ota_server.c – Zigbee OTA Upgrade Server (Coordinator-Seite)
+ * zb_ota_server.c —— Zigbee OTA 升级服务端（协调器侧）
  *
- * Die Pi-seitige Binary wird über UART nachgeladen:
- *   1. ota_task  sendet {"t":"ota_req","off":O,"sz":S} an Pi
- *   2. Pi antwortet {"cmd":"ota_data","off":O,"data":"HEX"}
- *   3. zb_ota_server_feed_data() dekodiert Hex in das lokale Fenster
- *   4. ota_next_data_cb() (ZBOSS-Task) bedient den Client aus dem Fenster
+ * 镜像由树莓派经 UART 一点点喂上来：
+ *   1. ota_task 给树莓派发 {"t":"ota_req","off":O,"sz":S}
+ *   2. 树莓派回 {"cmd":"ota_data","off":O,"data":"HEX"}
+ *   3. zb_ota_server_feed_data() 把 HEX 解码进本地窗口
+ *   4. ota_next_data_cb()（ZBOSS 任务里）从窗口取数据喂给客户端
  *
- * ══ Zwei Fehlerbilder, die diese Datei erklärt (2026-10-26) ══════════════
+ * ══ 本文件记录的两个坑（2026-10-26）════════════════════════════════════════
  *
- * ★★ 1) Warum der Callback nicht mehr endlos blockiert
- *    Der Callback läuft im ZBOSS-Task. Der Datenlieferant ist rx_task →
- *    on_uart_cmd() → zb_lock(). Wartet der Callback auf ein Semaphor, das
- *    nur der rx_task geben kann, während der rx_task auf die Lock wartet,
- *    die der ZBOSS-Task hält, steht alles für OTA_WAIT_MS still.
- *    Deshalb: on_uart_cmd hält für "ota_data" die Lock NICHT mehr
- *    (main.c), und der Callback bedient sich primär aus dem Fenster.
+ * ★★ 1) 回调为什么不再无限阻塞
+ *    回调跑在 ZBOSS 任务里。数据提供方是 rx_task → on_uart_cmd() → zb_lock()。
+ *    如果回调等一个只有 rx_task 才能给、而 rx_task 又在等 ZBOSS 任务手里的锁的
+ *    信号量，整个流程会卡死 OTA_WAIT_MS 那么久。
+ *    所以：on_uart_cmd 处理 "ota_data" 时**不再持锁**（见 main.c），
+ *    回调则优先直接从窗口里拿数据。
  *
- * ★★ 2) Warum erst vorgeladen und DANN notified wird
- *    Der Client schickt seine erste Image Block Request ~0,5–1 s nach dem
- *    Image Notify. Ist das Fenster dann noch leer, kann der Block nicht
- *    geliefert werden – und ein Fehler-Code vom Callback lässt den Stack
- *    die **ganze Session abbrechen** (Log: ota_srv_status aborted, danach
- *    kommt nur noch der 45-s-Retry, der sofort wieder abbricht).
- *    Deshalb: erst OTA_PRELOAD Bytes holen, dann notify_req().
+ * ★★ 2) 为什么必须先预填再 notify
+ *    客户端在收到 Image Notify 后约 0.5–1 s 就发第一个 Image Block Request。
+ *    这时窗口要是还空的，这一块就交不出来 —— 而回调返回错误码会让协议栈
+ *    **直接中止整个会话**（日志里 `ota_srv_status aborted`，之后只剩 45 s 重试，
+ *    重试一上来又立刻中止）。
+ *    所以：先取够 OTA_PRELOAD 字节，再调 notify_req()。
  *
- * ★★ 3) `index` ist der Bild-Index, NICHT der Datei-Offset
- *    Gemessen 2026-10-26: bei n=1..8 Aufrufen ist idx immer 0, `size`
- *    springt ab dem 2. Aufruf von 8 auf 64. Der Stack will also schlicht
- *    "the NEXT data" – es wird streng sequenziell serviert (s_cur_off).
+ * ★★ 3) `index` 是镜像序号，**不是**文件偏移
+ *    2026-10-26 实测：n=1..8 次调用 idx 恒为 0，`size` 从第 2 次起由 8 跳到 64。
+ *    协议栈要的就是 "the NEXT data" —— 严格顺序供给（靠 s_cur_off）。
  */
 #include <string.h>
 #include <stdlib.h>
@@ -48,15 +45,15 @@
 #define TAG            "ota_srv"
 #define OTA_ENDPOINT   1
 #define OTA_MFR_CODE   0x131B
-#define OTA_IMAGE_TYPE OTA_IMAGE_TYPE_ENDDEVICE   /* Default; per ota_start überschreibbar */
+#define OTA_IMAGE_TYPE OTA_IMAGE_TYPE_ENDDEVICE   /* 默认值；可用 ota_start 覆盖 */
 
-#define OTA_WIN        8192   /* lokales Fenster (Bytes) */
-#define OTA_FETCH      1024   /* pro ota_req vom Pi geholt (Hex = 2048 Zeichen) */
-#define OTA_AHEAD      1024   /* Rest im Fenster < das ⇒ nachladen */
-#define OTA_PRELOAD    2048   /* so viel muß stehen, bevor notified wird */
-#define OTA_MAX_BLOCK   232   /* größte Blockgröße, die ein Client anfordern darf */
-#define OTA_WAIT_MS    6000   /* Timeout für eine Pi-Antwort */
-#define OTA_MISS_MS    2500   /* Notfall-Wartezeit im Callback (nur bei Lücke) */
+#define OTA_WIN        8192   /* 本地窗口大小（字节） */
+#define OTA_FETCH      1024   /* 每次 ota_req 向树莓派取多少字节（HEX 即 2048 字符） */
+#define OTA_AHEAD      1024   /* 窗口剩余量小于此值就补货 */
+#define OTA_PRELOAD    2048   /* notify 之前窗口里至少要积这么多 */
+#define OTA_MAX_BLOCK   232   /* 客户端单次可请求的最大块长 */
+#define OTA_WAIT_MS    6000   /* 等树莓派回一块的超时 */
+#define OTA_MISS_MS    2500   /* 回调里的应急等待（仅缺口时用） */
 #define OTA_DBG_MAX       8
 
 /* ── Zustand ────────────────────────────────────────────────────────────── */
@@ -69,7 +66,7 @@ static uint32_t s_win_off  = 0;
 static uint32_t s_win_len  = 0;
 
 static volatile bool     s_active   = false;
-static volatile bool     s_preload  = false;   /* notify noch nicht raus */
+static volatile bool     s_preload  = false;   /* notify 还没发出去 */
 static volatile uint32_t s_img_size = 0;
 static volatile uint32_t s_cur_off  = 0;
 static volatile bool     s_eof      = false;
@@ -119,9 +116,9 @@ static inline bool win_covers(uint32_t off, uint32_t n)
     return off >= s_win_off && off + n <= s_win_off + s_win_len;
 }
 
-/* ── Vom APS-Indication-Callback gemeldeter Client-Offset ─────────────────
- * Läuft im ZBOSS-Task (Callbacks dürfen die SDK-API ohne Lock benutzen),
- * schreibt hier nur ein paar volatile Variablen – kein Lock, kein Blockieren. */
+/* ── APS 指示回调报上来的客户端偏移 ────────────────────────────────────────
+ * 跑在 ZBOSS 任务里（回调内可以不加锁直接用 SDK API），
+ * 这里只写几个 volatile 变量 —— 不加锁、不阻塞。 */
 void zb_ota_server_note_offset(uint32_t off)
 {
     if (!s_active) return;
@@ -130,7 +127,7 @@ void zb_ota_server_note_offset(uint32_t off)
     s_cli_ok  = true;
 }
 
-/* ── Fenster: Platz schaffen (nur im ota_task) ──────────────────────────── */
+/* ── 窗口：腾出空间（只允许在 ota_task 里调） ───────────────────────────── */
 static void win_compact(void)
 {
     if (OTA_WIN - s_win_len >= OTA_FETCH) return;
@@ -146,26 +143,22 @@ static void win_compact(void)
     s_win_len -= drop;
 }
 
-/* ── Callback: Stack fordert nächsten Chunk (ZBOSS-Task) ────────────────── */
+/* ── 回调：协议栈来要下一块（ZBOSS 任务） ───────────────────────────────── */
 static esp_err_t ota_next_data_cb(esp_zb_ota_zcl_information_t msg,
                                    uint16_t index, uint8_t size, uint8_t **data)
 {
     if (!s_active) return ESP_ERR_INVALID_STATE;
 
     s_cb_n++;
-    /* ★★ `index` ist NICHT der Datei-Offset, sondern der Index des Bildes in
-     *    der OTA-Tabelle – bei einer einzigen Datei konstant 0 (gemessen
-     *    2026-10-26: n=1..8 alle idx=0, sz ab dem 2. Aufruf 64).
-     *    Die API will laut Doku schlicht "the NEXT OTA data", also streng
-     *    sequenziell servieren und selbst mitzählen – ABER (siehe unten)
-     *    nur solange der Client wirklich dort steht, wo wir ihn vermuten. */
+    /* ★★ `index` 不是文件偏移，而是镜像在 OTA 表里的序号 —— 单个镜像时恒为 0
+     *    （2026-10-26 实测：n=1..8 全是 idx=0，`size` 从第 2 次起为 64）。
+     *    文档说这 API 要的就是 "the NEXT OTA data"，所以严格顺序供给、自己计数 ——
+     *    但（见下一段）只在「客户端确实站在我们以为的位置」时才成立。 */
     uint32_t want = s_cur_off;
 
-    /* ── Resync: der Client sagt uns in jeder Block-Anfrage seinen Offset.
-     *    Weicht er von unserem Zeiger ab (Koordinator mittendrin neu
-     *    gestartet, Block-Wiederholung, verlorene Antwort), dann dem Client
-     *    folgen statt blind weiterzuzählen. Sonst schreiben wir dem Client
-     *    die falschen Bytes in seine flash. */
+    /* ── 重新对齐：客户端在每次块请求里都会报自己的偏移。
+     *    一旦跟我们自己的指针不一致（协调器中途重启、块重传、回执丢了），
+     *    就跟着客户端走，而不是闭眼往下数。否则等于把错的字节写进它的 flash。 */
     if (s_cli_ok && s_cli_off != s_cur_off) {
         s_resync++;
         if (s_resync <= OTA_DBG_MAX) {
@@ -176,16 +169,15 @@ static esp_err_t ota_next_data_cb(esp_zb_ota_zcl_information_t msg,
         s_cur_off = s_cli_off;
         want = s_cli_off;
         if (!win_covers(want, size ? size : 1)) {
-            /* Fenster liegt woanders → verwerfen, ota_task lädt ab `want` neu. */
+            /* 窗口不在同一位置 ⇒ 直接丢掉，ota_task 从 `want` 重新装。 */
             s_win_off = want;
             s_win_len = 0;
         }
     }
 
-    /* Am Bildende gibt es keine OTA_MAX_BLOCK Bytes mehr – dann reicht der Rest.
-     * ★ Der Stack liest genau `size` Bytes aus *data, also reicht es, diese
-     *   `size` Bytes im Fenster zu haben (früher wurde OTA_MAX_BLOCK=232
-     *   verlangt ⇒ am Fensterende grundlos 2.5 s gewartet). */
+    /* 镜像末尾凑不满一整块 —— 剩下多少算多少。
+     * ★ 协议栈只会从 *data 读 `size` 个字节，所以窗口里有这 `size` 个就够
+     *   （以前硬要求 OTA_MAX_BLOCK=232 ⇒ 每到窗口末尾就白等 2.5 s）。 */
     uint32_t need = size ? size : 1;
     if (want >= s_img_size)              need = 1;
     else if (want + need > s_img_size)   need = s_img_size - want;
@@ -209,9 +201,9 @@ static esp_err_t ota_next_data_cb(esp_zb_ota_zcl_information_t msg,
         return ESP_OK;
     }
 
-    /* Lücke: kommt mit vorgeladenem Fenster + Vorlauf normalerweise nicht vor.
-     * Notfall: kurz warten (rx_task hält für ota_data keine Lock mehr, die
-     * Daten können also währenddessen ankommen) und es erneut versuchen. */
+    /* 缺口：有预填 + 提前量时一般不会出现。
+     * 应急：短暂等一下（rx_task 处理 ota_data 已经不持锁，数据可以在这期间到达）
+     * 再试一次。 */
     s_miss++;
     if (s_miss <= OTA_DBG_MAX) {
         ota_dbg("\"miss\":%lu,\"off\":%lu,\"win\":[%lu,+%lu)",
@@ -235,13 +227,11 @@ static esp_err_t ota_next_data_cb(esp_zb_ota_zcl_information_t msg,
     return ESP_ERR_NOT_FOUND;
 }
 
-/* ── Chunk vom Pi (rx_task → main.c on_uart_cmd, OHNE Zigbee-Lock) ──────── */
-/* payload = "OFF,HEX". ★ Das OFF wird benutzt, um die Daten an die richtige
- * Stelle im Fenster zu schreiben. Die alte Fassung hat stumpf an s_win_len
- * angehängt – bei einer Wiederholung (Client fragt denselben Block nochmal)
- * oder einem verspäteten Block landete alles verschoben im Puffer, und der
- * Client hat ein stillschweigend kaputtes Image geschrieben (esp_ota_end
- * scheitert dann, ohne dass der Server davon etwas merkt). */
+/* ── 树莓派送来的一块数据（rx_task → main.c on_uart_cmd，**不持** Zigbee 锁）── */
+/* payload = "OFF,HEX"。★ 带 OFF 是为了把数据写到窗口里正确的位置。
+ * 老版本是无脑往 s_win_len 后面追加 —— 一旦出现重传（客户端把同一块再要一次）
+ * 或者迟到的块，整段就错位写进缓冲，客户端于是写出一份**静默损坏**的镜像
+ * （esp_ota_end 会失败，而服务端这边毫无察觉）。 */
 void zb_ota_server_feed_data(const char *payload, uint16_t len)
 {
     if (!s_data_sem || !s_active || len == 0) return;
@@ -253,9 +243,9 @@ void zb_ota_server_feed_data(const char *payload, uint16_t len)
 
     uint32_t n = (len - (uint16_t)(hex - payload)) / 2;
     if (n == 0) return;
-    if (off < s_win_off) return;                       /* für dieses Fenster zu alt */
+    if (off < s_win_off) return;                       /* 对这一窗来说太旧，丢弃 */
     uint32_t rel = off - s_win_off;
-    if (rel + n > OTA_WIN) return;                     /* paßt nicht ins Fenster */
+    if (rel + n > OTA_WIN) return;                     /* 装不进窗口 */
 
     s_rx_n++;
     if (s_rx_n <= 3 || (s_rx_n % 64) == 0) {
@@ -269,7 +259,7 @@ void zb_ota_server_feed_data(const char *payload, uint16_t len)
         s_win[rel + i] = (uint8_t)strtol(h, NULL, 16);
     }
     s_rx_off = off;
-    s_rx_len = n;                  /* s_win_len erst im ota_task erhöhen */
+    s_rx_len = n;                  /* s_win_len 只由 ota_task 抬高 */
     xSemaphoreGive(s_data_sem);
 }
 
@@ -299,7 +289,7 @@ static bool fetch_once(void)
         return false;
     }
     if (s_rx_off != tail) {
-        /* Block gehört nicht an das Fensterende → verwerfen statt falsch einbauen */
+        /* 这一块不属于窗口末尾 ⇒ 宁可丢掉，也不要放错位置 */
         s_bad++;
         ota_dbg("\"badblk\":%lu,\"want\":%lu,\"got\":%lu",
                 (unsigned long)s_bad, (unsigned long)tail, (unsigned long)s_rx_off);
@@ -322,7 +312,7 @@ static void ota_task(void *arg)
             continue;
         }
 
-        /* Phase 1: vorladen, dann erst das Image-Notify rausschicken. */
+        /* 阶段 1：先预填，预填够了才发 Image Notify。 */
         if (s_preload) {
             uint32_t need = s_img_size < OTA_PRELOAD ? s_img_size : OTA_PRELOAD;
             while (s_active && s_preload && s_win_len < need) {
@@ -368,7 +358,7 @@ static void ota_task(void *arg)
 
         /* Phase 2: Vorrat halten. */
         uint32_t tail = s_win_off + s_win_len;
-        if (s_cur_off > tail) {          /* Client sprang über das Fenster hinaus */
+        if (s_cur_off > tail) {          /* 客户端一下跳到窗口之外了 */
             s_win_off = s_cur_off;
             s_win_len = 0;
             tail = s_cur_off;
@@ -414,7 +404,7 @@ static void ota_task(void *arg)
     }
 }
 
-/* ── OTA-Session starten (läuft im rx_task, hält die Zigbee-Lock) ───────── */
+/* ── 开始 OTA 会话（在 rx_task 里跑，持 Zigbee 锁） ─────────────────────── */
 void zb_ota_server_start(uint32_t size, uint32_t version, uint16_t image_type) {
     if (!s_data_sem) s_data_sem = xSemaphoreCreateBinary();
     if (!s_task) xTaskCreate(ota_task, "ota_srv", 3584, NULL, 4, &s_task);
@@ -433,8 +423,8 @@ void zb_ota_server_start(uint32_t size, uint32_t version, uint16_t image_type) {
     s_last_stat_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     s_last_cb = 0;
 
-    /* ★ Noch KEIN notify_req: der ota_task lädt erst OTA_PRELOAD Bytes vor.
-     *   Hier zu warten wäre ein Deadlock (rx_task liefert die Daten selbst). */
+    /* ★ 这里**还不发** notify_req：ota_task 要先预填 OTA_PRELOAD 字节。
+     *   在这里等会死锁（数据正是由当前这个 rx_task 提供的）。 */
     s_active  = true;
     s_preload = true;
     ESP_LOGI(TAG, "OTA vorbereiten: size=%lu ver=%lu type=0x%04x",
@@ -453,7 +443,7 @@ void zb_ota_server_stop(void) {
     s_win_len = 0;
 }
 
-/* ── OTA-Server-Cluster-Attribute erzeugen ───────────────────────────────── */
+/* ── 生成 OTA 服务端簇属性 ──────────────────────────────────────────────── */
 esp_zb_attribute_list_t *zb_ota_server_cluster_create(void)
 {
     esp_zb_attribute_list_t *attr = esp_zb_zcl_attr_list_create(

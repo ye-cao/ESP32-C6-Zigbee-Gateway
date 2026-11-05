@@ -3,9 +3,9 @@
 
 Schneidet die beiden Funktionen aus dem ECHTEN Quelltext und laesst sie
 gegen ein Fake-Serial laufen. Geprueft wird:
-  * welcher Befehl zuerst rausgeht (dev_cmd)
-  * dass ~0.7 s spaeter read_onoff mit richtiger addr/ep folgt
-  * dass der optimistische Echo stimmt (und spaeter ueberschreibbar ist)
+  * 先发出去的是哪条命令（dev_cmd）
+  * 约 0.7 s 之后是否跟着一条 addr/ep 正确的 read_onoff
+  * 乐观回声是否正确（以及之后是否可被覆盖）
 """
 import io, json, os, re, sys, time
 

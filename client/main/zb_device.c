@@ -29,7 +29,7 @@
 
 #define TAG            "zb_dev"
 #define ZB_EP          1
-#define JOIN_RETRY_MS  30000   /* alle 30 s Join-Versuch wenn nicht verbunden */
+#define JOIN_RETRY_MS  30000   /* 未入网时每 30 s 试一次 */
 #define DEFAULT_CH     20
 
 static bool      s_joined      = false;
@@ -38,8 +38,8 @@ static uint8_t   s_channel     = 0;
 static volatile int16_t s_temp_pending = (int16_t)0x8000;
 static volatile uint32_t s_temp_report_ms = 605000UL;  /* 605 s default */
 
-/* Vorwärtsdeklaration */
-static void temp_report_periodic(uint8_t param);   /* 65 s – kurz nach dem 60s-Heartbeat */
+/* 前向声明 */
+static void temp_report_periodic(uint8_t param);   /* 65 s —— 紧跟 60 s 心跳之后 */
 
 /* ── ZCL Attribute Handler ──────────────────────────────────────────────── */
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t id,
@@ -74,7 +74,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t id,
     return ESP_OK;
 }
 
-/* ── Periodischer Join-Watchdog (alle 30 s, wenn nicht verbunden) ───────── */
+/* ── 周期性的入网看门狗（未入网时每 30 s 一次） ─────────────────────────── */
 static void join_retry_alarm(uint8_t param) {
     (void)param;
     if (!s_joined) {
@@ -106,7 +106,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             esp_zb_set_primary_network_channel_set(1U << DEFAULT_CH);
             esp_zb_bdb_start_top_level_commissioning(
                 ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            /* Watchdog starten: alle 30 s Join-Versuch wenn nicht verbunden */
+            /* 启动看门狗：未入网时每 30 s 试一次入网 */
             esp_zb_scheduler_alarm(join_retry_alarm, 0, JOIN_RETRY_MS);
         }
         break;
@@ -158,7 +158,7 @@ static void zb_task(void *arg) {
 
     esp_zb_basic_cluster_cfg_t basic_cfg = { .zcl_version = 3, .power_source = 0x03 };
     esp_zb_attribute_list_t *basic_attr = esp_zb_basic_cluster_create(&basic_cfg);
-    /* ZCL Character String: erstes Byte = Länge */
+    /* ZCL 字符串：第一个字节 = 长度 */
     static const char mfr_str[]   = "\x09Espressif";   /* len=9 */
     static const char model_str[] = "\x0cESP32-C6-ZB";  /* len=12 */
     esp_zb_basic_cluster_add_attr(basic_attr, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)mfr_str);
@@ -183,7 +183,7 @@ static void zb_task(void *arg) {
         esp_zb_on_off_cluster_create(&on_off_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_temperature_meas_cluster_cfg_t temp_cfg = {
-        .measured_value = 0x8000,   /* ungültig */
+        .measured_value = 0x8000,   /* 无效值 */
         .min_value      = -5000,    /* -50°C */
         .max_value      =  8500,    /* +85°C */
     };
@@ -204,7 +204,7 @@ static void zb_task(void *arg) {
 
     esp_zb_core_action_handler_register(zb_action_handler);
 
-    /* Kanal aus NVS lesen, Default 20 */
+    /* 从 NVS 读信道，默认 20 */
     uint8_t ch = 20;
     nvs_handle_t nvs_h;
     if (nvs_open(ZB_NVS_NAMESPACE, NVS_READONLY, &nvs_h) == ESP_OK) {
@@ -218,7 +218,7 @@ static void zb_task(void *arg) {
     esp_zb_main_loop_iteration();
 }
 
-/* ── Öffentliche API ────────────────────────────────────────────────────── */
+/* ── 对外接口 ───────────────────────────────────────────────────────────── */
 void zb_device_start(void) {
     esp_zb_platform_config_t pcfg = {
         .radio_config = { .radio_mode = RADIO_MODE_NATIVE },
@@ -249,7 +249,7 @@ void zb_device_leave(void) {
     esp_zb_zdo_device_leave_req(NULL, true, true);
 }
 
-/* Periodischer Temp-Report – läuft ausschließlich im Zigbee-Task-Kontext */
+/* 周期性温度上报 —— 只在 Zigbee 任务上下文里跑 */
 static void temp_report_periodic(uint8_t param) {
     (void)param;
     if (s_joined) {
@@ -272,11 +272,11 @@ static void temp_report_periodic(uint8_t param) {
         };
         esp_zb_zcl_report_attr_cmd_req(&cmd);
     }
-    /* selbst neu einplanen */
+    /* 自己重新排下一次 */
     esp_zb_scheduler_alarm(temp_report_periodic, 0, s_temp_report_ms);
 }
 
-/* Wird vom Heartbeat-Task aufgerufen: nur Wert schreiben (atomisch für int16) */
+/* 由 heartbeat 任务调用：只写值（int16 写入是原子的） */
 void zb_device_report_temp(int16_t temp_100) {
     s_temp_pending = temp_100;
 }
@@ -312,12 +312,12 @@ void zb_device_set_channel(uint8_t ch) {
     esp_restart();
 }
 
-/* switch2wifi: NVS-Flag setzen + Neustart (aus Zigbee-Action-Handler) */
+/* switch2wifi：置 NVS 标志 + 重启（从 Zigbee action handler 里调） */
 void zb_device_switch2wifi_request(void) {
     wifi_switch_trigger();
 }
 
-/* set_sleep: Intervall setzen + NVS speichern (aus ZCL-Callback) */
+/* set_sleep：设置间隔 + 存进 NVS（从 ZCL 回调里调） */
 void zb_device_set_sleep(uint32_t seconds) {
     if (seconds < 10) seconds = 10;   /* minimum 10s */
     extern volatile uint32_t s_sleep_ms;

@@ -728,7 +728,7 @@ if (!eol) {                     /* Teilzeile -> anpuffern */
     else acc_len = 0;           /* Ueberlauf: verwerfen */
     continue;
 }
-if (acc_len) {                  /* Zeile endet, war aber gestueckelt */
+if (acc_len) {                  /* 行结束了，但前面是被切开的 */
     ... acc + buf zusammenfuehren, zurueck nach buf ...
 }
 ```
@@ -2208,7 +2208,7 @@ xTaskCreate(rx_task, "uart_rx", 2048, NULL, 4, NULL);   // ha_mqtt.c:271
 **修法**：两个缓冲区都改成 `static`（挪进 `.bss`），并按真实上限重新定尺寸：
 
 ```c
-#define LQI_JSON_MAX  1536     /* 32 Geräte à max. 41 B */
+#define LQI_JSON_MAX  1536     /* 32 台设备 × 每台最多 41 B */
 #define LQI_LINE_MAX  (LQI_JSON_MAX + 64)
 void zb_gateway_report_lqi(void) {
     static char buf[LQI_JSON_MAX];

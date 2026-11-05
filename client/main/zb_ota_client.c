@@ -1,9 +1,8 @@
 /*
- * zb_ota_client.c – Zigbee OTA Upgrade Client
+ * zb_ota_client.c —— Zigbee OTA 升级客户端
  *
- * Empfängt Firmware-Chunks via ZCL OTA Upgrade Cluster und
- * schreibt sie sequenziell in die inaktive OTA-Partition.
- * Nach vollständigem Empfang: Partition aktivieren + Neustart.
+ * 通过 ZCL OTA Upgrade 簇接收固件分块，顺序写入空闲的 OTA 分区。
+ * 全部收完后：激活该分区并重启。
  */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -111,10 +110,10 @@ esp_err_t zb_ota_client_handle(const void *message)
     return ret;
 }
 
-/* ── Cluster-Attribute für Client-Endpoint ───────────────────────────────── */
+/* ── 客户端端点的簇属性 ──────────────────────────────────────────────────── */
 esp_zb_attribute_list_t *zb_ota_client_cluster_create(void)
 {
-    /* Aktuelle Firmware-Version als "laufende" Versionsnummer */
+    /* 把当前固件版本当作「正在运行」的版本号 */
     esp_zb_ota_cluster_cfg_t cfg = {
         .ota_upgrade_file_version      = 0x00000001,
         .ota_upgrade_manufacturer      = OTA_MFR_CODE,
@@ -129,7 +128,7 @@ esp_zb_attribute_list_t *zb_ota_client_cluster_create(void)
     esp_zb_attribute_list_t *attr = esp_zb_ota_cluster_create(&cfg);
 
     esp_zb_zcl_ota_upgrade_client_variable_t var = {
-        .timer_query  = 5,    /* alle 5 Minuten nach Update fragen */
+        .timer_query  = 5,    /* 每 5 分钟问一次有没有新固件 */
         .hw_version   = 0x0001,
         .max_data_size = OTA_MAX_DATA,
     };

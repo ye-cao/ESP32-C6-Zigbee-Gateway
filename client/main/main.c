@@ -65,7 +65,7 @@ static float temp_read(void) {
     return raw * 0.0625f;
 }
 
-/* ── Kommando-Handler: Befehle vom Pi ───────────────────────────────────── */
+/* ── 命令处理：来自树莓派的命令 ─────────────────────────────────────────── */
 static void on_cmd(const char *cmd, const char *payload, int len) {
     (void)len;
     if (strcmp(cmd, "leave") == 0) {
@@ -91,7 +91,7 @@ static void heartbeat_task(void *arg) {
         if (temp > -126.0f) {
             zb_device_report_temp((int16_t)(temp * 100.0f));
         } else {
-            /* Sensor nicht vorhanden: invalid-Wert reporten */
+            /* 没装传感器：上报 invalid 值 */
             zb_device_report_temp((int16_t)0x8000);
         }
     }
@@ -139,7 +139,7 @@ void app_main(void) {
 
     temp_sensor_init();
 
-    /* WiFi-Modus falls NVS-Flag gesetzt (Befehl vom Coordinator) */
+    /* 若 NVS 标志已置则进 WiFi 模式（协调器发来的命令） */
     if (wifi_switch_is_pending()) {
         wifi_switch_run();  /* blockiert bis esp_restart() */
     }

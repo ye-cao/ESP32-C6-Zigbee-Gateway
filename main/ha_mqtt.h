@@ -25,9 +25,9 @@ void ha_mqtt_set_cmd_cb(mqtt_cmd_cb_t cb);
 void ha_mqtt_publish_zigbee(uint16_t addr,
                              const char *subtopic,
                              const char *payload);
-/* Wie oben, aber mit Quell-Endpoint (Mehrfach-Geräte / Mehrkanal-Schalter).
- * endpoint <= 1: Topic unverändert "<subtopic>"
- * endpoint  > 1: Topic wird "<epN>/<subtopic>" (z.B. "ep2/on_off") */
+/* 同上，但可指定来源端点（多通道设备 / 多联开关）。
+ * endpoint <= 1：Topic 保持 "<subtopic>" 不变
+ * endpoint  > 1：Topic 变成 "<epN>/<subtopic>"（例如 "ep2/on_off"） */
 void ha_mqtt_publish_zigbee_ep(uint16_t addr,
                                uint8_t endpoint,
                                const char *subtopic,
@@ -40,5 +40,5 @@ const char *ha_mqtt_base_topic(void);
 void        ha_mqtt_logf(const char *tag, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-/* Rohe JSON-Zeile direkt ausgeben (für scan-Ergebnisse) */
+/* 直接吐出一行原始 JSON（用于扫描结果） */
 void ha_mqtt_emit_raw(const char *line);

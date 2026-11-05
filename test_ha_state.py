@@ -223,7 +223,7 @@ check("Web/MQTT-Kommando geht auf die Leitung", line.get("cmd") == "set_tx_power
 check("dBm als Zahl, nicht als String", line.get("dbm") == 14, str(line))
 
 # Eigenes Kommando über MQTT: mq_put markiert das Topic als Selbst-Publish,
-# der Echo-Schutz darf {BASE}/cmd/* trotzdem nicht schlucken.
+# 但回声保护仍然不能把 {BASE}/cmd/* 吞掉。
 ser.written.clear()
 ns["_self_pub"]["gw/coordinator/cmd/set_tx_power"] = time.time() + 30
 on_message(None, None, Msg("gw/coordinator/cmd/set_tx_power", "8"))

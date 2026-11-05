@@ -1,9 +1,9 @@
 /*
- * ha_mqtt.c  –  JSON via USB-JTAG/CDC → ttyACM1
+ * ha_mqtt.c  ——  经 USB-JTAG/CDC 输出 JSON 到 ttyACM1
  *
- * CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y leitet printf()/stdin auf den
- * nativen USB-CDC-Port (ttyACM1). Kein UART-Treiber nötig.
- * IDF-Log wird per null_vprintf stummgeschaltet.
+ * CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 把 printf()/stdin 指向原生 USB-CDC
+ * 端口（ttyACM1），不需要 UART 驱动。
+ * IDF 自身的日志用 null_vprintf 静音。
  */
 #include <stdio.h>
 #include <string.h>
@@ -20,20 +20,18 @@
 
 static mqtt_cmd_cb_t     s_cmd_cb   = NULL;
 
-/* ★★★ 2026-10-25: Senden aus dem ZBOSS-Task entkoppeln.
+/* ★★★ 2026-10-25：把「发送」从 ZBOSS 任务里解耦出去。
  *
- * Vorher hat emit() direkt puts()+fflush() gemacht. Ein 4-KB-JSON (Topologie)
- * blockiert bei 115200 Baud ~350 ms, der ganze Topo-Dump ~1,4 s – und das
- * ALLES im ZBOSS-Task. Der MAC-Layer bekommt in der Zeit keine Iteration,
- * ZBOSS läuft in seine Queues und stirbt:
- *   Guru Meditation (Load access fault) in zb_mac_logic_iteration /
- *   zb_sched_loop_iteration, danach rst:0xc (SW_CPU) – also Reboot.
- * Auch jeder APS-Frame (aps_data_ind_cb) schrieb ~200 B blockierend.
+ * 以前 emit() 直接 puts()+fflush()。一条 4 KB 的 JSON（拓扑）在 115200 波特下
+ * 要阻塞 ~350 ms，整个拓扑 dump ~1.4 s —— 而且**全都在 ZBOSS 任务里**。
+ * 这段时间 MAC 层一次迭代都跑不到，ZBOSS 的队列积压后直接挂：
+ *   Guru Meditation (Load access fault)，落在 zb_mac_logic_iteration /
+ *   zb_sched_loop_iteration，随后 rst:0xc (SW_CPU) —— 也就是重启。
+ * 连每个 APS 帧（aps_data_ind_cb）都在阻塞写 ~200 B。
  *
- * Jetzt: emit() kopiert die Zeile in ein Heap-Block und legt den Zeiger in
- * eine Queue (nie blockierend, bei voller Queue wird verworfen und gezählt).
- * Ein eigener tx_task macht das langsame Schreiben. Der Aufrufer – egal ob
- * ZBOSS-, rx- oder heartbeat-Task – ist sofort wieder frei. */
+ * 现在：emit() 把整行拷到堆上，只把指针塞进队列（永不阻塞，队列满就丢弃并计数），
+ * 由独立的 tx_task 慢慢写。调用方 —— 不管是 ZBOSS、rx 还是 heartbeat 任务 ——
+ * 立刻返回。 */
 #define TX_Q_DEPTH      16
 static QueueHandle_t     s_tx_q      = NULL;
 static volatile uint32_t s_tx_drop   = 0;
@@ -71,10 +69,9 @@ static void emit(const char *line) {
 }
 
 
-/* Liefert einen Zeiger auf den Wert hinter "key" – tolerant gegenüber
- * Leerzeichen nach dem Doppelpunkt. Notwendig, weil json.dumps() (Python)
- * {"addr": "0x07da"} erzeugt: ein starres strstr(buf, "\"addr\":\"") findet
- * dann NICHTS, und der Befehl scheitert stillschweigend. */
+/* 返回 "key" 后面那个值的指针 —— 容忍冒号后的空格。
+ * 必须这么做，因为 Python 的 json.dumps() 产出的是 {"addr": "0x07da"}：
+ * 写死 strstr(buf, "\"addr\":\"") 会**什么都找不到**，命令于是静默失败。 */
 static const char *json_val(const char *buf, const char *key) {
     const char *k = strstr(buf, key);
     if (!k) return NULL;
@@ -90,14 +87,12 @@ static void rx_task(void *arg) {
     char *buf = malloc(BUF_SIZE);
     configASSERT(buf);
 
-    /* Der USB-Serial-JTAG-CDC liefert pro fgets() nur ~64 Byte und fgets()
-     * behandelt das als Zeilenende. Laengere Befehle kamen deshalb nur als
-     * Fragment an: bei fw_ota_data fehlte das schliessende '"', strchr()
-     * fand kein Ende, und der Befehl wurde STILL verworfen. Genau daran ist
-     * das Firmware-OTA reproduzierbar bei 1280 Byte (16 Frames) stehen
-     * geblieben – ohne Fehlermeldung. Kurze Befehle (dev_cmd, 45 Zeichen)
-     * funktionierten, weil alle Felder vor dem Abbruch lagen.
-     * Deshalb: Fragmente sammeln, bis ein Zeilenende ankommt. */
+    /* USB-Serial-JTAG-CDC 每次 fgets() 只给 ~64 字节，而 fgets() 把它当行尾。
+     * 于是长命令只会以碎片到达：fw_ota_data 缺少结尾的 '"'，strchr() 找不到结束，
+     * 整条命令被**静默丢弃**。固件 OTA 每次都稳稳卡在 1280 字节（16 帧）就是
+     * 这么来的 —— 而且一条错误提示都没有。短命令（dev_cmd，45 字符）能用，
+     * 只因为所有字段都落在断点之前。
+     * 所以：先把碎片攒起来，等到真正的行尾再处理。 */
     static char acc[BUF_SIZE];
     size_t acc_len = 0;
 
@@ -109,20 +104,20 @@ static void rx_task(void *arg) {
         size_t raw = strlen(buf);
         int eol = (raw > 0 && (buf[raw-1] == '\n' || buf[raw-1] == '\r'));
 
-        /* Zeilenende entfernen */
+        /* 去掉行尾换行 */
         size_t n = raw;
         while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
 
-        if (!eol) {                      /* Teilzeile -> anpuffern */
+        if (!eol) {                      /* 半行 ⇒ 先缓存 */
             if (acc_len + n < sizeof(acc)) {
                 memcpy(acc + acc_len, buf, n);
                 acc_len += n;
             } else {
-                acc_len = 0;             /* Ueberlauf: verwerfen */
+                acc_len = 0;             /* 溢出：整段丢弃 */
             }
             continue;
         }
-        if (acc_len) {                   /* Zeile endet, war aber gestueckelt */
+        if (acc_len) {                   /* 行结束了，但前面是被切开的 */
             if (acc_len + n >= sizeof(acc)) {
                 acc_len = 0;
                 continue;
@@ -142,14 +137,14 @@ static void rx_task(void *arg) {
             if (p) snprintf(secs_str, sizeof(secs_str), "%d", atoi(p + 6));
             s_cmd_cb("permit_join", secs_str, strlen(secs_str));
         } else if (strstr(buf, "fw_ota_start")) {
-            /* Coordinator-Firmware-Update – muss VOR ota_start stehen,
-             * weil "fw_ota_start" den Substring "ota_start" enthält */
+            /* 协调器固件更新 —— 必须排在 ota_start 前面，
+             * 因为 "fw_ota_start" 里含有子串 "ota_start" */
             char *ps = strstr(buf, "\"size\":");
             char payload[16] = "";
             if (ps) snprintf(payload, sizeof(payload), "%ld", atol(ps + 7));
             s_cmd_cb("fw_ota_start", payload, strlen(payload));
         } else if (strstr(buf, "fw_ota_data")) {
-            /* payload = "OFF,HEX" (Hex kann ~900 Zeichen haben → static) */
+            /* payload = "OFF,HEX"（HEX 可能 ~900 字符 ⇒ 必须 static） */
             const char *po = json_val(buf, "\"off\"");
             char *pd = (char *)json_val(buf, "\"data\"");
             if (po && pd) {
@@ -171,11 +166,10 @@ static void rx_task(void *arg) {
         } else if (strstr(buf, "fw_ota_end")) {
             s_cmd_cb("fw_ota_end", "", 0);
         } else if (strstr(buf, "dev_cmd")) {
-            /* Gerätesteuerung: {"cmd":"dev_cmd","addr":"0x07da","ep":16,"sw":"on"}
-             * payload = "ADDR,EP,CMD"   CMD: 0=off 1=on 2=toggle
-             * ACHTUNG: Aktion heißt "sw" NICHT "cmd" – sonst findet
-             * strstr() zuerst das führende {"cmd":"dev_cmd",…} und jede
-             * Aktion würde zu "on". */
+            /* 设备控制：{"cmd":"dev_cmd","addr":"0x07da","ep":16,"sw":"on"}
+             * payload = "ADDR,EP,CMD"   CMD：0=关 1=开 2=翻转
+             * 注意：动作字段叫 "sw" 而**不是** "cmd" —— 否则 strstr() 会先命中
+             * 开头的 {"cmd":"dev_cmd",…}，每个动作都被当成 "on"。 */
             const char *pa = json_val(buf, "\"addr\"");
             const char *pe = json_val(buf, "\"ep\"");
             const char *pc = json_val(buf, "\"sw\"");
@@ -184,14 +178,14 @@ static void rx_task(void *arg) {
                 const char *sv = (*pc == '"') ? pc + 1 : pc;
                 char payload[32];
                 int ep  = atoi(pe);
-                int cid = 1;                                  /* default: on */
+                int cid = 1;                                  /* 默认：开 */
                 if (strncmp(sv, "off", 3) == 0)         cid = 0;
                 else if (strncmp(sv, "toggle", 6) == 0) cid = 2;
                 snprintf(payload, sizeof(payload), "%lu,%d,%d", addr, ep, cid);
                 s_cmd_cb("dev_cmd", payload, strlen(payload));
             }
         } else if (strstr(buf, "probe")) {
-            /* Modellabfrage: {"cmd":"probe","addr":"0x07da","ep":1}
+            /* 型号探测：{"cmd":"probe","addr":"0x07da","ep":1}
              * payload = "ADDR,EP" */
             const char *pa = json_val(buf, "\"addr\"");
             const char *pe = json_val(buf, "\"ep\"");
@@ -202,8 +196,8 @@ static void rx_task(void *arg) {
                 s_cmd_cb("probe", payload, strlen(payload));
             }
         } else if (strstr(buf, "node_desc")) {
-            /* Node-Descriptor: {"cmd":"node_desc","addr":"0x07da"}
-             * payload = "ADDR" – klärt, ob das Gerät als Router (ZR) arbeitet. */
+            /* 节点描述符：{"cmd":"node_desc","addr":"0x07da"}
+             * payload = "ADDR" —— 用来确认这台设备是不是以路由器（ZR）身份工作。 */
             const char *pa = json_val(buf, "\"addr\"");
             if (pa) {
                 unsigned long addr = strtoul((*pa == '"') ? pa + 1 : pa, NULL, 16);
@@ -212,16 +206,13 @@ static void rx_task(void *arg) {
                 s_cmd_cb("node_desc", payload, strlen(payload));
             }
         } else if (strstr(buf, "dev_remove")) {
-            /* Gerät endgültig entfernen: {"cmd":"dev_remove","addr":"0x023b"}
-             * payload = "ADDR" – wie node_desc, nur ohne EP.
-             * ★★ Diese Datei ist die zweite Hälfte der Verdrahtung: main.c
-             *    kennt den Befehl allein nicht, hier muss er ebenfalls
-             *    eingetragen werden. Genau daran sind schon node_desc und
-             *    fw_ota_data stumm gestorben ("unknown_cmd" in der Antwort,
-             *    im Log aber nur ein nichtssagender Fehler).
-             *    Der Zweig muss VOR allen anderen stehen, deren Muster
-             *    zufällig als Teilstring passt ("dev_remove" enthält kein
-             *    anderes Kommando, deshalb ist die Position frei wählbar). */
+            /* 彻底删除设备：{"cmd":"dev_remove","addr":"0x023b"}
+             * payload = "ADDR" —— 跟 node_desc 一样，只是不要 EP。
+             * ★★ 本文件是接线的另一半：光在 main.c 里认识这个命令没用，
+             *    这里也必须登记。node_desc 和 fw_ota_data 就是这么「静默死亡」的
+             *    （回执是 "unknown_cmd"，日志里只有一句无信息的报错）。
+             *    这个分支要放在「模式恰好是其子串」的分支之前
+             *    （"dev_remove" 不含别的命令名，所以位置可以随便挑）。 */
             const char *pa = json_val(buf, "\"addr\"");
             if (pa) {
                 unsigned long addr = strtoul((*pa == '"') ? pa + 1 : pa, NULL, 16);
@@ -230,9 +221,9 @@ static void rx_task(void *arg) {
                 s_cmd_cb("dev_remove", payload, strlen(payload));
             }
         } else if (strstr(buf, "read_onoff")) {
-            /* Zustands-Rücklesen: {"cmd":"read_onoff","addr":"0x07da","ep":16}
-             * payload = "ADDR,EP" (ADRESS-Modus wie probe)
-             * Nötig, weil das Endgerät auf Fernbefehle keinen Report schickt. */
+            /* 回读开关状态：{"cmd":"read_onoff","addr":"0x07da","ep":16}
+             * payload = "ADDR,EP"（寻址方式同 probe）
+             * 必须回读，因为终端设备收到远程命令后不会主动上报。 */
             const char *pa = json_val(buf, "\"addr\"");
             const char *pe = json_val(buf, "\"ep\"");
             if (pa && pe) {
@@ -282,18 +273,16 @@ static void rx_task(void *arg) {
             }
             s_cmd_cb("set_dev_power", payload, strlen(payload));
         } else if (strstr(buf, "set_tx_power")) {
-            /* Sendeleistung zur Laufzeit: {"cmd":"set_tx_power","dbm":14}
-             * payload = "14"  (dBm). Erlaubt, die Leistung ohne Neuflashen
-             * zu variieren und den wirksamen Wert zurückzumelden. */
+            /* 运行期改发射功率：{"cmd":"set_tx_power","dbm":14}
+             * payload = "14"（dBm）。这样不重新刷机也能调功率，并回报实际生效值。 */
             char *p = strstr(buf, "\"dbm\":");
             char val[8] = "20";
             if (p) snprintf(val, sizeof(val), "%d", atoi(p + 6));
             s_cmd_cb("set_tx_power", val, strlen(val));
         } else if (strstr(buf, "\"lqi\"")) {
-            /* Momentaufnahme LQI/RSSI: {"cmd":"lqi"}
-             * Nur auf Anfrage – im Heartbeat steht dieselbe Liste, aber der
-             * Wert gilt für den letzten empfangenen Frame und ist nach 60 s
-             * unter Umständen längst überholt. */
+            /* 即时取一次 LQI/RSSI：{"cmd":"lqi"}
+             * 只在按需时用 —— 心跳里带的是同一份列表，但那是「最后一个收到的帧」的值，
+             * 60 s 之后很可能早就过期了。 */
             s_cmd_cb("lqi", "", 0);
         } else if (strstr(buf, "ota_start")) {
             /* {"cmd":"ota_start","size":N,"ver":V,"type":0x0002}
@@ -317,20 +306,16 @@ static void rx_task(void *arg) {
             }
             s_cmd_cb("ota_start", payload, strlen(payload));
         } else if (strstr(buf, "ota_data")) {
-            /* ★★ json_val statt strstr("\"data\":\"") (2026-10-26).
-             * Der Pi schickt die Blöcke mit json.dumps(), das erzeugt
+            /* ★★ 用 json_val 而不是 strstr("\"data\":\"")（2026-10-26）。
+             * 树莓派用 json.dumps() 发块，产出的是
              *      {"cmd": "ota_data", "off": 0, "data": "1f8b..."}
-             * – mit Leerzeichen nach dem Doppelpunkt. Das starre Muster
-             * "\"data\":\"" findet darin NICHTS, der Block wurde also
-             * stillschweigend verworfen. Symptom: der Server schickt
-             * brav ota_req, der Pi antwortet brav, der C6 wartet 6 s
-             * und bekommt nie Daten → OTA steht bei 8 / 610976 Bytes,
-             * danach bricht der Client ab und fragt alle 45 s erneut. */
-            /* ★ payload wird "OFF,HEX" – das OFF braucht die Firmware, um den
-             * Block an der richtigen Stelle im Fenster abzulegen. Ohne Offset
-             * wurde stumpf angehängt: eine Wiederholung des Clients (gleicher
-             * Block nochmal) verschob damit alles Folgende, und der Client
-             * schrieb ein still kaputtes Image. */
+             * —— 冒号后面有空格。写死的 "\"data\":\"" 在里面**什么都找不到**，
+             * 于是每一块都被静默丢弃。症状：服务端老老实实发 ota_req，
+             * 树莓派老老实实回，C6 等 6 s 永远拿不到数据 ⇒ OTA 卡在 8 / 610976 字节，
+             * 之后客户端超时放弃，每 45 s 再来问一次。 */
+            /* ★ payload 变成 "OFF,HEX" —— 固件需要 OFF 才能把这一块放到窗口里
+             * 正确的位置。没有偏移时是无脑追加：客户端一旦重传（把同一块再要一遍），
+             * 后面所有内容整体错位，客户端于是写出一份静默损坏的镜像。 */
             char *pd = (char *)json_val(buf, "\"data\"");
             const char *po = json_val(buf, "\"off\"");
             if (pd && po && *pd == '"') {
@@ -351,10 +336,9 @@ static void rx_task(void *arg) {
         } else if (strstr(buf, "ota_stop")) {
             s_cmd_cb("ota_stop", "", 0);
         } else if (strstr(buf, "\"cmd\"")) {
-            /* Unbekanntes Kommando NICHT stillschweigend verwerfen.
-             * Genau daran sind schon zwei Fehler stumm gestorben:
-             * fw_ota_data (Kapitel 11) und node_desc (Befehl war in main.c
-             * vorhanden, hier aber nicht verdrahtet → gar keine Ausgabe). */
+            /* 未知命令**不要**静默丢弃。
+             * 已经有两个 bug 就是这么无声无息死掉的：fw_ota_data、
+             * node_desc（main.c 里有这个命令，这里没接线 ⇒ 一点输出都没有）。 */
             const char *pc = strstr(buf, "\"cmd\":\"");
             char name[24] = "?";
             if (pc) {
@@ -379,23 +363,23 @@ esp_err_t ha_mqtt_init(const char *broker_uri,
                        const char *password) {
     (void)broker_uri; (void)username; (void)password;
 
-    /* ★★★ 2026-10-25: Sendepfad entkoppeln (siehe Kommentar bei emit()).
-     * Reihenfolge ist wichtig: Queue MUSS vor dem ersten emit() existieren,
-     * sonst wird die Boot-Zeile stillschweigend verworfen. */
+    /* ★★★ 2026-10-25：解耦发送路径（见 emit() 处的注释）。
+     * 顺序很重要：队列**必须**在第一次 emit() 之前建好，
+     * 否则连开机那行都会被静默丢掉。 */
     s_tx_q = xQueueCreate(TX_Q_DEPTH, sizeof(char *));
     configASSERT(s_tx_q);
-    /* 4096 B reichen: tx_task hält nur einen Zeiger + libc-Puffer. */
+    /* 4096 B 够用：tx_task 只持一个指针 + libc 缓冲。 */
     xTaskCreate(tx_task, "uart_tx", 4096, NULL, 3, NULL);
 
-    /* IDF-Log stummschalten – nur unser JSON auf ttyACM1 */
+    /* 关掉 IDF 自己的日志 —— ttyACM1 上只留我们的 JSON */
     esp_log_set_vprintf(null_vprintf);
 
-    /* ★ 2048 → 4096: rx_task läuft durch on_uart_cmd → zb_gateway_* und
-     * braucht für JSON-Zerlegung + snprintf mehr Luft als der reine
-     * fgets()-Pfad. Stack ist billig, ein Überlauf kostet einen Reboot. */
+    /* ★ 2048 → 4096：rx_task 会一路走到 on_uart_cmd → zb_gateway_*，
+     * JSON 拆分 + snprintf 比单纯的 fgets() 路径要费栈。
+     * 栈很便宜，溢出一次就是一次重启。 */
     xTaskCreate(rx_task, "uart_rx", 4096, NULL, 4, NULL);
 
-    /* Kurz warten bis USB-CDC bereit */
+    /* 稍等一下，等 USB-CDC 就绪 */
     vTaskDelay(pdMS_TO_TICKS(500));
     emit("{\"t\":\"boot\"}");
     return ESP_OK;

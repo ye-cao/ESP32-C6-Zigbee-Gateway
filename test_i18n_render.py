@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Render-Smoketest: laedt beide serial_gateway.py mit gemockten
-serial/paho-Abhaengigkeiten, fuellt _state und rendert Dashboard +
-Geraeteseite. Prueft auf chinesische Texte und deutsche Reste."""
+"""渲染冒烟测试：用 mock 的 serial/paho 依赖加载 serial_gateway.py，
+填入 _state 后渲染仪表盘 + 设备页。检查中文文案是否齐全、有没有德语残留。
+
+注意：host/serial_gateway.py（树莓派 systemd 那一份）已于 2026-11-05 删除
+（已分流、长期不再同步），所以这里只测 add-on 里的那份。"""
 import sys, types, importlib.util, io, os
 
 # ── Mocks: serial ──
@@ -127,7 +129,6 @@ CHINESE_EXPECT = ["在线", "允许加入", "Zigbee 设备", "运行时间", "�
 fail = 0
 for path, name in [
     ("host/addon/esp32c6_gateway/serial_gateway.py", "sg_addon"),
-    ("host/serial_gateway.py", "sg_up"),
 ]:
     print(f"== {path}")
     try:

@@ -1,6 +1,6 @@
 /*
  * ha_mqtt.c  –  USB Serial JTAG (/dev/ttyACM0) JSON-Lines Bridge
- *               Gleiche Lösung wie Coordinator – printf + null_vprintf
+ *               做法跟协调器一样 —— printf + null_vprintf
  *
  * C6 → Pi: {"t":"boot"}  {"t":"joined",...}  {"t":"attr",...}  {"t":"heartbeat",...}
  * Pi → C6: {"cmd":"leave"}  {"cmd":"set_onoff","v":1}  {"cmd":"permit_join","sec":60}
@@ -15,7 +15,7 @@
 #include "esp_log.h"
 #include "ha_mqtt.h"
 
-/* Compile-Zeit-Datum aus __DATE__ ("Mar 25 2026") → "2026-03-25" */
+/* 把编译期日期 __DATE__（"Mar 25 2026"）转成 "2026-03-25" */
 static const char *_build_date(void) {
     static char s[11];
     if (s[0]) return s;

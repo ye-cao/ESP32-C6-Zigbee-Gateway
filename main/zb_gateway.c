@@ -39,21 +39,20 @@
 /* 中继上报的父节点。0xFFFF = 还没收到过。仅作展示/拓扑用。 */
 static uint16_t s_rep_parent = 0xFFFF;
 
-/* ── Gerätedatenbank (nur Adress-Tracking, kein Name) ───────────────────── */
-/* Netzgröße = Tabellengröße. esp_zb_overall_network_size_set() (SDK ≥1.2.2)
- * dimensioniert Nachbar- und Routing-Tabelle der ZBOSS-Stack-Lib auf diesen
- * Wert; Default ist 64, vorher waren hier hart 32 verdrahtet – mehr ließ die
- * Bibliothek (1.0.9, feste Tabellen) gar nicht zu. MUSS vor esp_zb_init()
- * gesetzt werden, danach ist es wirkungslos. */
+/* ── 设备表（只跟踪地址，不存名字） ─────────────────────────────────────── */
+/* 网络规模 = 表的容量。esp_zb_overall_network_size_set()（SDK ≥1.2.2）按这个值
+ * 给 ZBOSS 库分配邻居表和路由表；默认 64，早先这里硬写 32 —— 老库（1.0.9，
+ * 表大小固定）本来也放不下更多。**必须在 esp_zb_init() 之前**设置，
+ * 之后再调没有任何效果。 */
 #define MAX_DEVICES ZB_GATEWAY_MAX_DEVICES
 typedef struct {
     uint16_t short_addr;
     uint8_t  ieee[8];
     bool     used;
-    bool     interviewed;   /* Interview (Bind/Reporting) schon durchgeführt */
-    uint8_t  lqi;   /* letzte LQI vom APS-Layer (0 = noch nie ein gültiger Wert) */
-    int8_t   rssi;  /* letzte RSSI vom IEEE 802.15.4 Layer (dBm) */
-    uint32_t lqi_ms; /* wann lqi/rssi zuletzt aktualisiert wurden (ms seit Boot) */
+    bool     interviewed;   /* 已完成 Interview（Bind/Reporting） */
+    uint8_t  lqi;   /* APS 层给的最后一次 LQI（0 = 还没拿到过有效值） */
+    int8_t   rssi;  /* IEEE 802.15.4 层给的最后一次 RSSI（dBm） */
+    uint32_t lqi_ms; /* lqi/rssi 最后一次更新的时间（开机后的毫秒数） */
     char     mfr[33];   /* Basic 0x0004 ManufacturerName */
     char     model[33]; /* Basic 0x0005 ModelIdentifier */
 } zb_device_t;
@@ -62,9 +61,9 @@ static zb_device_t  s_devices[MAX_DEVICES];
 static SemaphoreHandle_t s_dev_mutex;
 static volatile int8_t  s_last_rssi = 0;
 
-/* Erst true, wenn esp_zb_start() durch ist (siehe zb_task).
- * Der uart_rx-Task läuft schon vorher → alle öffentlichen Einstiegspunkte
- * müssen das abfragen, sonst NULL-Deref in ZBOSS. */
+/* 只有 esp_zb_start() 走完之后才置 true（见 zb_task）。
+ * uart_rx 任务比它先跑起来 ⇒ 所有对外入口都必须先查这个标志，
+ * 否则会在 ZBOSS 里空指针解引用。 */
 static volatile bool s_zb_ready = false;
 
 static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
@@ -84,16 +83,14 @@ static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
     return NULL;
 }
 
-/* ── Persistenz der Gerätetabelle ─────────────────────────────────────────
- * ZBOSS legt Netzwerkschlüssel, PAN, Kanal und die Adresstabelle selbst im
- * NVRAM ab (Partition zb_storage) und setzt das Netz beim Boot fort, solange
- * niemand nvram_erase_at_start setzt. Unsere eigene Tabelle (Kurzadresse +
- * IEEE für LQI-Snapshot und Interview) war dagegen reiner RAM: nach einem
- * Neustart war sie leer, bis jedes Gerät erneut einen Device-Announce
- * schickte – schlafende Endgeräte brauchen dafür Stunden.
- * Deshalb hier eine kleine NVS-Kopie. interviewed wird beim Laden bewusst
- * auf false gesetzt: das Interview läuft erst, wenn das Gerät wieder
- * antwortet, sonst würden Bind/Reporting ins Leere gehen. */
+/* ── 设备表的持久化 ───────────────────────────────────────────────────────
+ * 网络密钥、PAN、信道和地址表 ZBOSS 自己会存进 NVRAM（分区 zb_storage），
+ * 只要没人设 nvram_erase_at_start，开机就接着用原来的网络。
+ * 但我们这张表（短地址 + IEEE，用于 LQI 快照和 Interview）以前纯在 RAM 里：
+ * 一重启就空了，得等每台设备重新发一次 Device-Announce —— 睡眠终端设备
+ * 等这个要几个小时。
+ * 所以这里存一份 NVS 副本。载入时 interviewed 故意置 false：Interview 要等
+ * 设备重新应答之后才跑，否则 Bind/Reporting 全是空打。 */
 #define DEVTAB_MAGIC   0x44425531u   /* 'DBU1' */
 #define DEVTAB_KEY     "devtab"
 
@@ -103,8 +100,8 @@ typedef struct {
     struct { uint16_t addr; uint8_t ieee[8]; } e[MAX_DEVICES];
 } __attribute__((packed)) devtab_blob_t;
 
-/* Statisch, nicht auf dem Stack: Aufruf erfolgt im ZB-Task, aber die
- * Stack-Budget-Regel dieses Projekts gilt einheitlich (s. LQI-Puffer). */
+/* 用静态变量而不是栈上：虽然是在 ZB 任务里调用，但本项目的栈预算规则
+ * 一律适用（参见 LQI 缓冲那段）。 */
 static devtab_blob_t s_devtab;
 
 static void devtab_save(void) {
@@ -114,8 +111,8 @@ static void devtab_save(void) {
     s_devtab.count = 0;
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
     for (int i = 0; i < MAX_DEVICES; i++) {
-        /* IEEE 0 ist "noch nicht aufgelöst" – solche Einträge bringen nach
-         * dem Neustart nichts, weil ohne IEEE kein Interview möglich ist. */
+        /* IEEE 为 0 表示"还没解析出来" —— 这种条目重启后没有任何用，
+         * 因为拿不到 IEEE 就做不了 Interview。 */
         if (!s_devices[i].used || s_devices[i].ieee[0] == 0) continue;
         s_devtab.e[s_devtab.count].addr = s_devices[i].short_addr;
         memcpy(s_devtab.e[s_devtab.count].ieee, s_devices[i].ieee, 8);
@@ -150,25 +147,22 @@ static void devtab_load(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
-/*  Interview nach Join: Active-EP → Simple-Desc → Bind → Configure-Reporting  */
+/*  入网后的 Interview：Active-EP → Simple-Desc → Bind → Configure-Reporting   */
 /*                                                                             */
-/*  Hintergrund: Ein „nackter“ Coordinator, der nach dem Join nichts weiter     */
-/*  tut, wird von vielen Endgeräten nach ~1 Minute aufgegeben – sie verlassen  */
-/*  das Netzwerk wieder (Symptom: „pairt erfolgreich, ist aber kurz darauf      */
-/*  wieder ungepairt“). Echte Gateways (Xiaomi / Hue / …) führen nach dem      */
-/*  Join die Standard-Sequenz aus: aktive Endpoints abfragen →                 */
-/*  Simple-Descriptor lesen → Bindings anlegen → Attribute-Reporting           */
-/*  konfigurieren. Genau das macht dieser Block.                                */
+/*  背景：一个"裸"协调器在设备入网后什么都不做，很多终端设备约 1 分钟后就会     */
+/*  放弃并退网（症状：「配对成功，但转眼又变未配对」）。真正的网关               */
+/*  （小米 / Hue / …）入网后都会走标准流程：查活动端点 →                        */
+/*  读 Simple Descriptor → 建 Binding → 配置属性上报。                          */
+/*  下面这一段干的就是这件事。                                                  */
 /* ══════════════════════════════════════════════════════════════════════════ */
 
 #define IV_MAX_EPS      8
 #define IV_MAX_CLUSTERS 16
 
-/* Server-Cluster (Input) des Endgeräts → an den Coordinator binden und
- * Reporting auf das Hauptattribut konfigurieren.
- * ACHTUNG: attr == IV_NO_REPORT (0xFFFF) → nur binden. 0x0000 ist eine
- * gültige Attribut-ID (On/Off, Temperatur, Feuchte, … primäres Attribut) –
- * der frühere Check `if (attr)` hat alle diese Cluster nie gemeldet! */
+/* 终端设备的 Server 簇（Input）→ 绑到协调器上，并给主属性配上报。
+ * 注意：attr == IV_NO_REPORT（0xFFFF）时**只绑定**。0x0000 是合法的属性 ID
+ * （On/Off、温度、湿度…… 都是各自的主属性）—— 以前写 `if (attr)` 判断，
+ * 结果这些簇一个都没配上上报！ */
 #define IV_NO_REPORT 0xFFFFu
 typedef struct {
     uint16_t cluster;
@@ -190,8 +184,8 @@ static const iv_report_cfg_t s_iv_input[] = {
     { ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,             0x0020, ESP_ZB_ZCL_ATTR_TYPE_U8,     300, 3600, 1 },
 };
 
-/* Client-Cluster (Output) des Endgeräts → nur binden (Tastenbefehle,
- * Szenen, Gruppen landen dann als ZCL-Command beim Coordinator). */
+/* 终端设备的 Client 簇（Output）→ 只绑定（按键命令、场景、组播
+ * 之后就会以 ZCL Command 的形式送到协调器）。 */
 static const uint16_t s_iv_output[] = {
     ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
     ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
@@ -210,12 +204,11 @@ typedef struct {
 
 static iv_ctx_t  s_iv;
 static uint8_t   s_coord_ieee[8];
-static uint16_t  s_iv_change;   /* reportable change – static, wird vom Stack gelesen */
+static uint16_t  s_iv_change;   /* 上报变化量 —— 必须 static，协议栈会直接读它 */
 
-/* Letzter per APS empfangener Frame – die SET_ATTR_VALUE-Message (Tastenbefehl)
- * enthält KEINE Quell-Adresse, daher nehmen wir sie aus dem unmittelbar
- * vorher verarbeiteten APS-Frame (aps_data_ind_cb läuft im gleichen
- * Stack-Durchlauf VOR dem ZCL-Callback). */
+/* 最后一个经 APS 收到的帧 —— SET_ATTR_VALUE 消息（按键命令）里**没有**
+ * 源地址，所以只能从紧邻的上一帧取（同一次协议栈轮次里，
+ * aps_data_ind_cb 先于 ZCL 回调执行）。 */
 static struct {
     uint16_t addr;
     uint8_t  ep;
@@ -228,12 +221,12 @@ static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
                               esp_zb_af_simple_desc_1_1_t *sd, void *user_ctx);
 static void iv_bind_cb(esp_zb_zdp_status_t status, void *user_ctx);
 
-/* Basic-Cluster-Read: Zustand + Callback (Definition weiter unten) */
+/* 读 Basic 簇：状态 + 回调（定义在后面） */
 static uint16_t s_basic_pending_addr = 0xFFFF;
-static uint8_t  s_basic_pending_ep   = 1;   /* echte Geräte-EP (ep1-Hardcodewort repariert) */
+static uint8_t  s_basic_pending_ep   = 1;   /* 设备真实端点（修掉了写死 ep1 的老毛病） */
 static void read_basic_cb(uint8_t param);
-/* Vorwärtdeklaration – start_basic_scan ist erst weiter unten definiert,
- * wird aber schon beim Interview-Abschluss (oben) aufgerufen. */
+/* 前向声明 —— start_basic_scan 在后面才定义，
+ * 但前面 Interview 收尾时就要调用它。 */
 static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n);
 
 static void iv_ieee_str(const uint8_t *ieee, char *out, size_t len) {
@@ -242,8 +235,8 @@ static void iv_ieee_str(const uint8_t *ieee, char *out, size_t len) {
              ieee[3], ieee[2], ieee[1], ieee[0]);
 }
 
-/* FIFO der ausgehenden Bind-Requests – nur für die Zuordnung der Responses
- * beim Logging (ZBOSS liefert pro Response nur Status + ctx). */
+/* 发出的 Bind 请求队列 —— 只用于日志里把 Response 对上号
+ * （ZBOSS 每份 Response 只给 status + ctx）。 */
 typedef struct { uint16_t addr; uint8_t ep; uint16_t cluster; } iv_bind_rec_t;
 static iv_bind_rec_t s_iv_bind_fifo[16];
 static uint8_t s_iv_bind_head = 0, s_iv_bind_tail = 0;
@@ -277,7 +270,7 @@ static void interview_start(uint16_t addr, const uint8_t *ieee) {
     s_iv.ep_idx     = 0;
     esp_zb_get_long_address(s_coord_ieee);
 
-    /* als interviewiert markieren – kein Re-Interview bei jedem Frame */
+    /* 标记为已完成 Interview —— 免得每来一帧就重做一遍 */
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
     for (int i = 0; i < MAX_DEVICES; i++) {
         if (s_devices[i].used && s_devices[i].short_addr == addr) {
@@ -312,7 +305,7 @@ static void iv_request_simple_desc(uint8_t idx) {
         ha_mqtt_emit_raw(line);
         ESP_LOGI(TAG, "Interview 0x%04x abgeschlossen (eps: %s)",
                  s_iv.short_addr, eps);
-        /* Basic-Attribute (Hersteller/Modell) lesen – über alle Endpunkte */
+        /* 读 Basic 属性（厂商/型号）—— 遍历所有端点 */
         if (s_iv.ep_count > 0) {
             start_basic_scan(s_iv.short_addr, s_iv.eps, s_iv.ep_count);
         }
@@ -411,13 +404,12 @@ static void iv_bind_cb(esp_zb_zdp_status_t status, void *user_ctx) {
     }
 }
 
-/* ZCL unterscheidet ANALOGE und DISKRETE Datentypen. Nur bei analogen gehört
- * das Feld "reportable change" in den Configure-Reporting-Record; bei
- * diskreten (Bool, Bitmap, Enum, Strings …) ist es laut ZCL 2.5.7.1 NICHT
- * enthalten. Wird es trotzdem mitgeschickt, ist der Record zu lang – manche
- * Endgeräte (z. B. Feibit HGZB-043) quittieren ihn mit SUCCESS, speichern
- * aber Unsinn und melden danach nie wieder eine Zustandsänderung. Genau das
- * war der Grund, warum HA den Schalterzustand nie gesehen hat. */
+/* ZCL 把数据类型分成「模拟量」和「离散量」。只有模拟量才需要在
+ * Configure-Reporting 记录里带 "reportable change" 字段；离散量
+ * （Bool、Bitmap、Enum、字符串……）按 ZCL 2.5.7.1 是**不能**带的。
+ * 硬带上就会让记录超长 —— 有些终端设备（例如 Feibit HGZB-043）会回 SUCCESS，
+ * 却存进一堆垃圾，之后再也报不出状态变化。HA 一直看不到开关状态，
+ * 根因就是这个。 */
 static bool iv_type_is_analog(uint8_t t) {
     if (t >= ESP_ZB_ZCL_ATTR_TYPE_U8 && t <= ESP_ZB_ZCL_ATTR_TYPE_S64) return true;  /* 0x20–0x2f */
     if (t >= ESP_ZB_ZCL_ATTR_TYPE_SEMI && t <= ESP_ZB_ZCL_ATTR_TYPE_DOUBLE) return true; /* 0x38–0x3a */
@@ -497,7 +489,7 @@ static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
         ha_mqtt_emit_raw(line);
     }
 
-    /* Input-Cluster (Server am Gerät) → binden + Reporting */
+    /* Input 簇（设备侧是 Server）→ 绑定 + 配上报 */
     for (uint8_t i = 0; i < in_n; i++) {
         uint16_t cl = sd->app_cluster_list[i];
         for (size_t k = 0; k < sizeof(s_iv_input) / sizeof(s_iv_input[0]); k++) {
@@ -508,7 +500,7 @@ static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
         }
     }
 
-    /* Output-Cluster (Client am Gerät) → nur binden */
+    /* Output 簇（设备侧是 Client）→ 只绑定 */
     const uint16_t *out = sd->app_cluster_list + sd->app_input_cluster_count;
     for (uint8_t i = 0; i < out_n; i++) {
         uint16_t cl = out[i];
@@ -547,10 +539,9 @@ static void read_basic_cb(uint8_t param) {
     s_basic_pending_addr = 0xFFFF;
 }
 
-/* Modell-Scan: das Basic-Cluster sitzt je nach Hersteller auf ep1 oder auf
- * jedem Schalter-Endpunkt (Feibit/Nue: ep16..18). Beim Interview wurde nur
- * die erste EP probiert → „basic" kam nie zurück, das Modell blieb unbekannt.
- * Deshalb hier nacheinander alle bekannten Endpunkte durchprobieren. */
+/* 型号扫描：Basic 簇有的厂商放在 ep1，有的放在每个开关端点上
+ * （Feibit/Nue：ep16..18）。Interview 时只试了第一个端点 ⇒ "basic" 从来没
+ * 回来过，型号一直是未知。所以这里挨个把已知端点试一遍。 */
 #define BASIC_SCAN_MAX 9
 static uint16_t s_scan_addr = 0xFFFF;
 static uint8_t  s_scan_eps[BASIC_SCAN_MAX];
@@ -567,7 +558,7 @@ static void read_basic_scan_cb(uint8_t param) {
 static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n) {
     s_scan_addr = addr;
     s_scan_n    = 0;
-    s_scan_eps[s_scan_n++] = 1;          /* Basic liegt am häufigsten auf ep1 */
+    s_scan_eps[s_scan_n++] = 1;          /* Basic 大多在 ep1 上 */
     for (uint8_t k = 0; k < n && s_scan_n < BASIC_SCAN_MAX; k++) {
         if (eps[k] != 1) s_scan_eps[s_scan_n++] = eps[k];
     }
@@ -575,17 +566,16 @@ static void start_basic_scan(uint16_t addr, const uint8_t *eps, uint8_t n) {
     esp_zb_scheduler_alarm(read_basic_scan_cb, 0, 500);
 }
 
-/* ── IEEE-Auflösung für „stille“ Rejoins ────────────────────────────────────
- * Nach einem Coordinator-Reboot kommen viele Geräte ohne Device-Announce
- * zurück: sie senden einfach wieder APS-Daten. Dann kennen wir ihre IEEE
- * nicht, das Interview wurde bisher übersprungen („ohne IEEE kein Bind“) und
- * damit wurde auch nie das Basic-Cluster gelesen → kein Modell in HA.
- * Deshalb die IEEE hier per ZDO nachträglich auflösen und das Interview
- * danach starten. Rate-Limit: maximal 1 Request pro 30 s im ganzen Netz. */
+/* ── 给「安静」重连的设备补 IEEE ─────────────────────────────────────────────
+ * 协调器重启后，很多设备不会发 Device-Announce 就回来了：它们直接接着发
+ * APS 数据。这时我们不知道它们的 IEEE，Interview 会被跳过（"没 IEEE 就不绑"），
+ * Basic 簇也就永远没读过 → HA 里没有型号。
+ * 所以这里用 ZDO 事后补解析 IEEE，然后再补一次 Interview。
+ * 限速：全网最多每 30 s 一个请求。 */
 static TickType_t s_ieee_last_tick = 0;
 
-/* SDK ≥1.6.0 hat den Callback-Typ neu definiert: die Antwort kommt als
- * esp_zb_zdo_ieee_addr_rsp_t* statt als rohes ieee_addr-Array. */
+/* SDK ≥1.6.0 改了回调类型：应答是 esp_zb_zdo_ieee_addr_rsp_t*，
+ * 不再是裸的 ieee_addr 数组。 */
 static void ieee_resolved_cb(esp_zb_zdp_status_t zdo_status,
                              esp_zb_zdo_ieee_addr_rsp_t *resp, void *user_ctx) {
     uint16_t addr = (uint16_t)(uintptr_t)user_ctx;
@@ -612,11 +602,11 @@ static void request_ieee(uint16_t addr) {
     esp_zb_zdo_ieee_addr_req(&req, ieee_resolved_cb, (void *)(uintptr_t)addr);
 }
 
-/* ── Keep-Alive-Test: liest nach Autorisierung periodisch Basic-Attribute ──
- * These: TI-Geräte (Z-Stack) verlassen das Netz ~10 s nach "Device
- * Authorized" (rejoin=0), obwohl Interview + Bind erfolgreich waren.
- * Verdacht: Gerät erwartet aktive Kommunikation vom Coordinator.
- * 12 Runden à 5 s = 60 s Abdeckung; jede Runde loggt {"t":"keepalive",...}. */
+/* ── 保活测试：授权后周期性读 Basic 属性 ──────────────────────────────────
+ * 假设：TI 设备（Z-Stack）在 "Device Authorized"(rejoin=0) 之后约 10 s 退网，
+ * 尽管 Interview + Bind 都成功了。
+ * 怀疑：设备期待协调器主动跟它通信。
+ * 12 轮 × 5 s = 覆盖 60 s；每轮打一行 {"t":"keepalive",...}。 */
 static uint16_t s_ka_addr = 0xFFFF;   /* 0xFFFF = kein Keep-Alive aktiv */
 static uint8_t  s_ka_ep   = 1;
 static uint8_t  s_ka_n    = 0;
@@ -631,7 +621,7 @@ static void keepalive_cb(uint8_t param) {
              "{\"t\":\"keepalive\",\"addr\":\"0x%04x\",\"ep\":%u,\"round\":%u}",
              s_ka_addr, (unsigned)s_ka_ep, (unsigned)s_ka_n);
     ha_mqtt_emit_raw(line);
-    /* Read-Attribute über read_basic_cb an die echte EP senden */
+    /* 通过 read_basic_cb 向真实端点发 Read Attributes */
     s_basic_pending_addr = s_ka_addr;
     s_basic_pending_ep   = s_ka_ep;
     esp_zb_scheduler_alarm(read_basic_cb, 0, 10);
@@ -667,9 +657,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         const esp_zb_zcl_cmd_read_attr_resp_message_t *m = message;
         if (!m) return ESP_OK;
 
-        /* On/Off aktiv zurückgelesen (nach einem Fernbefehl). Das Gerät
-         * schickt keinen Report, antwortet aber auf Read Attributes –
-         * damit wird die optimistische Annahme des Gateways korrigiert. */
+        /* 远程命令之后主动回读 On/Off。设备不会发 Report，
+         * 但会回应 Read Attributes ——
+         * 用这个纠正网关的乐观假设。 */
         if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             uint16_t ra = m->info.src_address.u.short_addr;
             for (esp_zb_zcl_read_attr_resp_variable_t *v = m->variables; v; v = v->next) {
@@ -728,8 +718,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                  "{\"t\":\"ota_srv_status\",\"addr\":\"0x%04x\",\"status\":\"%s\"}",
                  m->zcl_addr.u.short_addr, st);
         ha_mqtt_emit_raw(line);
-        /* Session ist beendet oder abgebrochen → Nachlade-Task stilllegen,
-         * sonst fragt er weiter Blöcke beim Pi an, die niemand mehr braucht. */
+        /* 会话已结束或已中止 ⇒ 停掉补货任务，
+         * 否则它还会继续向树莓派要没人需要的块。 */
         if (m->server_status != ESP_ZB_ZCL_OTA_UPGRADE_SERVER_STARTED) {
             zb_ota_server_stop();
         }
@@ -737,10 +727,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         return ESP_OK;
     }
 
-    /* Tastenbefehl eines gebundenen Schalters: Das On/Off-Server-Cluster am
-     * Coordinator setzt das OnOff-Attribut → landet hier (gleicher Pfad wie im
-     * HA-On/Off-Light-Beispiel). Die Message enthält keine Quell-Adresse, daher
-     * aus s_last_aps (wird von aps_data_ind_cb unmittelbar vorher gefüllt). */
+    /* 已绑定开关的按键命令：协调器上的 On/Off Server 簇被写入 OnOff 属性
+     * → 落到这里（跟 HA 的 On/Off Light 示例是同一条路径）。消息里没有源地址，
+     * 所以从 s_last_aps 取（aps_data_ind_cb 在它之前刚刚填好）。 */
     if (callback_id == ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID) {
         const esp_zb_zcl_set_attr_value_message_t *m = message;
 
@@ -792,7 +781,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         return ESP_OK;
     }
 
-    /* Configure-Reporting-Response (Antwort des Endgeräts auf unser Interview) */
+    /* Configure-Reporting 的应答（设备对我们 Interview 的回话） */
     if (callback_id == ESP_ZB_CORE_CMD_REPORT_CONFIG_RESP_CB_ID) {
         const esp_zb_zcl_cmd_config_report_resp_message_t *m = message;
         if (m) {
@@ -814,8 +803,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
     /* Nur Attribut-Reports verarbeiten. Andere Callback-IDs (u. a.
      * SET_ATTR_VALUE_CB_ID) liefern andere Struct-Typen – ein Cast auf
-     * report_attr_message_t würde falsche Offsets lesen (Müll-Publishes).
-     * SET_ATTR_VALUE wird oben separat mit korrektem Typ verarbeitet. */
+     * report_attr_message_t 会读错偏移（发出垃圾数据）。
+     * SET_ATTR_VALUE 在上面已经按正确类型单独处理过了。 */
     if (callback_id != ESP_ZB_CORE_REPORT_ATTR_CB_ID)
         return ESP_OK;
 
@@ -939,11 +928,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
 
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err == ESP_OK) {
-            /* NICHT esp_zb_bdb_open_network(0) hier aufrufen!
-             * Das Boot-Steering-Signal kann NACH einem per BOOT-Taste/UI
-             * geöffneten Permit-Join-Fenster ankommen und es sofort wieder
-             * schließen (Bug: Fenster wurde ~1 s nach dem Öffnen gekillt).
-             * Nach dem Boot ist das Netzwerk ohnehin geschlossen. */
+            /* 这里**不要**调 esp_zb_bdb_open_network(0)！
+             * boot-steering 信号可能在「已用 BOOT 键/网页开好的配网窗口」
+             * 之后才到，一刀就把窗口关了（bug：窗口开了约 1 s 就被干掉）。
+             * 而且开机之后网络本来就是关着的。 */
             ESP_LOGI(TAG, "Zigbee bereit – Netzwerk wiederhergestellt");
         }
         break;
@@ -955,7 +943,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         ESP_LOGI(TAG, "Neues Gerät: 0x%04hx", a);
 
         xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
-        /* Rejoin mit neuer Short-Adresse: alten Eintrag gleicher IEEE entfernen */
+        /* 带新短地址重连：先把同 IEEE 的旧条目删掉 */
         for (int i = 0; i < MAX_DEVICES; i++) {
             if (s_devices[i].used && s_devices[i].short_addr != a &&
                 memcmp(s_devices[i].ieee, p->ieee_addr, 8) == 0) {
@@ -968,16 +956,16 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         uint8_t dev_ieee[8] = { 0 };
         if (dev) memcpy(dev_ieee, p->ieee_addr, 8);
         xSemaphoreGive(s_dev_mutex);
-        /* Neu aufgenommene bzw. migrierte Adresse sofort sichern, damit ein
-         * Neustart die Tabelle nicht wieder verliert. */
+        /* 新收下的、或迁移过来的地址立刻存盘，
+         * 免得重启一次又把表丢了。 */
         if (dev) devtab_save();
 
-        /* IEEE-Adresse als String */
+        /* IEEE 地址转成字符串 */
         char ieee_str[24] = "?";
         if (dev) iv_ieee_str(dev_ieee, ieee_str, sizeof(ieee_str));
 
-        /* Join-Event MIT Top-Level-IEEE (so kann der Pi alte Einträge nach
-         * Rejoin mit neuer Short-Adresse dedupen) */
+        /* Join 事件里带上顶层 IEEE（这样树莓派能在「重连换地址」之后
+         * 把旧条目去重） */
         {
             char line[176];
             snprintf(line, sizeof(line),
@@ -988,8 +976,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ha_mqtt_emit_raw(line);
         }
 
-        /* Basic-Attribute werden nach dem Interview mit echter EP gelesen
-         * (siehe iv_request_simple_desc – alter ep1-Pfad war fehlerhaft) */
+        /* Basic 属性在 Interview 之后用真实端点去读
+         * （见 iv_request_simple_desc —— 以前写死 ep1 的路径是错的） */
 
         /* Interview: Active-EP → Simple-Desc → Bind → Configure-Reporting */
         if (dev) interview_start(a, dev_ieee);
@@ -1005,9 +993,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         break;
     }
 
-    /* Gerät verlässt das Netzwerk (oder wird entfernt) – das ist das Signal,
-     * das unser Problem „pairt, ist aber ~1 min später wieder ungepairt“
-     * sichtbar macht. rejoin=1 heißt: Leave MIT Rejoin (Adresswechsel). */
+    /* 设备离网（或被删除）—— 正是这个信号让「配对成功、约 1 分钟后
+     * 又变未配对」这个毛病变得可见。rejoin=1 表示：带重连的 Leave
+     * （典型是换地址）。 */
     case ESP_ZB_ZDO_SIGNAL_LEAVE_INDICATION: {
         esp_zb_zdo_signal_leave_indication_params_t *p =
             esp_zb_app_signal_get_params(sg_p);
@@ -1026,9 +1014,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                      (unsigned)p->rejoin, ieee_str);
             ha_mqtt_emit_raw(line);
 
-            /* Endgültiges Leave (rejoin=0): Eintrag aus der Tabelle und aus
-             * der NVS-Kopie entfernen. Bei rejoin=1 bleibt er stehen – das
-             * Gerät kommt mit neuer Kurzadresse zurück (ANNCE migriert). */
+            /* 彻底离网（rejoin=0）：从表里和 NVS 副本里都删掉。
+             * rejoin=1 时保留 —— 设备会带着新短地址回来（ANNCE 会给它迁移）。 */
             if (!p->rejoin) {
                 xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
                 for (int i = 0; i < MAX_DEVICES; i++) {
@@ -1062,10 +1049,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         break;
     }
 
-    /* Autorisierung durch Trust Center – type/status sind die Schlüssel-
-     * werte für die Leave-Ursache (0x01=TCLK, 0x02=SE-CBKE; status
-     * 0x00=ok, 0x01=timeout, 0x02=failed). Danach startet der Keep-Alive-
-     * Test (12 Runden Read-Attribute à 5 s). */
+    /* Trust Center 的授权结果 —— type/status 是判断离网原因的关键值
+     * （0x01=TCLK，0x02=SE-CBKE；status 0x00=ok，0x01=timeout，0x02=failed）。
+     * 之后启动保活测试（12 轮 Read Attributes，每 5 s 一轮）。 */
     case ESP_ZB_ZDO_SIGNAL_DEVICE_AUTHORIZED: {
         esp_zb_zdo_signal_device_authorized_params_t *p =
             esp_zb_app_signal_get_params(sg_p);
@@ -1091,9 +1077,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     }
 
     default: {
-        /* Alle übrigen Signale als JSON-Zeile ausgeben – so ist die komplette
-         * Signal-Kette (inkl. der Sekunden vor einem Leave) im Add-on-Log
-         * sichtbar. ESP_LOGD allein wäre unsichtbar (anderer UART). */
+        /* 其余信号全部按 JSON 行输出 —— 这样整条信号链
+         * （包括离网前那几秒）在 add-on 日志里都能看到。
+         * 只用 ESP_LOGD 是看不见的（走的是另一个 UART）。 */
         const char *name = esp_zb_zdo_signal_to_string(sig);
         char line[128];
         snprintf(line, sizeof(line),
@@ -1107,7 +1093,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     }
 }
 
-/* ── Gespeicherten Kanal aus NVS lesen (Default: ZB_DEFAULT_CHANNEL) ─────── */
+/* ── 从 NVS 读保存的信道（默认 ZB_DEFAULT_CHANNEL） ────────────────────── */
 static uint8_t load_channel(void) {
     uint8_t ch = ZB_DEFAULT_CHANNEL;
     nvs_handle_t h;
@@ -1128,7 +1114,7 @@ static void zb_task(void *arg) {
                                                     : ZB_FALLBACK_CHANNEL;
     ESP_LOGI(TAG, "Zigbee primär Kanal %d, Fallback Kanal %d", ch, fallback);
 
-    /* Tabellen dimensionieren – zwingend VOR esp_zb_init(). */
+    /* 先定表的大小 —— 必须在 esp_zb_init() 之前。 */
     esp_err_t siz = esp_zb_overall_network_size_set(MAX_DEVICES);
     ESP_LOGI(TAG, "Netzgröße %d Geräte (overall_network_size_set=%s)",
              MAX_DEVICES, esp_err_to_name(siz));
@@ -1141,13 +1127,12 @@ static void zb_task(void *arg) {
     esp_zb_init(&cfg);
     esp_zb_set_tx_power(20);   /* max TX-Power: 20 dBm */
 
-    /* NVRAM NIE beim Start löschen: dort liegen Netzwerkschlüssel, PAN,
-     * Kanal und die Adresstabelle. Genau das hält die Pairings über einen
-     * Neustart – wer hier true setzt, verliert bei jedem Boot das Netz. */
+    /* 启动时**永远不要**清 NVRAM：网络密钥、PAN、信道和地址表都在里面。
+     * 配对能扛过重启全靠它 —— 谁在这里写 true，每次开机都丢网。 */
     esp_zb_nvram_erase_at_start(false);
 
-    /* Eigene Gerätetabelle aus der NVS-Kopie ergänzen, damit LQI-Snapshot
-     * und Keep-Alive die Geräte schon vor ihrem ersten Announce kennen. */
+    /* 用自己的 NVS 副本把设备表补回来，这样 LQI 快照和保活
+     * 在设备第一次 Announce 之前就认得它们。 */
     devtab_load();
 
     /* Endpoint manuell aufbauen: Basic + Identify + OTA-Server */
@@ -1164,7 +1149,7 @@ static void zb_task(void *arg) {
     esp_zb_cluster_list_add_ota_cluster(cl,
         zb_ota_server_cluster_create(), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    /* Temperature + On/Off als Client registrieren → empfängt Attribute-Reports */
+    /* 把 Temperature + On/Off 注册成 Client ⇒ 能收到属性上报 */
     esp_zb_temperature_meas_cluster_cfg_t temp_cfg = {
         .measured_value = (int16_t)0x8000,
         .min_value = -5000,
@@ -1187,10 +1172,10 @@ static void zb_task(void *arg) {
         esp_zb_on_off_cluster_create(&on_off_cfg),
         ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
-    /* On/Off zusätzlich als SERVER registrieren: so landen On/Off-Befehle
-     * gebundener Schalter (Tastendruck) als ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID
-     * bei uns – gleicher Pfad wie im HA-On/Off-Light-Beispiel. Die
-     * Client-Rolle bleibt für Attribut-Reports von Server-Geräten erhalten. */
+    /* On/Off 再额外注册成 **SERVER**：这样已绑定开关发来的 On/Off 命令
+     * （按键）才会以 ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID 落到我们这里 ——
+     * 跟 HA 的 On/Off Light 示例是同一条路径。
+     * Client 角色继续保留，用于接收 Server 设备的属性上报。 */
     esp_zb_on_off_cluster_cfg_t on_off_srv_cfg = { .on_off = false };
     esp_zb_cluster_list_add_on_off_cluster(cl,
         esp_zb_on_off_cluster_create(&on_off_srv_cfg),
@@ -1221,7 +1206,7 @@ static void zb_task(void *arg) {
     esp_zb_cluster_list_add_occupancy_sensing_cluster(cl,
         esp_zb_occupancy_sensing_cluster_create(&occ_cfg), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
-    /* IAS Zone (0x0500) – PIR/Tür/Rauch-Sensoren */
+    /* IAS Zone（0x0500）—— 人体/门磁/烟感 */
     esp_zb_ias_zone_cluster_cfg_t ias_cfg = {
         .zone_state = 0, .zone_type = ESP_ZB_ZCL_IAS_ZONE_ZONETYPE_MOTION, .zone_status = 0,
     };
@@ -1238,7 +1223,7 @@ static void zb_task(void *arg) {
     esp_zb_cluster_list_add_custom_cluster(cl, sw_attr, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
     esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
-    /* SDK ≥1.2.0: Endpunkt-Konfiguration als Struct statt Einzelparameter */
+    /* SDK ≥1.2.0：端点配置改成结构体，不再是零散参数 */
     esp_zb_endpoint_config_t ep_cfg = {
         .endpoint           = ZB_ENDPOINT,
         .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
@@ -1247,14 +1232,12 @@ static void zb_task(void *arg) {
     };
     esp_zb_ep_list_add_ep(ep, cl, ep_cfg);
 
-    /* EP 0x0B (11) – Spiegelpunkt für Feibit FB56/ZSW1x (3A Nue HGZB-043):
-     * diese Schalter senden ihre On/Off-Attribut-Reports an die
-     * Coordinator-EP 0x0B (Ziel-Endpoint aus der Fremd-Gateway-Konfiguration,
-     * z. B. Xiaomi). Ohne diesen Endpunkt verwirft die ZCL-Schicht die
-     * Reports (beobachtet: dep=11, keine Callbacks).
-     * WICHTIG: Die Reports kommen mit Frame-Control 0x08 = direction
-     * to-client → ZBOSS sucht die CLIENT-Rolle. Deshalb beide Rollen
-     * registrieren (wie bei EP1). */
+    /* EP 0x0B（11）—— 给 Feibit FB56/ZSW1x（3A Nue HGZB-043）准备的镜像端点：
+     * 这些开关把 On/Off 属性上报发到协调器的 EP 0x0B（目标端点来自它们原先
+     * 那套外来网关的配置，例如小米）。没有这个端点，ZCL 层会直接丢弃上报
+     * （实测：dep=11，一个回调都没有）。
+     * 重要：上报的 Frame Control 是 0x08 = direction to-client ⇒
+     * ZBOSS 会去找 CLIENT 角色。所以两个角色都要注册（跟 EP1 一样）。 */
     {
         esp_zb_cluster_list_t *cl_b = esp_zb_zcl_cluster_list_create();
         esp_zb_cluster_list_add_on_off_cluster(cl_b,
@@ -1291,12 +1274,11 @@ static void zb_task(void *arg) {
 
     ESP_ERROR_CHECK(esp_zb_start(false));
 
-    /* ★★ 2026-10-25: Ab hier dürfen andere Tasks ZBOSS-Aufrufe machen.
-     * Vorher NICHT – esp_zb_scheduler_alarm() dereferenziert eine noch nicht
-     * existierende Warteschlange und stirbt mit "Load access fault"
-     * (MTVAL=0xd). Genau das war die Reboot-Schleife: das Add-on schickt
-     * direkt nach dem Boot read_onoff, der uart_rx-Task läuft aber schon
-     * parallel zu diesem Task hier. */
+    /* ★★ 2026-10-25：从这里开始，别的任务才可以调 ZBOSS。
+     * 之前不行 —— esp_zb_scheduler_alarm() 会解引用一个还不存在的队列，
+     * 直接 "Load access fault"（MTVAL=0xd）。重启循环就是这么来的：
+     * add-on 开机后立刻发 read_onoff，而 uart_rx 任务是跟当前这个任务
+     * **并行**跑的。 */
     s_zb_ready = true;
     ESP_LOGI(TAG, "Zigbee-Stack bereit – UART-Befehle werden angenommen");
 
@@ -1305,27 +1287,26 @@ static void zb_task(void *arg) {
 
 bool zb_gateway_is_ready(void) { return s_zb_ready; }
 
-/* ── Öffentliche API ────────────────────────────────────────────────────── */
+/* ── 对外接口 ───────────────────────────────────────────────────────────── */
 void zb_gateway_start(void) {
     memset(s_devices, 0, sizeof(s_devices));
     s_dev_mutex = xSemaphoreCreateMutex();
 
     esp_zb_platform_config_t pcfg = {
-        /* SDK ≥1.3.0: Enums mit ZB_-Präfix (vorher RADIO_MODE_NATIVE) */
+        /* SDK ≥1.3.0：枚举带 ZB_ 前缀（以前叫 RADIO_MODE_NATIVE） */
         .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
         .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&pcfg));
-    /* ★ 2026-10-25: 8192 → 16384. Der Topologie-Dump (zb_topo.c) läuft im
-     * ZBOSS-Task und baut dort bis zu 4 KB JSON-Zeilen + snprintf + stdio.
-     * Panic landete reproduzierbar in zb_sched_loop_iteration /
-     * zb_mac_logic_iteration – klassisches Symptom für überlaufenden Stack
-     * im ZBOSS-Task. Der High-Water-Mark wird beim topo-Dump geloggt. */
+    /* ★ 2026-10-25：8192 → 16384。拓扑 dump（zb_topo.c）跑在 ZBOSS 任务里，
+     * 在那里要拼出最多 4 KB 的 JSON 行 + snprintf + stdio。
+     * panic 稳定落在 zb_sched_loop_iteration / zb_mac_logic_iteration ——
+     * 这是 ZBOSS 任务栈溢出的经典症状。拓扑 dump 时会打印 high-water mark。 */
     xTaskCreate(zb_task, "zb_main", 16384, NULL, 5, NULL);
 }
 
 void zb_gateway_permit_join(uint8_t seconds) {
-    /* Boot-Taste kann vor dem Stack-Start gedrückt werden → sonst NULL-Deref */
+    /* BOOT 键可能在协议栈启动前就被按下 ⇒ 不判就是空指针解引用 */
     if (!s_zb_ready) {
         ha_mqtt_logf(TAG, "permit_join(%u) ignoriert – Zigbee-Stack startet noch", seconds);
         return;
@@ -1372,7 +1353,7 @@ void zb_gateway_set_channel(uint8_t ch) {
         return;
     }
 
-    /* Zigbee FAT-Storage löschen → nächster Boot bildet neues Netz */
+    /* 删掉 Zigbee FAT 存储 ⇒ 下次启动重建新网络 */
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "zb_storage");
     if (part) {
@@ -1414,8 +1395,8 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
     }
     xSemaphoreGive(s_dev_mutex);
 
-    /* Quell-Adresse/Endpoint des letzten Frames merken – die
-     * SET_ATTR_VALUE-Message (Tastenbefehl) führt keine Quell-Adresse. */
+    /* 记下最后一帧的源地址/端点 ——
+     * SET_ATTR_VALUE 消息（按键命令）里不带源地址。 */
     s_last_aps.addr    = ind.src_short_addr;
     s_last_aps.ep      = ind.src_endpoint;
     s_last_aps.cluster = ind.cluster_id;
@@ -1441,8 +1422,8 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
     }
 
     /* Diagnose: jeden eingehenden APS-Frame roh mitschneiden.
-     * ASDU = ZCL-Frame (Frame-Control, TSN, Command-ID, …) – damit ist
-     * sichtbar, ob Tastenbefehle überhaupt ankommen und in welcher Form. */
+     * ASDU = ZCL 帧（Frame-Control、TSN、Command-ID……）—— 一眼就能看出
+     * 按键命令到底有没有到、以什么形式到。 */
     if (ind.src_short_addr != 0x0000 && ind.asdu && ind.asdu_length > 0) {
         char hex[64];
         size_t hx = 0;
@@ -1460,8 +1441,8 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
         ha_mqtt_emit_raw(line);
     }
 
-    /* Noch nicht interviewiert → Interview nachholen (Gerät, das schon vor
-     * dem Flash gepairt war und sich nicht neu anmeldet). */
+    /* 还没 Interview 过 ⇒ 补做一次（这台设备在刷机前就配好了，
+     * 不会重新来登记）。 */
     if (d && !d->interviewed && ind.src_short_addr != 0x0000) {
         bool have_ieee = false;
         for (int i = 0; i < 8; i++) {
@@ -1472,7 +1453,7 @@ static bool aps_data_ind_cb(esp_zb_apsde_data_ind_t ind) {
             memcpy(ieee, d->ieee, 8);
             interview_start(ind.src_short_addr, ieee);
         } else if (xTaskGetTickCount() - s_ieee_last_tick > pdMS_TO_TICKS(30000)) {
-            /* IEEE unbekannt (stiller Rejoin) → per ZDO nachträglich holen */
+            /* IEEE 未知（安静重连）⇒ 用 ZDO 事后补 */
             s_ieee_last_tick = xTaskGetTickCount();
             request_ieee(ind.src_short_addr);
         }
@@ -1510,7 +1491,7 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
                      (unsigned long)age);
         if (n < 0) break;
         if ((size_t)n < r) { p += n; r -= (size_t)n; }
-        else               { r = 1; break; }   /* Puffer voll – Rest verwerfen */
+        else               { r = 1; break; }   /* 缓冲满 —— 剩下的丢掉 */
         first = false;
     }
     snprintf(p, r, "]");
@@ -1519,10 +1500,9 @@ void zb_gateway_lqi_json(char *buf, size_t len) {
 
 int8_t zb_gateway_get_last_rssi(void) { return s_last_rssi; }
 
-/* Alle bekannten Kurzadressen (ohne 0x0000) in out[] kopieren.
- * Für die Topologie: nur Geräte, mit denen wir schon gesprochen haben, haben
- * eine Chance auf eine Mgmt_Lqi_rsp – tote Adressen aus der Nachbartabelle
- * würden die Erfassung nur um Sekunden verzögern. Gibt die Anzahl zurück. */
+/* 把所有已知短地址（不含 0x0000）拷进 out[]。
+ * 给拓扑用：只有跟我们讲过话的设备才有可能回 Mgmt_Lqi_rsp ——
+ * 邻居表里的死地址只会让整轮采集白白多拖几秒。返回个数。 */
 uint8_t zb_gateway_known_addrs(uint16_t *out, uint8_t max) {
     if (!out || !max) return 0;
     uint8_t n = 0;
@@ -1536,23 +1516,20 @@ uint8_t zb_gateway_known_addrs(uint16_t *out, uint8_t max) {
     return n;
 }
 
-/* LQI-Momentaufnahme auf Anfrage.
+/* 按需取一次 LQI 快照。
  *
- * Im Heartbeat steckt dieselbe Liste, aber nur alle 60 s. Für den Vergleich
- * von Sendeleistungen ist das zu langsam: der Wert gilt nur für den *letzten*
- * empfangenen Frame, und der kann Minuten alt sein. Hier wird bewusst der
- * Zeitstempel mitgeschickt (uptime_ms), damit man „Zustand von vor 3 Minuten"
- * von „gerade eben gemessen" unterscheiden kann.
+ * 心跳里带的是同一份列表，但 60 s 才有一次。比较发射功率时这太慢了：
+ * 那个值只对**最后一个**收到的帧有效，可能已经是几分钟前的。
+ * 这里刻意带上时间戳（uptime_ms），好区分「3 分钟前的状态」和「刚测的」。
  *
- * ACHTUNG – beide Puffer MÜSSEN statisch sein:
- * Diese Funktion läuft im uart_rx-Task, und der hat nur 2048 B Stack
- * (ha_mqtt.c: xTaskCreate(rx_task, "uart_rx", 2048, ...)). Ein lokaler
- * char[2048+128] hätte den Stack allein schon überschritten – Absturz beim
- * ersten Aufruf des Befehls. Der Heartbeat-Task darf es sich leisten (8192 B),
- * dieser hier nicht.
+ * 注意 —— 两个缓冲**必须**是静态的：
+ * 这个函数跑在 uart_rx 任务里，而它只有 2048 B 栈
+ * （ha_mqtt.c: xTaskCreate(rx_task, "uart_rx", 2048, ...)）。一个局部
+ * char[2048+128] 光是它本身就超了 —— 命令第一次调用就崩。
+ * heartbeat 任务负担得起（8192 B），这里不行。
  *
- * Größe: MAX_DEVICES Geräte à maximal ~53 Zeichen ("addr","lqi","rssi","lqia"
- * + Komma), 64 als runde Obergrenze je Eintrag plus Umschlag. */
+ * 尺寸：MAX_DEVICES 台 × 每台最多约 53 字符（"addr","lqi","rssi","lqia"
+ * 加逗号），每项按 64 取整，再加包头。 */
 #define LQI_JSON_MAX  (MAX_DEVICES * 64 + 128)
 #define LQI_LINE_MAX  (LQI_JSON_MAX + 64)
 void zb_gateway_report_lqi(void) {
@@ -1568,10 +1545,9 @@ void zb_gateway_report_lqi(void) {
 }
 
 /* ── Sendeleistung ──────────────────────────────────────────────────────── */
-/* Wunschwert und wirksamer Wert sind nicht dasselbe: esp_zb_set_tx_power()
- * klemmt den Wert intern auf den PHY-Bereich. Deshalb wird nach dem Setzen
- * über esp_ieee802154_get_txpower() zurückgelesen und mitgeschickt – sonst
- * misst man beim Vergleich die Wunschzahl statt der Sendeleistung. */
+/* 设定值和实际生效值不是一回事：esp_zb_set_tx_power() 内部会把值
+ * 夹到 PHY 允许的范围内。所以设完之后要用 esp_ieee802154_get_txpower()
+ * 读回来一起报 —— 否则比较功率时量的是设定值，不是发射功率。 */
 void zb_gateway_set_tx_power(int8_t dbm) {
     esp_zb_set_tx_power(dbm);
     int8_t eff = esp_ieee802154_get_txpower();
@@ -1596,26 +1572,22 @@ void zb_gateway_list_devices(void) {
     xSemaphoreGive(s_dev_mutex);
 }
 
-/* ── Gerät endgültig entfernen (manuell aus der Liste) ──────────────────── */
-/* Anlass: ein Gerät zieht in ein anderes Netz um (oder ist defekt/ausgebaut).
+/* ── 彻底删除设备（手动从列表里移除） ──────────────────────────────────── */
+/* 场景：设备搬到别的网络去了（或者坏了、拆了）。
  *
- * Warum das überhaupt nötig ist: die Gerätetabelle hier ist die einzige
- * Quelle, aus der das Add-on seine Geräteliste baut – jeder Heartbeat
- * (60 s) schickt s_devices als LQI-Array mit, und `t == "lqi"` legt daraus
- * fehlende Einträge neu an. Ein lokales "Löschen" im Web-UI hält deshalb
- * exakt 60 Sekunden: die Kachel kommt zurück, weil WIR die tote Adresse
- * weiter melden. Entfernen muss also hier passieren, nicht im Add-on.
+ * 为什么非得在这儿删：这张设备表是 add-on 构建设备列表的**唯一**来源 ——
+ * 每次心跳（60 s）都会把 s_devices 当作 LQI 数组发下去，而 `t == "lqi"`
+ * 会据此把缺的条目重新补上。所以在网页上"本地删除"只顶 60 秒：卡片会回来，
+ * 因为是**我们**还在上报那个死地址。要删就得在这里删，不在 add-on 那边。
  *
- * ★ Grenze: ZBOSS' eigene Nachbar-/Routing-Tabelle räumt dieser Aufruf NICHT
- *   auf – dafür gibt es in esp-zigbee-lib keine API (kein bdb_dev_remove).
- *   Ein toter Nachbar fällt dort von selbst raus, wenn das Link-Status-Aging
- *   zuschlägt. Der Eintrag, der HA und die Weboberfläche speist, ist unserer,
- *   und genau der muss sauber werden.
+ * ★ 边界：ZBOSS 自己的邻居表/路由表**不会**被这个调用清掉 ——
+ *   esp-zigbee-lib 里没有这个 API（没有 bdb_dev_remove）。
+ *   死邻居会在链路状态老化之后自己掉出去。喂给 HA 和网页的那个条目是我们
+ *   自己的，那个必须干净。
  *
- * Reihenfolge: erst RAM + NVS (deterministisch, ohne Funk), dann im
- * Hintergrund Mgmt_Leave_req. Das Leave ist reine Höflichkeit für Geräte,
- * die noch in unserem Netz hängen; ein Gerät, das schon woanders pairt,
- * antwortet nie darauf – deshalb darf das Entfernen nicht davon abhängen. */
+ * 顺序：先 RAM + NVS（确定性的，不依赖无线电），再在后台发 Mgmt_Leave_req。
+ * 这个 Leave 只是对「还挂在我们网里」的设备讲个客气；已经配到别处的设备
+ * 永远不会回它 —— 所以删除绝不能依赖它。 */
 static uint16_t s_rm_addr     = 0;
 static uint8_t  s_rm_ieee[8]  = {0};
 static bool     s_rm_has_ieee = false;
@@ -1627,15 +1599,14 @@ static void rm_leave_ack_cb(esp_zb_zdp_status_t status, void *ctx) {
 }
 
 static void rm_leave_task(void *arg) {
-    /* FREMDER Task ⇒ ZBOSS-Lock Pflicht, und nur um den Request herum halten:
-     * ein Gerät, das nicht mehr da ist, lässt den Callback erst nach dem
-     * ZDO-Timeout (mehrere Sekunden) feuern. */
+    /* 这是**外来任务** ⇒ 必须持 ZBOSS 锁，而且只包住请求本身：
+     * 一台已经不在的设备，会让回调直到 ZDO 超时（好几秒）才触发。 */
     if (s_rm_has_ieee && s_zb_ready && esp_zb_lock_acquire(portMAX_DELAY)) {
         esp_zb_zdo_mgmt_leave_req_param_t req;
         memset(&req, 0, sizeof(req));
         memcpy(req.device_address, s_rm_ieee, sizeof(req.device_address));
         req.dst_nwk_addr    = s_rm_addr;
-        req.rejoin          = 0;   /* endgültig raus, kein Rejoin erlauben */
+        req.rejoin          = 0;   /* 彻底出去，不许重连 */
         req.remove_children = 0;
         esp_zb_zdo_device_leave_req(&req, rm_leave_ack_cb, NULL);
         esp_zb_lock_release();
@@ -1725,10 +1696,9 @@ static void scan_task(void *arg) {
                  "{\"t\":\"scan\",\"state\":\"scanning\",\"ch\":%d}", ch);
         ha_mqtt_emit_raw(line);
 
-        /* ★ scan_task ist ein FREMDER Task ⇒ ZBOSS-Lock ist Pflicht
-         * (esp_zigbee_core.h / esp_zb_lock_acquire). Aber nur um den
-         * Request herum halten – das Warten auf den Callback (bis 12 s)
-         * darf den ZBOSS-Task nicht blockieren. */
+        /* ★ scan_task 是**外来任务** ⇒ 必须持 ZBOSS 锁
+         * （esp_zigbee_core.h / esp_zb_lock_acquire）。但只包住请求本身 ——
+         * 等回调（最长 12 s）不能把 ZBOSS 任务堵住。 */
         if (s_zb_ready && esp_zb_lock_acquire(portMAX_DELAY)) {
             esp_zb_zdo_active_scan_request(1U << ch, SCAN_DURATION, scan_cb);
             esp_zb_lock_release();
@@ -1758,7 +1728,7 @@ void zb_gateway_scan_channels(void) {
     xTaskCreate(scan_task, "chan_scan", 4096, NULL, 2, &s_scan_task_h);
 }
 
-/* ── Gerätesteuerung von HA/Pi (On/Off-Befehl an einen Endpoint) ───────── */
+/* ── HA/树莓派发来的设备控制（给某个端点发 On/Off） ─────────────────────── */
 void zb_gateway_probe_basic(uint16_t addr, uint8_t ep) {
     if (addr == 0x0000 || addr == 0xFFFF) return;
     s_basic_pending_addr = addr;
@@ -1766,10 +1736,9 @@ void zb_gateway_probe_basic(uint16_t addr, uint8_t ep) {
     esp_zb_scheduler_alarm(read_basic_cb, 0, 100);
 }
 
-/* WICHTIG: esp_zb_zcl_*_cmd_req() darf nur im ZBOSS-Task-Kontext laufen.
- * Der UART-RX-Task ist ein anderer Task – ein direkter Aufruf von dort wird
- * vom Stack stillschweigend verworfen (kein Fehler, kein Frame on air).
- * Deshalb wird der Request über den ZBOSS-Scheduler eingereiht. */
+/* 重要：esp_zb_zcl_*_cmd_req() 只能在 ZBOSS 任务上下文里跑。
+ * UART-RX 是另一个任务 —— 从那里直接调会被协议栈**静默丢弃**
+ * （不报错，也没有帧发出去）。所以请求要走 ZBOSS 调度器排队。 */
 static uint16_t s_dev_cmd_addr = 0xFFFF;
 static uint8_t  s_dev_cmd_ep   = 0;
 static uint8_t  s_dev_cmd_id   = 0;
@@ -1871,11 +1840,10 @@ void zb_gateway_write_tx_power(uint16_t addr, uint8_t ep, int8_t dbm) {
 }
 
 
-/* ── Node-Descriptor (ZDO 0x0002): Router (ZR) oder End Device (ZED)? ──────
- * Nur Router leiten Fremdverkehr weiter – ein Wandschalter, der als ZED
- * implementiert ist, obwohl er am Netz hängt, taugt NICHT als Repeater.
- * Die MAC-Capability-Flags sind die einzige verlässliche Auskunft darüber:
- *   bit1 = 1 → FFD / Router, bit2 = 1 → Netzbetrieb, bit3 = 1 → RX immer an. */
+/* ── Node Descriptor（ZDO 0x0002）：路由器（ZR）还是终端（ZED）？ ──────────
+ * 只有路由器才转发别人的流量 —— 一个挂在市电上却按 ZED 实现的墙壁开关，
+ * 当不了中继。MAC capability 标志位是唯一靠得住的判据：
+ *   bit1 = 1 → FFD / 路由器，bit2 = 1 → 市电供电，bit3 = 1 → 常开接收。 */
 static uint16_t s_nd_addr = 0xFFFF;
 
 static void node_desc_cb(esp_zb_zdp_status_t status, uint16_t addr,
@@ -1918,28 +1886,22 @@ void zb_gateway_node_desc(uint16_t addr) {
 }
 
 
-/* ── On/Off aktiv zurücklesen ─────────────────────────────────────────────
- * Das HGZB-043 beantwortet einen Fernbefehl nur mit Default-Response und
- * schickt KEIN Report-Attribut. Lesen geht aber: Read Attributes auf
- * Cluster 0x0006, Attribut 0x0000. Damit bekommt HA den ECHTEN Zustand
- * zurueck, statt sich auf die optimistische Annahme des Gateways zu
- * verlassen (die z. B. daneben liegt, wenn das Geraet den Befehl ablehnt).
+/* ── 主动回读 On/Off ─────────────────────────────────────────────────────
+ * HGZB-043 收到远程命令只回一个 Default Response，**不发** Report 属性。
+ * 但读是可以的：对簇 0x0006、属性 0x0000 发 Read Attributes。这样 HA 拿到的
+ * 是**真实**状态，而不是网关的乐观假设（设备拒收命令时那个假设就是错的）。
  *
- * Mehrere Slots, weil eine HA-Szene schnell zehn Geraete gleichzeitig
- * schaltet: mit nur einer Adresse haette der letzte Aufruf die vorherigen
- * ueberschrieben und die Anfrage waere beim falschen Geraet gelandet.
+ * 用多个槽位，是因为一个 HA 场景很容易同时切十台设备：
+ * 只留一个地址的话，后一次调用会覆盖前一次，请求就发到错误的设备上去了。
  *
- * ★ Feste Slots statt Ringpuffer (Bug vom 2026-10-17):
- *   Der Ringpuffer hatte zwei Zeiger (head/tail) in zwei Tasks. Sobald sich
- *   zwei Callbacks ueberschnitten – oder ein esp_zb_scheduler_alarm() im
- *   Callback scheiterte – liefen head und tail auseinander und der Puffer
- *   galt DAUERHAFT als "nicht leer". Jede weitere Anfrage fiel auf einen
- *   vollen Puffer und wurde verworfen: das Zuruecklesen war stillschweigend
- *   tot, bis der C6 neu startete. Von aussen sah es aus wie "Befehl kommt
- *   nicht an" – MQTT zeigte weiter den angenommenen Zustand.
- *   Jetzt bekommt jede Anfrage einen eigenen Slot, dessen Index als Parameter
- *   in den Alarm geht. Kein gemeinsamer Zeiger, nichts kann sich verheddern;
- *   geht ein Alarm verloren, fehlt genau eine Antwort. */
+ * ★ 用固定槽位替代环形缓冲（2026-10-17 那个 bug）：
+ *   环形缓冲的 head/tail 两个指针跨两个任务。只要两个回调交叉一下 ——
+ *   或者回调里的 esp_zb_scheduler_alarm() 失败一次 —— head 和 tail 就错开，
+ *   缓冲**从此永久**被判为"非空"。之后每个请求都撞上满缓冲被丢弃：
+ *   回读功能静默失效，直到 C6 重启。从外面看就是"命令没送到" ——
+ *   而 MQTT 那边还一直显示着乐观的假定状态。
+ *   现在每个请求各占一个槽，槽号作为参数进 alarm。没有共享指针，
+ *   不会互相纠缠；丢一个 alarm 就正好少一份回执。 */
 #define RD_SLOTS 8
 
 static uint16_t s_rd_attr[1] = { ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID };
@@ -1974,15 +1936,15 @@ static void read_onoff_send(uint8_t slot) {
 
 void zb_gateway_read_onoff(uint16_t addr, uint8_t ep) {
     if (addr == 0x0000 || addr == 0xFFFF || ep == 0) return;
-    if (!s_zb_ready) return;    /* zweite Sicherung – siehe main.c/on_uart_cmd */
+    if (!s_zb_ready) return;    /* 第二道保险 —— 见 main.c/on_uart_cmd */
 
     for (uint8_t i = 0; i < RD_SLOTS; i++) {
         if (s_rd_slots[i].busy) continue;
         s_rd_slots[i].addr = addr;
         s_rd_slots[i].ep   = ep;
         s_rd_slots[i].busy = true;
-        /* 45 ms Versatz je Slot: die Antworten kommen dann einzeln zurueck
-         * und nicht als Burst im Callback. */
+        /* 每个槽错开 45 ms：这样回执是一个个回来，
+         * 而不是在回调里挤成一堆。 */
         esp_zb_scheduler_alarm(read_onoff_send, i, (uint32_t)(10 + i * 45));
         return;
     }
@@ -1990,7 +1952,7 @@ void zb_gateway_read_onoff(uint16_t addr, uint8_t ep) {
 }
 
 
-/* ── switch2wifi-Befehl an alle bekannten Devices senden ────────────────── */
+/* ── 向所有已知设备发送 switch2wifi 命令 ────────────────────────────────── */
 #define SW2WIFI_CLUSTER  0xFF01
 #define SW2WIFI_CMD_ID   0x01
 
@@ -2029,7 +1991,7 @@ void zb_gateway_send_switch2wifi_all(void) {
     esp_zb_scheduler_alarm(send_switch2wifi_cb, 0, 0);
 }
 
-/* ── set_sleep-Befehl an alle Devices senden ────────────────────────────── */
+/* ── 向所有设备发送 set_sleep 命令 ──────────────────────────────────────── */
 static uint32_t s_sleep_pending_s = 600;
 
 static void send_set_sleep_cb(uint8_t param) {

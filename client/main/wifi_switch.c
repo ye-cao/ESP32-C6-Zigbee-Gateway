@@ -1,12 +1,12 @@
 /*
- * wifi_switch.c – WiFi-Modus für WIFI_SWITCH_TIMEOUT_S, dann esp_restart()
+ * wifi_switch.c —— 进入 WiFi 模式并保持 WIFI_SWITCH_TIMEOUT_S，然后 esp_restart()
  *
- * Ablauf:
- *   1. Empfang des switch2wifi-Befehls via Zigbee → wifi_switch_trigger()
- *   2. NVS-Flag setzen + esp_restart()
- *   3. Nächster Boot: app_main prüft Flag → wifi_switch_run()
- *   4. WiFi scan → bestes offenes AP → verbinden → warten → esp_restart()
- *   5. Nächster Boot: normaler Zigbee-Betrieb
+ * 流程：
+ *   1. 经 Zigbee 收到 switch2wifi 命令 → wifi_switch_trigger()
+ *   2. 置 NVS 标志 + esp_restart()
+ *   3. 下次启动：app_main 检查标志 → wifi_switch_run()
+ *   4. 扫 WiFi → 挑信号最好的开放 AP → 连上 → 等一会儿 → esp_restart()
+ *   5. 再下次启动：回到正常 Zigbee 模式
  */
 #include "wifi_switch.h"
 #include "ha_mqtt.h"
@@ -48,16 +48,16 @@ static void set_pending(uint8_t val) {
     }
 }
 
-/* Aus Zigbee-Callback aufrufen: Flag setzen + sofortiger Neustart */
+/* 从 Zigbee 回调里调用：置标志 + 立即重启 */
 void wifi_switch_trigger(void) {
     set_pending(1);
     ha_mqtt_emit_raw("{\"t\":\"switch2wifi\",\"state\":\"rebooting\"}");
-    /* Kurze Verzögerung damit emit() flushen kann, dann Neustart */
+    /* 稍等一下，让 emit() 把数据吐完，再重启 */
     vTaskDelay(pdMS_TO_TICKS(150));
     esp_restart();
 }
 
-/* ── Minimales MQTT PUBLISH über TCP-Socket ─────────────────────────────── */
+/* ── 用 TCP socket 发最小化的 MQTT PUBLISH ──────────────────────────────── */
 static void mqtt_publish_ip(const char *broker_ip, const char *topic,
                             const char *payload) {
     struct sockaddr_in addr = {
@@ -104,13 +104,13 @@ static void mqtt_publish_ip(const char *broker_ip, const char *topic,
     close(sock);
 }
 
-/* ── WiFi-Modus (läuft in app_main vor Zigbee-Start) ───────────────────── */
+/* ── WiFi 模式（在 app_main 里、Zigbee 启动之前跑） ─────────────────────── */
 void wifi_switch_run(void) {
-    set_pending(0);   /* Flag sofort löschen */
+    set_pending(0);   /* 立刻清掉标志 */
 
     ha_mqtt_emit_raw("{\"t\":\"switch2wifi\",\"state\":\"starting\"}");
 
-    /* Event-Loop + Netif init (einmalig, da kein Zigbee gestartet wird) */
+    /* 初始化事件循环 + netif（只做一次，因为这个模式不起 Zigbee） */
     esp_err_t err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "event_loop_create: %s", esp_err_to_name(err));
@@ -134,7 +134,7 @@ void wifi_switch_run(void) {
     memset(recs, 0, sizeof(recs));
     esp_wifi_scan_get_ap_records(&ap_count, recs);
 
-    /* Bestes offenes AP (stärkstes Signal, kein Passwort) */
+    /* 挑最好的开放 AP（信号最强、不需要密码） */
     int best = -1, best_rssi = -128;
     for (int i = 0; i < ap_count; i++) {
         if (recs[i].authmode == WIFI_AUTH_OPEN && recs[i].rssi > best_rssi) {
@@ -177,7 +177,7 @@ void wifi_switch_run(void) {
         ssid, WIFI_SWITCH_TIMEOUT_S);
     ha_mqtt_emit_raw(line);
 
-    /* IP ermitteln und per MQTT direkt an Broker senden */
+    /* 取 IP，直接用 MQTT 发给 broker */
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif) {
         esp_netif_ip_info_t ip_info;

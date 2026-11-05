@@ -11,10 +11,10 @@ zerhackt; das erste Fragment endet mitten im Hex-String, strchr(pd,'"')
 findet kein Ende → Frame wird stillschweigend verworfen → kein ACK.
 
 Dieser Test baut beide Seiten nach:
-  * Gateway: die echten Funktionen aus serial_gateway.py (_fw_ota_start,
-    _fw_ota_send_batch, _fw_ota_close)
-  * C6: ein FakeSerial, das die fgets-Semantik exakt nachbildet
-    (Zeilen werden bei buf_size-1 Zeichen zerschnitten)
+  * 网关侧：直接用 serial_gateway.py 里真实的函数（_fw_ota_start、
+    _fw_ota_send_batch、_fw_ota_close）
+  * C6 侧：一个 FakeSerial，精确复刻 fgets 的行为
+    （行会在 buf_size-1 个字符处被切断）
 
 Erwartung:
   FW_CHUNK=80  → Transfer läuft durch, Byte für Byte identisch, 0 Fragmente
