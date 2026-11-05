@@ -1,174 +1,144 @@
-# Changelog
+# 变更日志
 
-Alle nennenswerten Änderungen an diesem Projekt.
-Format orientiert sich an *Keep a Changelog*, Versionierung an der Add-on-Version
-(`host/addon/esp32c6_gateway/config.json`), weil das die einzige Versionsnummer ist,
-die Nutzer in der Oberfläche sehen.
+本文件记录本项目所有值得说明的改动。
+格式参考 *Keep a Changelog*，版本号沿用 add-on 的版本号
+（`host/addon/esp32c6_gateway/config.json`），因为那是用户在界面上唯一能看到的号。
+
+> 语言约定：说明、注释、文档一律中文（专有名词与 API 名保留原文）。
 
 ## [1.5.4] – 2026-11-05
 
-Schwerpunkt: **Geräte wirklich löschen können**. Ein Knoten, der in ein
-anderes Netz umgezogen ist, blieb bisher als Karteileiche stehen – in der
-Weboberfläche, in MQTT (retained) und in Home Assistant.
+重点：**让设备真的能被删掉**。已经搬到别的 Zigbee 网络的节点，以前会一直作为
+僵尸残留在网页、MQTT（retained）和 Home Assistant 里。
 
-### Added – Firmware (Koordinator, `main/`)
+### 新增 – 固件（协调器 `main/`）
 
-- **`zb_gateway_remove_device()`** (`zb_gateway.c`) plus Serienbefehl
-  `{"cmd":"dev_remove","addr":"0x…"}`: entfernt den Eintrag aus der
-  Gerätetabelle **und** der NVS-Kopie (`devtab_save()`) und schickt
-  anschließend in einem eigenen Task ein ZDO `Mgmt_Leave_req` hinterher
-  (`rejoin = 0`, nur wenn die IEEE bekannt ist). Antwort:
-  `{"t":"dev_removed","addr":…,"ieee":…,"found":…,"leave":…}`.
-- Der Befehl ist in **beiden** Hälften verdrahtet – `main.c` (Dispatch) und
-  `ha_mqtt.c` (JSON→payload). Fehlt eine davon, antwortet der Koordinator
-  `{"t":"error","why":"unknown_cmd"}`; genau das passierte beim ersten
-  Versuch, obwohl die Funktion längst kompiliert war.
-- Grenze, bewusst so dokumentiert: ZBOSS' eigene Nachbar-/Routing-Tabelle
-  räumt der Aufruf nicht auf (keine API in `esp-zigbee-lib`); tote Nachbarn
-  fallen dort über das Link-Status-Aging von selbst heraus.
+- **`zb_gateway_remove_device()`**（`zb_gateway.c`）+ 串口命令
+  `{"cmd":"dev_remove","addr":"0x…"}`：从设备表**和** NVS 副本（`devtab_save()`）
+  里删掉该条目，随后另起任务补发一次 ZDO `Mgmt_Leave_req`（`rejoin = 0`，仅在
+  IEEE 已知时发送）。回执：
+  `{"t":"dev_removed","addr":…,"ieee":…,"found":…,"leave":…}`。
+- 该命令必须登记在**两处**——`main.c`（命令分发）和 `ha_mqtt.c`（JSON→payload）。
+  少一处，协调器就回 `{"t":"error","why":"unknown_cmd"}`；本次第一次测试正是如此，
+  尽管函数早已编译进固件。
+- 边界（有意如此并写明）：ZBOSS 自己的邻居/路由表不会因此清理——
+  `esp-zigbee-lib` 没有对应 API；死掉的邻居会由 link-status 老化自行淘汰。
 
-### Added – Add-on (`host/addon/esp32c6_gateway/`)
+### 新增 – Add-on（`host/addon/esp32c6_gateway/`）
 
-- **`_device_remove()`**: ein Pfad für „Gerät ist endgültig weg“.
-  Löscht retained Zustands-Topics, die HA-Discovery-Configs (auch die aus
-  dem Broker-Stand `_disc_remote`, nicht nur die in dieser Sitzung
-  publizierten), die Adress-/IEEE-Zuordnungen, `_noread`/`_ctrl`, die
-  Verfügbarkeits-Zettel und die retained `dev/<addr>/status`; danach
-  `_nodes_save()`. Erst dann geht `dev_remove` an den Koordinator.
-- `POST /api/device/<addr>/delete` nutzt diesen Pfad (vorher: nur
-  `_state["devices"].pop()` + DB-Zeile – die Kachel war nach 60 s zurück,
-  weil der Heartbeat die Gerätetabelle erneut schickt und `t=="lqi"` sie
-  per `setdefault` wieder anlegt).
-- Neue Nachricht `{"t":"dev_removed"}`: bestätigt das Löschen und räumt
-  Reste nach, falls die Adresse hier noch bekannt war.
-- Geräteseite: Knopf heißt jetzt „从网关彻底移除（含 HA 实体）“ und nennt
-  in der Rückfrage die vier Wirkungen. Der wirkungslose Eintrag `leave`
-  im Befehls-Dropdown ist entfernt (die Firmware kannte ihn nie).
+- **`_device_remove()`**：一个“设备彻底不在了”的出口。删除 retained 状态话题、
+  HA Discovery 配置（session 内发布过的 `_sent_addr` **和** 启动时从 broker 读到的
+  镜像 `_disc_remote` 两处都查）、地址/IEEE 映射、`_noread`/`_ctrl`、可用性记分板
+  和 retained 的 `dev/<addr>/status`；然后 `_nodes_save()`，最后才向协调器发
+  `dev_remove`。
+- `POST /api/device/<addr>/delete` 改用这条路径（以前只做
+  `_state["devices"].pop()` + 删 DB 行——60 秒后设备就回来了，因为心跳会把整份
+  设备表重新发下来，而 `t=="lqi"` 分支用 `setdefault` 把缺的地址又建了回来）。
+- 新增消息 `{"t":"dev_removed"}`：确认删除，并在本地仍有残留时补清理。
+- 设备页按钮改名为「从网关彻底移除（含 HA 实体）」，确认框里写明四项影响；
+  删除了下拉里那个 `leave` 选项（固件从来就不认识它，纯属摆设）。
 
 ## [1.5.3] – 2026-10-26
 
-Erste getaggte Version. Schwerpunkt: **Netzwerktopologie sichtbar machen,
-OTA-Downloads zuverlässig machen und den seriellen Pfad unempfindlich gegen
-einen toten USB-CDC-Filedescriptor**.
+第一个打标签的版本。重点：**让网络拓扑可见、让 OTA 下载可靠、让串口链路扛得住
+一个已经死掉的 USB-CDC 文件描述符**。
 
-Stack: ESP-IDF 5.5.1 · `esp-zigbee-lib` 1.6.8 · `esp-zboss-lib` 1.6.4
-Gerätekapazität: 64 Knoten · OTA image types `0x0001` (Endgerät) / `0x0002` (Repeater),
-Hersteller-Code `0x131B`
+技术栈：ESP-IDF 5.5.1 · `esp-zigbee-lib` 1.6.8 · `esp-zboss-lib` 1.6.4
+设备容量：64 个节点 · OTA image type `0x0001`（终端节点）/ `0x0002`（中继），
+厂商代码 `0x131B`
 
-### Added – Firmware (Koordinator, `main/`)
+### 新增 – 固件（协调器 `main/`）
 
-- **`zb_topo.c` / `zb_topo.h`**: echte Mesh-Topologie über ZDO `Mgmt_Lqi_Req`
-  (`0x0031`) pro Knoten, inklusive Seiten-Fortsetzung und 15-s-Watchdog.
-  Ausgabe als `{"t":"topo_mesh",…}`. Wichtig: Parameter **müssen** mit
-  `ZB_BUF_GET_PARAM()` in den Buffer gelegt werden – `zb_buf_begin()` erhöht die
-  Bufferlänge nicht, ZBOSS adressiert dann sich selbst (`0x0000`) und jedes Gerät
-  meldet die Nachbarschaft des Koordinators.
-- **`zb_ota_server.c`**: OTA-Server neu geschrieben. Vier Fehler, die den Download
-  vorher unbrauchbar machten, sind behoben:
-  1. `ota_data` wird jetzt mit `json_val()` geparst (das JSON enthält Leerzeichen
-     nach dem Doppelpünktchen; ein fest verdrahtetes `strstr("\"data\":\"")` verwarf
-     still jeden Block).
-  2. Der **Datei-Offset des Clients** wird aus dem Image-Block-Request (ASDU)
-     gelesen und dem Callback mitgeteilt. Der SDK-Callback liefert keinen Offset;
-     ein blind hochgezählter Serverzeiger schob nach einem Neustart des Koordinators
-     das gesamte Bild um die bereits übertragenen Bytes – der Grund, warum frühere
-     Läufe bei „99,4 %" hingen und die Version nie aktiv wurde.
-  3. Ein **2-KB-Fenster** wird vorab gefüllt, bevor `notify_req` läuft. Läuft der
-     erste Block-Request ins Leere, bricht der SDK die Session ab (kein Retry).
-  4. Statistik (`hit / miss / to / bad / served / sync`) plus `ota_stop`.
-- **`zb_gateway.c`**: LQI/RSSI werden nur noch bei **gültigen** Werten überschrieben
-  (`ind.lqi != 0`); neues Feld `lqia` (Sekunden seit der letzten gültigen Messung,
-  `0xFFFFFFFF` = nie). Vorher setzte ein einziger Frame ohne LQI alle Geräte auf 0.
-- **`main.c`**: `zb_lock()` / `zb_unlock()` um **jeden** SDK-Aufruf aus fremden Tasks
-  (`uart_rx`, `btn`, `heartbeat`, `scan`). `port_uxCriticalNesting` ist global pro Kern,
-  nicht pro Task – ungeschützte `esp_zb_*`-Aufrufe führen zu
-  `assert failed: vPortExitCritical … (port_uxCriticalNesting[0] > 0)` und `rst:0xc`.
-  Ausgenommen sind nur reine Flash-Pfade (`fw_ota_*`, `ota_data`).
-  Puffer in `heartbeat_task` sind jetzt `static` (4 KB Task-Stack reichten nicht).
-- **`ha_mqtt.c`**: `emit()` schreibt nicht mehr blockierend aus dem ZBOSS-Task.
-  Zeile → Heap-Block → 16 tiefe Queue → eigener `tx_task`. Ein 4-KB-Topologie-Dump
-  blockierte vorher ~1,4 s und riss den MAC-Layer in
-  `Guru Meditation (Load access fault)` mit anschließendem Reboot.
-- Geräteleistung schreibbar (`set_dev_power`, Basic `0x0016`).
+- **`zb_topo.c` / `zb_topo.h`**：通过逐节点的 ZDO `Mgmt_Lqi_Req`（`0x0031`）取真实
+  Mesh 拓扑，含分页续取和 15 s 看门狗。输出 `{"t":"topo_mesh",…}`。要点：参数
+  **必须**用 `ZB_BUF_GET_PARAM()` 放进缓冲区——`zb_buf_begin()` 不增加缓冲长度，
+  ZBOSS 于是把请求发给自己（`0x0000`），每台设备都会回报“协调器自己的邻居”。
+- **`zb_ota_server.c`**：OTA 服务端重写。四个让下载彻底不可用的错误已修：
+  1. `ota_data` 改用 `json_val()` 解析（JSON 冒号后有空格；写死的
+     `strstr("\"data\":\"")` 会**静默丢弃每一块**）。
+  2. 从 Image Block Request（ASDU）里读出**客户端的文件偏移**并告知回调。SDK 回调
+     不给 offset；盲目自增的服务端游标在协调器重启后会把整份镜像整体错位——这就是
+     以前“跑到 99.4% 却版本不生效”的原因。
+  3. `notify_req` 之前**预填 2 KB 窗口**。第一个块请求落空会让 SDK 直接中断会话
+     （不重试）。
+  4. 统计（`hit / miss / to / bad / served / sync`）外加 `ota_stop`。
+- **`zb_gateway.c`**：LQI/RSSI 仅在**有效值**时才覆盖（`ind.lqi != 0`）；新增字段
+  `lqia`（距上次有效测量的秒数，`0xFFFFFFFF` = 从未）。以前只要来一帧没带 LQI 的
+  报文，所有设备的值就被清零。
+- **`main.c`**：对来自外来任务的**每一次** SDK 调用都加 `zb_lock()` / `zb_unlock()`
+  （`uart_rx`、`btn`、`heartbeat`、`scan`）。`port_uxCriticalNesting` 是每核全局的，
+  不是每任务的——未加锁的 `esp_zb_*` 调用会导致
+  `assert failed: vPortExitCritical … (port_uxCriticalNesting[0] > 0)` 和 `rst:0xc`。
+  只有纯 Flash 路径（`fw_ota_*`、`ota_data`）例外。
+  `heartbeat_task` 里的缓冲区改为 `static`（4 KB 任务栈放不下）。
+- **`ha_mqtt.c`**：`emit()` 不再在 ZBOSS 任务里阻塞写串口。整行 → 堆块 → 16 深度
+  队列 → 独立 `tx_task`。以前一次 4 KB 的拓扑 dump 会阻塞约 1.4 s，把 MAC 层拖进
+  `Guru Meditation (Load access fault)` 并随后重启。
+- 设备发射功率可写（`set_dev_power`，Basic `0x0016`）。
 
-### Added – Repeater (`router/`)
+### 新增 – 中继器（`router/`）
 
-- **`zb_ota_client.c` / `zb_ota_client.h`**: OTA-Client, image type `0x0002`,
-  `max_data_size = 223`, Version aus NVS, `esp_ota_set_boot_partition()` + Neustart.
-- **Vendor-Cluster `0xFC00`**: `0x0001` = Sendeleistung (S8, dBm, **NVS-persistent**),
-  `0x0002` = selbst gemeldeter Elternknoten.
-- **BOOT-Taste kurz (<1 s)** schaltet die Leistung 8 → 14 → 20 → 8 dBm und speichert sie.
+- **`zb_ota_client.c` / `zb_ota_client.h`**：OTA 客户端，image type `0x0002`，
+  `max_data_size = 223`，版本存 NVS，`esp_ota_set_boot_partition()` + 重启。
+- **厂商簇 `0xFC00`**：`0x0001` = 发射功率（S8，dBm，**NVS 持久化**），
+  `0x0002` = 自报的父节点。
+- **BOOT 键短按（<1 s）**循环切换功率 8 → 14 → 20 → 8 dBm 并保存。
 
-### Added – Add-on (`host/addon/esp32c6_gateway/`, v1.5.3)
+### 新增 – Add-on（`host/addon/esp32c6_gateway/`，v1.5.3）
 
-- **Serieller Selbstheiler**: Nach einem Container-Neustart liefert der alte
-  USB-CDC-Filedescriptor dauerhaft `[Errno 5] I/O error`; ein erneuter Versuch auf
-  demselben fd erholt sich **nie**. Neu: `_NullSerial`, `_serial_open()` mit Retries,
-  `_serial_reopen()` mit Backoff, `_serial_kick_reset()` (nur RTS, **nie** DTR –
-  DTR ist der Strapping-Pin), verschluckte Schreibfehler und ein 45-s-Watchdog.
-  Zusätzlich `POST /api/serial_reopen`.
-- **Geräte-Availability**: jedes Gerät bekommt ein eigenes
-  `{base}/dev/<addr>/status`-Topic, Discovery nutzt `availability_mode: "all"`.
-  Vorher zeigten ausgefallene Schalter „aus" statt „nicht verfügbar", weil nur der
-  Gateway-Zustand zählte. Bewertung über ein Punktesystem (APS-Frame, erfolgreicher
-  `node_desc`-Probe, Nachbarschaftseintrag); ein Gerät gilt erst als verschwunden,
-  wenn es im Gerätebestand steht, seit dem Start nichts gemeldet hat **und** in einer
-  frischen Nachbarschaftstabelle fehlt (5 min Schonfrist).
-- **Discovery-Migration**: `_disc_upgrade_avail()` ergänzt beim Start die zweite
-  Availability-Quelle in bereits vorhandenen retained Configs. Ohne das behielten
-  Geräte, die nach dem Update nie wieder etwas senden, für immer die alte Config.
-- **Topologie-Auto-Sammlung** (`topo_interval`, Standard 60 s) und
-  **15-s-Auto-Refresh** der Topologie-Seite; Rundenzähler, „zuletzt gesammelt"-Zeit
-  und stabile Mesh-Daten (Geräte verschwinden nicht mehr kurzzeitig, nur weil ihre
-  Antwort später eintrifft).
-- **Geräteliste aus der Nachbarschaftstabelle** und aus rohen APS-Frames –
-  reine Tasterpanels (die nie einen ZCL-Report senden) tauchen jetzt überhaupt erst
-  in der Oberfläche auf.
-- **Sendeleistung wird gemerkt** (`/data/gw_txpower.json`) und nach jedem
-  Koordinator-Neustart erneut gesetzt, bis der Rücklesewert sie bestätigt.
-  Die Firmware speichert sie **nicht** in NVS; ohne das lief das Gateway nach einem
-  Stromausfall still mit der Standardleistung weiter (an `lqi`/`rssi` nicht erkennbar,
-  weil die die Gegenrichtung beschreiben).
-- Geräteseite: „zuletzt gemeldet" pro Gerät, LQI mit Altersangabe.
-- Broadcast-Adressen (`0xfffc`–`0xffff`) werden bei `node_desc` verworfen; vorher
-  erzeugte `0xffff` einen dauerhaften Fehleintrag „Gerät offline".
-- Weitere Option `topo_interval` in `config.json` / `run.sh`.
+- **串口自愈**：容器重启后旧的 USB-CDC 文件描述符会永久返回 `[Errno 5] I/O error`，
+  在同一个 fd 上重试**永远不会**恢复。新增 `_NullSerial`、带重试的 `_serial_open()`、
+  带退避的 `_serial_reopen()`、`_serial_kick_reset()`（只拉 RTS，**绝不**碰 DTR——
+  DTR 是 strapping 引脚）、吞掉写错误后的补写，以及 45 s 看门狗。
+  另加 `POST /api/serial_reopen`。
+- **设备级可用性**：每台设备有自己的 `{base}/dev/<addr>/status` 话题，Discovery 用
+  `availability_mode: "all"`。以前掉线的开关显示“关”，因为只看网关状态。判定用记分
+  板（APS 帧、成功的 `node_desc` 探测、邻居表条目）；一台设备只有在“历史上有实体、
+  本次启动后毫无音讯、**且**不在新鲜的邻居表里”时才算消失（启动后 5 分钟宽限）。
+- **Discovery 迁移**：`_disc_upgrade_avail()` 在启动时给已存在的 retained 配置补上
+  第二个可用性来源。否则升级后再没发过消息的设备会永远保留旧配置。
+- **拓扑自动采集**（`topo_interval`，默认 60 s）和拓扑页 **15 秒自动刷新**；
+  轮次计数、“本轮采集完成于”时间戳，以及稳定的 Mesh 数据（设备不再因为应答晚到而
+  短暂消失）。
+- **设备列表来自邻居表和裸 APS 帧**——纯按键面板（从不会发 ZCL Report）现在才第一次
+  出现在界面上。
+- **发射功率会被记住**（`/data/gw_txpower.json`），并在每次协调器重启后重新下发，
+  直到回读值确认。固件**不**把它写进 NVS；没有这一步，断电后网关会静默地以默认功率
+  运行（从 `lqi`/`rssi` 看不出来，因为它们反映的是反方向）。
+- 设备页：每台设备的“最后上报”，LQI 带年龄标注。
+- `node_desc` 丢弃广播地址（`0xfffc`–`0xffff`）；以前 `0xffff` 会生成一条永久的
+  “设备离线”错误记录。
+- `config.json` / `run.sh` 新增选项 `topo_interval`。
 
-### Added – Tests und Werkzeuge
+### 新增 – 测试与工具
 
-- `tools/checks/run_all.py` – ein Aufruf prüft alles:
-  Geräte-Availability/Discovery/Tx-Power, Topologie-Runden, serielle Selbstheilung,
-  Web-UI-Rendering + i18n.
-- `tools/ota_watch.py` – Durchsatz/Stillstands-Monitor für Zigbee-OTA.
-- `tools/mq_dump.py` – retained Discovery-Configs und Availability-Topics auslesen.
+- `tools/checks/run_all.py` —— 一条命令跑全部检查：设备可用性/Discovery/发射功率、
+  拓扑轮次、串口自愈、Web UI 渲染 + i18n。
+- `tools/ota_watch.py` —— Zigbee OTA 的速率/停顿监视。
+- `tools/mq_dump.py` —— 导出 retained 的 Discovery 配置和可用性话题。
 
-### Changed
+### 变更
 
-- Vorcompilierte Images `firmware/zigbee-vital-sensor-sdk16.bin` (663 616 B) und
-  `firmware/zigbee-repeater.bin` (613 088 B) entsprechen jetzt exakt dem Stand der
-  Quellen (Byte-Vergleich mit dem Build geprüft).
-- `README.md` und `DEVICE_INTEGRATION_REPORT.md` um Topologie, OTA und
-  Leistungsmessungen ergänzt; `OTA-调试记录-2026-10-26.md` dokumentiert die vier
-  OTA-Server-Fehler im Detail.
+- 预编译镜像 `firmware/zigbee-vital-sensor-sdk16.bin`（663 616 B）和
+  `firmware/zigbee-repeater.bin`（613 088 B）现在与源码状态完全一致（已与构建产物
+  逐字节比对）。
+- `README.md` 和 `DEVICE_INTEGRATION_REPORT.md` 补充了拓扑、OTA 与功率测量；
+  `OTA-调试记录-2026-10-26.md` 详细记录了那四个 OTA 服务端错误。
 
-### Fixed – Feldbefunde
+### 修复 – 现场实测
 
-- Repeater-OTA **an seinem Einsatzort** (LQI 40–51, RSSI −71 dBm): 613 088 B in
-  **772 s**, ~920 B/s, **0 Stillstände**, Server `hit=2751 miss=0 to=0 bad=0`.
-  Damit ist belegt: der frühere Einbruch auf 115 B/s war kein Funkproblem, sondern
-  die vier OTA-Server-Fehler. Der Repeater muss zum Aktualisieren **nicht** neben
-  den Koordinator gestellt werden.
-- Obergrenze des Durchsatzes ist strukturell: 223 B pro Block überschreiten die
-  APS-Nutzlast einer 802.15.4-Frame (~82 B), also drei Fragmente mit je einem ACK
-  ⇒ ~4,4 Blöcke/s ≈ 950 B/s, unabhängig von der Linkqualität.
+- 中继在其**安装位置**做 OTA（LQI 40–51、RSSI −71 dBm）：613 088 B / **772 s**，
+  ~920 B/s，**0 次停顿**，服务端 `hit=2751 miss=0 to=0 bad=0`。据此可以断定：以前
+  掉到 115 B/s 不是信号问题，而是那四个 OTA 服务端错误。升级**不需要**把中继搬到
+  协调器旁边。
+- 吞吐上限是结构性的：每块 223 B 超过 802.15.4 单帧的 APS 净荷（约 82 B），即拆成
+  3 个分片各自 ACK ⇒ 约 4.4 块/秒 ≈ 950 B/s，与链路质量无关。
 
-### Known limitations
+### 已知限制
 
-- Netzwerke mit Geräten, die `Mgmt_Lqi_Req` nicht beantworten (z. B. Feibit-Schalter,
-  `0x84 NOT_SUPPORTED`) und ESP32-C6-Repeater, deren ZBOSS `relationship` immer 2 und
-  `depth` immer 0 liefert: Elternbeziehungen werden deshalb aus einem ungerichteten
-  Kantengraph (Koordinator-Nachbarschaft + Selbstauskünfte) per BFS abgeleitet.
-- Der Durchsatz ließe sich nur durch kleinere Blöcke (82/160 B) steigern; das
-  erfordert ein USB-Flashen des Repeaters und ist nicht verifiziert.
-- `dev_cmd`/`set_dev_power` wirken nur auf Geräte, die Basic `0x0016` beschreibbar
-  anbieten; der Repeater speichert seine Leistung selbst in NVS.
+- 对于不回应 `Mgmt_Lqi_Req` 的设备（如 Feibit 开关，回 `0x84 NOT_SUPPORTED`），以及
+  ZBOSS 一律把 `relationship` 填 2、`depth` 填 0 的 ESP32-C6 中继：父子关系只能由
+  “协调器邻居表 + 设备自报”构成的**无向边图**通过 BFS 推导。
+- 想再提速只能把块调小（82/160 B）；这需要 USB 刷中继，收益未经验证。
+- `dev_cmd`/`set_dev_power` 只对提供了可写 Basic `0x0016` 的设备有效；中继把自己的
+  功率存在自己的 NVS 里。
