@@ -1,9 +1,9 @@
-# ESP32-C6 Matter over Thread – Vital Gateway
+# ESP32-C6 Matter over Thread —— 生命体征网关
 
-Zweite Firmware-Variante für denselben ESP32-C6 + MR60BHA1 Hardware-Stack.
-Statt Zigbee 3.0 + MQTT wird hier **Matter over Thread** verwendet.
+同一套 ESP32-C6 + MR60BHA1 硬件的第二种固件方案：不用 Zigbee 3.0 + MQTT，
+改用 **Matter over Thread**。
 
-## Architektur
+## 架构
 
 ```
 MR60BHA1 ──UART──► ESP32-C6 [ Matter End Device ]
@@ -17,26 +17,26 @@ MR60BHA1 ──UART──► ESP32-C6 [ Matter End Device ]
               Home Assistant (Matter Controller)
 ```
 
-## Unterschied zur Zigbee-Variante
+## 与 Zigbee 方案的差别
 
-| | Zigbee-Firmware (`main/`) | Matter-Firmware (`matter/`) |
+| | Zigbee 固件（`main/`） | Matter 固件（`matter/`） |
 |---|---|---|
-| Stack | esp-zigbee-sdk | esp-matter + OpenThread |
-| Transport | Zigbee Mesh | Thread Mesh (IPv6) |
-| Host-Software | gateway_service.py + MQTT | Kein Host nötig (native Matter) |
-| Commissioning | Permit Join | BLE GATT (QR-Code) |
-| HA-Integration | MQTT Auto-Discovery | Native Matter |
+| 协议栈 | esp-zigbee-sdk | esp-matter + OpenThread |
+| 传输 | Zigbee Mesh | Thread Mesh（IPv6） |
+| 上位机软件 | gateway_service.py + MQTT | 不需要（原生 Matter） |
+| 配网 | Permit Join | BLE GATT（二维码） |
+| HA 集成 | MQTT 自动发现 | 原生 Matter |
 
-## Matter Data Model
+## Matter 数据模型
 
-| Endpoint | Cluster | Inhalt |
+| 端点 | 簇 | 内容 |
 |---|---|---|
-| 0 | Basic Information | Device info, OTA |
-| 1 | Occupancy Sensing | Radar-Präsenz (radar_status == 2) |
-| 2 | (Custom 0xFFF10001) | Herzrate BPM + Kategorie |
-| 3 | (Custom 0xFFF10002) | Atemrate RPM + Kategorie |
+| 0 | Basic Information | 设备信息、OTA |
+| 1 | Occupancy Sensing | 雷达存在检测（radar_status == 2） |
+| 2 | （自定义 0xFFF10001） | 心率 BPM + 分类 |
+| 3 | （自定义 0xFFF10002） | 呼吸率 RPM + 分类 |
 
-## Voraussetzungen
+## 前提条件
 
 ```bash
 # ESP-IDF >= 5.1
@@ -47,7 +47,7 @@ git clone --recursive https://github.com/espressif/esp-matter $ESP_MATTER_PATH
 . $ESP_MATTER_PATH/export.sh
 ```
 
-## Bauen & Flashen
+## 编译与烧写
 
 ```bash
 cd matter/
@@ -56,18 +56,19 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-## Matter Commissioning
+## Matter 配网
 
-Nach dem Flash mit Apple Home, Google Home oder Home Assistant:
-1. QR-Code aus `idf.py monitor` ablesen
-2. Im Controller „Gerät hinzufügen" → QR-Code scannen
-3. Gerät erscheint als „Vital Sensor" ohne weiteren Gateway
+烧写之后，用 Apple 家庭、Google Home 或 Home Assistant：
 
-## Status
+1. 从 `idf.py monitor` 里读出二维码
+2. 在控制器里点「添加设备」→ 扫描二维码
+3. 设备直接以「Vital Sensor」出现，不需要任何额外网关
 
-- [x] Projektgerüst
-- [x] MR60BHA1 UART-Treiber (wiederverwendet)
-- [x] Matter Occupancy-Endpoint
-- [ ] Custom Cluster BPM/RPM
-- [ ] OTA-Update via Matter
-- [ ] Thread Border Router Anleitung
+## 状态
+
+- [x] 工程骨架
+- [x] MR60BHA1 UART 驱动（复用）
+- [x] Matter Occupancy 端点
+- [ ] 自定义 BPM/RPM 簇
+- [ ] 通过 Matter 做 OTA
+- [ ] Thread Border Router 配置说明
