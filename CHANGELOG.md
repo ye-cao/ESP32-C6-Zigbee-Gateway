@@ -8,6 +8,89 @@
 
 ## [未发布]
 
+### 修复 – 固件（协调器 `main/`）
+
+- **★★★ Wi-Fi 扫不到 AP / 连上就狂掉包的根因：从未注册 Wi‑Fi ↔ 802.15.4 共存仲裁。**
+  `CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y` 只是把 `esp_coex` 组件编进固件，并不等于
+  把 802.15.4 注册进仲裁器。对照 ESPHome 官方 `zigbee_esp32.cpp` 发现它在
+  `esp_zigbee_init()` 之后显式调用 `esp_coex_wifi_i154_enable()`，并在
+  `zigbee_esp32.py` 里 `include_builtin_idf_component("esp_coex")`；本项目
+  `main/CMakeLists.txt` 的 `REQUIRES` 里没有 `esp_coex`，链接图里该符号出现 0 次。
+  本次补上：`REQUIRES` 增加 `esp_coex`，`wifi_begin()` 在 `esp_wifi_init()` 之前调用
+  `esp_coex_wifi_i154_enable()`，`net_status` 新增 `"coex"` 回执（`0`=已启用、
+  `0x7FFFFFFF`=尚未调用，便于实测确认）。
+  **实测（同一块板、同一 AP、未做物理 RST）**：刷写前 `EARLYJOIN ok:0 / why=209`、
+  Wi-Fi 完全连不上；刷写后 `wifi_join ok:1 ip=192.168.100.139 rssi=-59 ch=1 why=0`、
+  `coex=0`；连续 `ping -n 40` **0% 丢包、平均 85 ms**（此前记录为丢 70% / RTT 3122 ms）。
+  ARP 复核 MAC `98-88-e0-71-b8-54` 确认目标就是 C6。
+- **`wifi_scan` 会把已关联的 STA 打断且不恢复。** 原实现无条件
+  `esp_wifi_disconnect()` 后做 13 信道主动扫描，注释假设「net_task 下一轮会重连」，
+  但串口模式 `tr=0` 下 `net_task` 根本没启动 ⇒ 实测 `why=8`（ASSOC_LEAVE）、
+  ARP 消失、网关离线。现改为：已关联时只扫当前 AP 信道（短驻留、不断开），
+  未关联时保持全信道扫描；回执新增 `"attached"` 说明扫的是哪一种。
+- **OTA 后可能回滚。** `serial_ota.c` 用标准 `esp_ota_*`，
+  `esp_ota_set_boot_partition()` 会把新镜像标成 `PENDING_VERIFY`；此前未开启
+  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`，也没有首启确认逻辑。现在开启该配置，
+  并在 `app_main()` 末尾（Zigbee 已启动、任务已建）确认健康后调用
+  `esp_ota_mark_app_valid_cancel_rollback()`，避免「OTA 成功但重启回旧固件」。
+
+### 变更 – 构建（**IDF 5.5.1 → 5.5.2，根因的最后一块**）
+
+- `esp_coex_wifi_i154_enable()` 在 IDF **5.5.1 里是半成品**：实现只有
+  `coex_enable(); coex_schm_status_bit_set(1, 1);`（源码注释还挂着
+  `TODO: Add a scheme for wifi and 154 coex`），`libcoexist.a` 里**没有**
+  `esp_coex_ieee802154_status_enable` 这个符号，`coexist.c` 也没 include
+  `esp_coex_i154.h`。5.5.2 起才改成
+  `coex_enable(); esp_coex_ieee802154_status_enable();`。
+  6.0.2 与 5.5.2 在共存策略上一致，只差底层时钟/GPIO 初始化写法。
+- 这解释了此前「补了调用却仍时好时坏」：5.5.1 上只是设了一个无语义的 scheme
+  状态位，仲裁器并不知道要给 802.15.4 留窗口。
+- 版本背景：5.5.1 发布于 2025‑08‑30，5.5.6 是 2026‑10‑16，落后 5 个 bugfix
+  版本、14 个月；`libphy`/`libnet80211`/`libpp` 三个射频库逐版本都不同
+  （`libphy` 182180 → 184020 → 185912 B）。ESPHome 官方 Zigbee 组件要求
+  IDF ≥ 5.5.4。
+- 选型：升 **5.5.2**（本机已装），不升 6.0（共存能力等价、破坏性变更多、
+  ZBOSS 1.6.8 在 6.0 上未验证），不换 `esp-zigbee-lib 2.0.5`（那是换协议栈）。
+  `esp-zigbee-lib 1.6.8` 只要求 `idf >= 5.0`，升 5.5.2 在支持范围内。
+- **实测（5.5.2 固件，未做物理 RST）**：`coex` 由 `2147483647` 变 **0**；
+  `wifi_join ok:1 ip=192.168.100.139 rssi=-57 ch=6 why=0`；`ping -n 40`
+  **0% 丢包**（RTT 平均 157 ms）；已关联状态下 `wifi_scan` 返回
+  `attached:1 n:1` 且**不再掉线**（此前必 `why=8`）；切 `tr=1` 后 add-on 日志
+  出现 `状态：通道=wifi state=tcp_up` 与 `[HB] uptime=… ch=20 pan=0xd13e`，
+  TCP 通道成立。
+- 换 IDF 版本后 **bootloader 需一起刷**（`0x0`）。本次因沙箱锁导致 bootloader
+  子项目配置失败，实际刷的是 5.5.1 bootloader + 5.5.2 app，同 minor 可正常启动
+  （`Loaded app from partition at offset 0x20000`，无 panic）。
+
+### 修复 – 构建配置符号
+
+- `sdkconfig.defaults` 里 `CONFIG_ZB_COORDINATOR_ROLE=y` 是**不存在的符号**
+  （`main/Kconfig.projbuild` 实际定义 `ZB_ZCZR`），每次构建都报
+  `unknown kconfig symbol`，只靠 `default ZB_ZCZR` 侥幸生效。改为 `CONFIG_ZB_ZCZR=y`。
+- 删除已废弃的 `CONFIG_ESP_WIFI_SW_COEXIST_ENABLE`（IDF 会提示
+  "was replaced with CONFIG_ESP_COEX_SW_COEXIST_ENABLE"，5.5.2 起不存在）。
+
+### 新增 – 构建脚本（并行）
+
+- `build.ps1`（Windows）与重写的 `build.sh`：用
+  `cmake --build <dir> --parallel N -- -k 0` 替代无并行参数的 `idf.py build`；
+  默认并行 `min(逻辑核数, 8)`，本机 16 核 → 8；并行失败自动 `-j 1` 串行收尾；
+  构建后再跑一次要求 no-op，用来验证依赖图完整、没有重复编译。
+- 支持 `-IdfPath` / `-BuildDir` 指定 IDF 版本与独立构建目录（本次 5.5.2 用
+  `C:/Temp/b552x`，不污染原有 `build/`）。
+- 说明：本机实测真正拖慢编译的**不是并行度**，而是三件事：`.ninja_log` 丢失导致
+  ninja 判定全部目标重编、多个 ninja 实例抢 `.ninja_lock`、以及 `deps = gcc`
+  让 ninja 编译后删除 depfile 时被文件监控拦住（`Access is denied`）。
+  全量 1066 目标最终耗时约 86 分钟。
+
+### 变更 – 固件
+
+- `net_status` 回执新增 `"coex":<int>`；`wifi_scan` 回执新增 `"attached":0|1`。
+  两者都是新增字段，add-on 侧忽略未知键，无兼容影响。
+- 运行日志里残留的德语/英语叙述共 **47 处**改为中文（专有名词、API 名、
+  字段名与格式占位符保持原样；`zb_gateway.c` 里作为设备状态值的
+  `"offen"/"geschlossen"` 未改动）。门禁 `RESULT: ALL OK (5 Checks)`。
+
 ### 新增 – 固件（协调器 `main/`）
 
 - **新命令 `{"cmd":"wifi_join"}`**：真正做一次 `esp_wifi_connect()`（最长等 20 s），

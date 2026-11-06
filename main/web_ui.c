@@ -158,7 +158,7 @@ static esp_err_t handle_permit_join(httpd_req_t *req) {
     }
     uint8_t secs = (uint8_t)atoi(body);
     if (secs == 0) secs = 180;
-    ESP_LOGI(TAG, "Permit Join %u s (Web-UI)", secs);
+    ESP_LOGI(TAG, "开放入网 %u s（Web UI）", secs);
     zb_gateway_permit_join(secs);
 
     httpd_resp_set_type(req, "application/json");
@@ -173,7 +173,7 @@ void web_ui_start(void) {
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP-Server konnte nicht gestartet werden");
+        ESP_LOGE(TAG, "HTTP 服务启动失败");
         return;
     }
 

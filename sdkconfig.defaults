@@ -4,7 +4,12 @@
 
 # ── Zigbee ────────────────────────────────────────────────────────────────────
 CONFIG_ZB_ENABLED=y
-CONFIG_ZB_COORDINATOR_ROLE=y
+# ★★★ 角色必须写成 CONFIG_ZB_ZCZR（Coordinator/Router）。
+#   原来这里写的是 CONFIG_ZB_COORDINATOR_ROLE —— 那是**不存在的符号**，
+#   每次构建都报 `unknown kconfig symbol`，只是靠 Kconfig 的
+#   `default ZB_ZCZR` 侥幸生效。干净构建或 Kconfig 默认值一变，角色就会错成
+#   终端设备，网关直接失效。2026-11-07 修正。
+CONFIG_ZB_ZCZR=y
 CONFIG_ZB_GP_ENABLED=n
 
 # ── Wi-Fi（可选的第二条传输通道，见 main/net_link.c）─────────────────────────
@@ -14,8 +19,10 @@ CONFIG_ZB_GP_ENABLED=n
 CONFIG_ESP_COEX_ENABLED=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 CONFIG_ESP_WIFI_ENABLED=y
-CONFIG_ESP_WIFI_SW_COEXIST_ENABLE=y
 CONFIG_LWIP_MAX_SOCKETS=10
+# ★ 原来的 CONFIG_ESP_WIFI_SW_COEXIST_ENABLE 是旧符号，IDF 会提示
+#   "was replaced with CONFIG_ESP_COEX_SW_COEXIST_ENABLE"，5.5.2 起已不存在，
+#   保留只会产生无意义的警告，故删除（效果由上面那一项覆盖）。
 
 # ★★★ WPA3-SAE 必须显式编进来，而且必须写在这个文件里。
 #   sdkconfig 是 .gitignore 掉的，只在本地有效 —— 换台机器干净构建就会丢掉
@@ -27,6 +34,16 @@ CONFIG_ESP_WIFI_ENABLE_SAE_H2E=y
 
 # ── CPU / System ──────────────────────────────────────────────────────────────
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# ── OTA 回滚保护（应用侧已就绪，编译开关暂不打开）────────────────────────
+# serial_ota.c 用标准 esp_ota_*，新镜像会被标成 PENDING_VERIFY；开启下面这一项
+# 后，应用必须在首启确认健康，否则 bootloader 会回滚回旧镜像。
+# main.c::app_main() 末尾已经实现首启自检（仅在 PENDING_VERIFY 时调用
+# esp_ota_mark_app_valid_cancel_rollback()），代码与开关解耦，随时可以启用。
+# ★ 2026-11-07 暂不开启的原因：改 sdkconfig 会让 IDF 重新生成 sdkconfig.h，
+#   触发 1030 个 obj 的全量重编译；本机 Windows Defender 实时扫描下实测
+#   20 分钟只推进 19 个 obj，构建不可控。等能关掉实时防护或换构建机再启用。
+#   启用前请确认 bootloader.bin 也一起重新刷写，否则只有应用侧逻辑生效。
+# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 

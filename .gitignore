@@ -35,3 +35,8 @@ _ha_token.tmp
 
 # 整片 Flash 备份（含 Zigbee 配网凭据，体积大，不入库）
 backup/
+
+# 本地构建配置与多版本构建目录（不进版本库）
+build*/
+sdkconfig.*
+!sdkconfig.defaults

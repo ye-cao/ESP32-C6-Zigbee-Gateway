@@ -53,6 +53,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"   /* ★ esp_coex_wifi_i154_enable()：Wi-Fi ↔ 802.15.4 共存仲裁 */
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -93,6 +94,11 @@ static bool              s_handlers_registered = false;
  *   net_status 里表现完全一样（ip=0.0.0.0、rssi=0）。2026-11-06 就因为看不出来，
  *   差点去怀疑信号强度和 AP 距离，实际是纯 WPA3 网络没开 SAE。 */
 static volatile int      s_last_reason = 0;
+/* ★ Wi-Fi ↔ 802.15.4 共存仲裁的调用结果：ESP_OK(0)=已启用，
+ *   0x7FFFFFFF=还没调用过（Wi-Fi 是懒启动，串口模式下可能一直没起）。
+ *   必须能回读：ESP_LOGI 被 null_vprintf 静默，没有回执就无从判断
+ *   "到底有没有把 802.15.4 注册进 coex"。 */
+static volatile int      s_coex_ret = 0x7FFFFFFF;
 /* ★★★ s_task_started 必须是**文件级**的，而且 net_link_start 和
  *     net_link_configure 共用它。第一版把开关做成了 net_link_configure 里的
  *     函数级 static，于是「开机 tr=1 已经建过任务」之后再发一条 net_cfg，
@@ -246,6 +252,22 @@ static esp_err_t wifi_begin(void) {
     }
     if (s_wifi_inited) return ESP_OK;
 
+    /* ★★★ 启用 Wi-Fi ↔ IEEE 802.15.4 共存仲裁（2026-11-07）。
+     *   依据：ESPHome 官方 zigbee_esp32.cpp 在 ZigbeeComponent::setup() 里、
+     *   esp_zigbee_init() 之后调用 esp_coex_wifi_i154_enable()，并且在
+     *   zigbee_esp32.py 里显式 include_builtin_idf_component("esp_coex")。
+     *   ESPHome 跑 IDF 5.5.6，Wi-Fi + Zigbee 同板正常工作。
+     *   本项目之前从未调用任何 esp_coex_*，链接图里该符号出现 0 次 ——
+     *   CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y 只是把组件编进来，不等于
+     *   把 802.15.4 注册进了仲裁器。
+     *   放在 esp_wifi_init() 之前；Wi-Fi 是懒启动，此时 ZBOSS 早已 init/start，
+     *   与 ESPHome "Zigbee 初始化之后" 的时序前提一致。 */
+    s_coex_ret = esp_coex_wifi_i154_enable();
+    if (s_coex_ret != ESP_OK) {
+        ESP_LOGE(TAG, "共存仲裁启用失败：%s", esp_err_to_name(s_coex_ret));
+        return s_coex_ret;
+    }
+
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     r = esp_wifi_init(&ic);
     if (r != ESP_OK) {
@@ -303,6 +325,25 @@ static void wifi_apply_cfg(void) {
      *   5 GHz BSSID 明确标注「不支持 H2E」，自动选可能挑错边。
      *   写成 BOTH 就是两种都试，兼容性最好。 */
     wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    /* ★★★ 2026-11-07 按 ESPHome 官方实现补齐三个字段。
+     *
+     *   依据：`ESPHome与本项目WiFi连接差异核对-2026-11-07.md` §2.2，以及
+     *   ESPHome 2026.10.2 的 `WiFiComponent::wifi_sta_connect_()`：
+     *       conf.sta.threshold.rssi = -127;
+     *       conf.sta.scan_method = ap.has_channel() ? WIFI_FAST_SCAN
+     *                                              : WIFI_ALL_CHANNEL_SCAN;
+     *       conf.sta.listen_interval = 0;
+     *
+     *   原来这里 memset 之后把它们留成零，实际含义是：
+     *     threshold.rssi = 0 dBm  —— 物理上不可能达到的 AP 接受门限；
+     *     scan_method    = WIFI_FAST_SCAN —— 但我们并没有指定 channel/BSSID，
+     *                      驱动会按"只扫已知信道"处理，正常应走全信道扫描。
+     *   我们不设 BSSID/channel，所以对应 ESPHome 的 ALL_CHANNEL_SCAN 分支。
+     *   这三项是本次资料核对里方向最明确、且不改变网络配置的差异。 */
+    wc.sta.threshold.rssi  = -127;
+    wc.sta.scan_method     = WIFI_ALL_CHANNEL_SCAN;
+    wc.sta.listen_interval = 0;
 
     esp_err_t r = esp_wifi_set_config(WIFI_IF_STA, &wc);
     if (r != ESP_OK) ESP_LOGE(TAG, "set_config 失败：%s", esp_err_to_name(r));
@@ -661,10 +702,10 @@ void net_link_status_json(char *out, size_t out_len) {
     snprintf(out, out_len,
         "{\"t\":\"net_status\",\"transport\":\"%s\",\"state\":\"%s\","
         "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%u,\"ip\":\"%s\","
-        "\"rssi\":%d,\"ap_ch\":%d,\"why\":%d}",
+        "\"rssi\":%d,\"ap_ch\":%d,\"why\":%d,\"coex\":%d}",
         s_cfg.transport == NET_LINK_TCP ? "wifi" : "uart", st,
         s_cfg.ssid, s_cfg.host, (unsigned)s_cfg.port, s_ip,
-        (int)rssi, ch, s_last_reason);
+        (int)rssi, ch, s_last_reason, s_coex_ret);
 }
 
 /* ── 扫频：把 C6 自己"看见"了哪些 AP 报给主机 ─────────────────────────────
@@ -694,17 +735,34 @@ static esp_err_t scan_format(const char *tag, char *out, size_t out_len) {
      *    全 0 的配置在实机上表现为「scan 返回 ESP_OK，但 AP 数量是 0」——
      *    n=0 / aps=[]，连隔壁邻居的 AP 都扫不到，看起来像射频坏了。
      *    2026-11-06 就是这么被误导了一轮。
-     *    active.min/max 是每个信道的探测时长（ms）：min 给 120 是 IDF 的
-     *    常规取值，max 1500 让信号弱的 AP 也有机会回 probe response。 */
-    sc.scan_type            = WIFI_SCAN_TYPE_ACTIVE;
-    sc.scan_time.active.min = 120;
-    sc.scan_time.active.max = 1500;
+     *
+     * ★★★ 2026-11-07 按现场对照调整驻留量级：ESPHome 21:27:52 发起扫描、
+     *    21:28:00 才列出 4 个 AP（约 8 s），而我方原来 120/1500 全程只约
+     *    2.9 s。同板同 AP、对方便能扫到，把每信道驻留提到 ESPHome 量级是
+     *    本次资料核对里可直接验证的一刀（见差异核对报告 §2.2 / §3.2）。
+     *    代价：这条诊断命令会多花几秒，不进轮询。 */
+    sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
 
-    /* ★ 先断开再扫。STA 正在 esp_wifi_connect() 的重试循环里时，扫描请求
-     *   可能被驱动吞掉（返回 OK 但结果为空）。断开一下把状态清干净，
-     *   net_task 那边下一轮会自己再连，不需要我们操心。 */
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(300));
+    /* ★★★ 2026-11-07 缺陷修复：已关联时禁止「断开 + 全信道扫描」。
+     *   原实现无条件 esp_wifi_disconnect() 再扫 13 个信道，实机直接把 STA
+     *   关联打断（why=8 ASSOC_LEAVE、ARP 消失）。注释里说「net_task 下一轮会
+     *   自己再连」，但串口模式 tr=0 下 net_task 根本没跑 ⇒ 网关掉线不恢复。
+     *   ESP-IDF 在 STA 已关联时也只允许扫当前信道，因此改为：
+     *     已关联 → 只扫当前 AP 信道、短驻留、不断开；
+     *     未关联 → 保持原来的全信道扫描（此时没有连接可打断）。 */
+    wifi_ap_record_t cur_ap;
+    bool attached = (esp_wifi_sta_get_ap_info(&cur_ap) == ESP_OK);
+    if (attached) {
+        sc.channel              = cur_ap.primary;
+        sc.scan_time.active.min = 120;
+        sc.scan_time.active.max = 300;
+    } else {
+        sc.scan_time.active.min = 400;
+        sc.scan_time.active.max = 3000;
+        /* 未关联时可能停在 connect 重试循环里，先断开把状态清干净 */
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
 
     esp_err_t r = esp_wifi_scan_start(&sc, true);   /* true = 阻塞到扫完 */
     if (r != ESP_OK) {
@@ -731,8 +789,8 @@ static esp_err_t scan_format(const char *tag, char *out, size_t out_len) {
      *   把排查方向从"驱动"带到"射频"上去 —— 这个坑我自己先踩了一次。 */
     size_t pos = 0;
     pos += snprintf(out + pos, out_len - pos,
-                    "{\"t\":\"%s\",\"n\":%u,\"got\":%u,\"aps\":[",
-                    tag, (unsigned)n, (unsigned)got);
+                    "{\"t\":\"%s\",\"attached\":%d,\"n\":%u,\"got\":%u,\"aps\":[",
+                    tag, attached ? 1 : 0, (unsigned)n, (unsigned)got);
     if (nr != ESP_OK || gr != ESP_OK) {
         pos += snprintf(out + pos, out_len - pos, "],\"e_num\":\"%s\",\"e_rec\":\"%s\"}",
                         esp_err_to_name(nr), esp_err_to_name(gr));
@@ -842,6 +900,13 @@ esp_err_t net_link_scan_json(char *out, size_t out_len) {
             return r;
         }
     }
+    /* ★★★ 2026-11-07：串口模式（tr=0）下 net_task 根本没跑，这条懒加载
+     *    路径以前**从未**下发过 wifi_apply_cfg()，驱动里的 STA 配置一直停在
+     *    memset 的零值（threshold.rssi=0、FAST_SCAN），补在 wifi_apply_cfg()
+     *    里的修复因此对 wifi_scan 完全不生效。
+     *    必须在 esp_wifi_start() 之前补齐（项目硬规则：配置要先于 start）。
+     *    依据：ESPHome 2026.10.2 每次连接前都 esp_wifi_set_config()。 */
+    wifi_apply_cfg();
     if (!s_wifi_started) {
         esp_err_t r = esp_wifi_start();
         if (r != ESP_OK && r != ESP_ERR_WIFI_INIT_STATE) {
@@ -903,6 +968,12 @@ esp_err_t net_link_scan_early(char *out, size_t out_len) {
         }
         s_wifi_inited = true;
     }
+    /* ★ 2026-11-07：开机早扫过去只做了 init/set_mode，没下发 STA 配置，
+     *   于是配置修复（threshold.rssi / scan_method）在这条路径上不生效。
+     *   必须在 esp_wifi_start() 之前补齐，才能和开机后的 wifi_scan 做
+     *   同条件对比。注意此时 cfg_load() 还没跑，s_cfg 是默认值（空 SSID），
+     *   但扫描不依赖 SSID，关键字段仍会生效。 */
+    wifi_apply_cfg();
     if (!s_wifi_started) {
         r = esp_wifi_start();
         if (r != ESP_OK && r != ESP_ERR_WIFI_INIT_STATE) {

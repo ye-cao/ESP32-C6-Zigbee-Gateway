@@ -18,6 +18,7 @@ idf_component_register(
         freertos
         log
         ieee802154
+        esp_coex
         esp_wifi
         esp_netif
         lwip

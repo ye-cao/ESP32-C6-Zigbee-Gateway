@@ -427,7 +427,7 @@ void zb_ota_server_start(uint32_t size, uint32_t version, uint16_t image_type) {
      *   在这里等会死锁（数据正是由当前这个 rx_task 提供的）。 */
     s_active  = true;
     s_preload = true;
-    ESP_LOGI(TAG, "OTA vorbereiten: size=%lu ver=%lu type=0x%04x",
+    ESP_LOGI(TAG, "准备 OTA：size=%lu ver=%lu type=0x%04x",
              (unsigned long)size, (unsigned long)version, (unsigned)s_type);
 }
 

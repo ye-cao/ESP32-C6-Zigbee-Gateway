@@ -195,7 +195,7 @@ static void parse_byte(uint8_t b)
             dispatch(s_frame_type, NULL, 0);
             s_state = S_SOF;
         } else if (s_total_len > sizeof(s_buf)) {
-            ESP_LOGE(TAG, "frame too long: %u", s_total_len);
+            ESP_LOGE(TAG, "帧过长：%u", s_total_len);
             s_state = S_SOF;
             xSemaphoreTake(s_mutex, portMAX_DELAY); s_data.frames_err++; xSemaphoreGive(s_mutex);
         } else {

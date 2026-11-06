@@ -310,7 +310,7 @@ static void mesh_timeout_cb(uint8_t param) {
 static void mesh_send(uint16_t addr, uint8_t start) {
     zb_bufid_t buf = zb_buf_get_out();
     if (buf == ZB_BUF_INVALID) {
-        ESP_LOGW(TAG, "kein ZBOSS-Puffer für Mgmt_Lqi – Rest übersprungen");
+        ESP_LOGW(TAG, "没有可用的 ZBOSS 缓冲区用于 Mgmt_Lqi – 跳过剩余设备");
         mesh_finish();
         return;
     }
@@ -324,7 +324,7 @@ static void mesh_send(uint16_t addr, uint8_t start) {
         ZB_BUF_GET_PARAM((zb_uint8_t)buf, zb_zdo_mgmt_lqi_param_t);
     if (!p) {
         zb_buf_free(buf);
-        ESP_LOGW(TAG, "Mgmt_Lqi-Parameter nicht platzierbar");
+        ESP_LOGW(TAG, "Mgmt_Lqi 参数无法填入缓冲区");
         mesh_fail_and_next(0xFD);
         return;
     }
@@ -335,7 +335,7 @@ static void mesh_send(uint16_t addr, uint8_t start) {
     zb_uint8_t tsn = zb_zdo_mgmt_lqi_req((zb_uint8_t)buf, mesh_lqi_cb);
     if (tsn == 0xFF) {
         zb_buf_free(buf);
-        ESP_LOGW(TAG, "Mgmt_Lqi an 0x%04x nicht möglich (ZDP belegt)", addr);
+        ESP_LOGW(TAG, "无法向 0x%04x 发 Mgmt_Lqi（ZDP 忙）", addr);
         mesh_fail_and_next(0xFE);
     }
 }

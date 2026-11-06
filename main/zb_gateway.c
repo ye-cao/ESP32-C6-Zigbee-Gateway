@@ -79,7 +79,7 @@ static zb_device_t *find_or_add(uint16_t addr, const uint8_t *ieee) {
             return &s_devices[i];
         }
     }
-    ESP_LOGW(TAG, "Gerätedatenbank voll (max %d)", MAX_DEVICES);
+    ESP_LOGW(TAG, "设备表已满（上限 %d）", MAX_DEVICES);
     return NULL;
 }
 
@@ -142,8 +142,8 @@ static void devtab_load(void) {
         s_devices[i].interviewed = false;
         n++;
     }
-    ESP_LOGI(TAG, "%d Geräte aus NVS wiederhergestellt "
-                  "(Interview folgt, sobald sie sich melden)", n);
+    ESP_LOGI(TAG, "已从 NVS 恢复 %d 台设备"
+                  "（等设备重新上报后再做设备采访）", n);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
@@ -284,7 +284,7 @@ static void interview_start(uint16_t addr, const uint8_t *ieee) {
     snprintf(line, sizeof(line),
              "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"start\"}", addr);
     ha_mqtt_emit_raw(line);
-    ESP_LOGI(TAG, "Interview 0x%04x: Active-EP …", addr);
+    ESP_LOGI(TAG, "设备采访 0x%04x：读取 Active-EP …", addr);
 
     esp_zb_zdo_active_ep_req_param_t req = { .addr_of_interest = addr };
     esp_zb_zdo_active_ep_req(&req, iv_active_ep_cb, NULL);
@@ -303,7 +303,7 @@ static void iv_request_simple_desc(uint8_t idx) {
                  "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"done\",\"eps\":[%s]}",
                  s_iv.short_addr, eps);
         ha_mqtt_emit_raw(line);
-        ESP_LOGI(TAG, "Interview 0x%04x abgeschlossen (eps: %s)",
+        ESP_LOGI(TAG, "设备采访 0x%04x 完成（端点：%s）",
                  s_iv.short_addr, eps);
         /* 读 Basic 属性（厂商/型号）—— 遍历所有端点 */
         if (s_iv.ep_count > 0) {
@@ -331,7 +331,7 @@ static void iv_active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count,
                  "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"ep_failed\",\"status\":\"0x%02x\"}",
                  s_iv.short_addr, (unsigned)status);
         ha_mqtt_emit_raw(line);
-        ESP_LOGW(TAG, "Interview 0x%04x: Active-EP fehlgeschlagen (0x%02x)",
+        ESP_LOGW(TAG, "设备采访 0x%04x：读取 Active-EP 失败 (0x%02x)",
                  s_iv.short_addr, (unsigned)status);
         s_iv.busy = false;
         return;
@@ -352,7 +352,7 @@ static void iv_active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count,
              "{\"t\":\"interview\",\"addr\":\"0x%04x\",\"state\":\"ep_list\",\"eps\":[%s]}",
              s_iv.short_addr, eps);
     ha_mqtt_emit_raw(line);
-    ESP_LOGI(TAG, "Interview 0x%04x: %u Endpoint(s) [%s]",
+    ESP_LOGI(TAG, "设备采访 0x%04x：共 %u 个端点 [%s]",
              s_iv.short_addr, (unsigned)ep_count, eps);
 
     iv_request_simple_desc(0);
@@ -399,7 +399,7 @@ static void iv_bind_cb(esp_zb_zdp_status_t status, void *user_ctx) {
     }
     ha_mqtt_emit_raw(line);
     if (known && status != ESP_ZB_ZDP_STATUS_SUCCESS) {
-        ESP_LOGW(TAG, "Interview: Bind ep%u cluster 0x%04x → 0x%02x",
+        ESP_LOGW(TAG, "设备采访：绑定 ep%u 簇 0x%04x → 0x%02x",
                  (unsigned)ep, cluster, (unsigned)status);
     }
 }
@@ -455,7 +455,7 @@ static void iv_simple_desc_cb(esp_zb_zdp_status_t status,
 
     uint8_t ep = s_iv.eps[s_iv.ep_idx];
     if (status != ESP_ZB_ZDP_STATUS_SUCCESS || !sd) {
-        ESP_LOGW(TAG, "Interview: Simple-Desc ep%u fehlgeschlagen (0x%02x)",
+        ESP_LOGW(TAG, "设备采访：Simple-Desc ep%u 失败 (0x%02x)",
                  (unsigned)ep, (unsigned)status);
         iv_request_simple_desc((uint8_t)(s_iv.ep_idx + 1));
         return;
@@ -580,14 +580,14 @@ static void ieee_resolved_cb(esp_zb_zdp_status_t zdo_status,
                              esp_zb_zdo_ieee_addr_rsp_t *resp, void *user_ctx) {
     uint16_t addr = (uint16_t)(uintptr_t)user_ctx;
     if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || resp == NULL) {
-        ESP_LOGW(TAG, "IEEE-Request 0x%04x fehlgeschlagen (0x%02x)", addr, zdo_status);
+        ESP_LOGW(TAG, "IEEE 地址请求 0x%04x 失败 (0x%02x)", addr, zdo_status);
         return;
     }
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
     zb_device_t *d = find_or_add(addr, resp->ieee_addr);
     bool need = d && !d->interviewed;
     xSemaphoreGive(s_dev_mutex);
-    ESP_LOGI(TAG, "IEEE 0x%04x aufgelöst → Interview%s", addr, need ? "" : " (schon erfolgt)");
+    ESP_LOGI(TAG, "IEEE 0x%04x 已解析 → 设备采访%s", addr, need ? "" : " (schon erfolgt)");
     if (d) devtab_save();
     if (need) interview_start(addr, resp->ieee_addr);
 }
@@ -772,7 +772,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                          "{\"t\":\"cmd\",\"addr\":\"0x%04x\",\"ep\":%u,\"cluster\":\"on_off\",\"v\":%u}",
                          src, (unsigned)ep, v ? 1u : 0u);
                 ha_mqtt_emit_raw(line);
-                ESP_LOGI(TAG, "Schalter 0x%04x ep%u → %s",
+                ESP_LOGI(TAG, "开关 0x%04x ep%u → %s",
                          src, (unsigned)ep, v ? "ON" : "OFF");
             } else {
                 ha_mqtt_emit_raw("{\"t\":\"cmd\",\"cluster\":\"on_off\",\"src\":\"unknown\"}");
@@ -898,28 +898,28 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err == ESP_OK) {
             if (esp_zb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Erster Start – Netzwerk wird gebildet");
+                ESP_LOGI(TAG, "首次启动 – 正在组建网络");
                 esp_zb_bdb_start_top_level_commissioning(
                     ESP_ZB_BDB_MODE_NETWORK_FORMATION);
             } else {
-                ESP_LOGI(TAG, "Neustart – Netzwerk wiederhergestellt");
+                ESP_LOGI(TAG, "重启 – 网络已恢复");
                 esp_zb_bdb_start_top_level_commissioning(
                     ESP_ZB_BDB_MODE_NETWORK_STEERING);
             }
         } else {
-            ESP_LOGE(TAG, "Zigbee-Init fehlgeschlagen: %s",
+            ESP_LOGE(TAG, "Zigbee 初始化失败：%s",
                      esp_err_to_name(err));
         }
         break;
 
     case ESP_ZB_BDB_SIGNAL_FORMATION:
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Netzwerk gebildet – PAN 0x%04hx Kanal %d",
+            ESP_LOGI(TAG, "网络已组建 – PAN 0x%04hx 信道 %d",
                      esp_zb_get_pan_id(), esp_zb_get_current_channel());
             esp_zb_bdb_start_top_level_commissioning(
                 ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
-            ESP_LOGW(TAG, "Netzwerkbildung fehlgeschlagen – erneuter Versuch");
+            ESP_LOGW(TAG, "组网失败 – 将重试");
             esp_zb_scheduler_alarm(
                 (esp_zb_callback_t)(void *)esp_zb_bdb_start_top_level_commissioning,
                 ESP_ZB_BDB_MODE_NETWORK_FORMATION, 1000);
@@ -932,7 +932,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
              * boot-steering 信号可能在「已用 BOOT 键/网页开好的配网窗口」
              * 之后才到，一刀就把窗口关了（bug：窗口开了约 1 s 就被干掉）。
              * 而且开机之后网络本来就是关着的。 */
-            ESP_LOGI(TAG, "Zigbee bereit – Netzwerk wiederhergestellt");
+            ESP_LOGI(TAG, "Zigbee 就绪 – 网络已恢复");
         }
         break;
 
@@ -940,14 +940,14 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         esp_zb_zdo_signal_device_annce_params_t *p =
             esp_zb_app_signal_get_params(sg_p);
         uint16_t a = p->device_short_addr;
-        ESP_LOGI(TAG, "Neues Gerät: 0x%04hx", a);
+        ESP_LOGI(TAG, "新设备：0x%04hx", a);
 
         xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
         /* 带新短地址重连：先把同 IEEE 的旧条目删掉 */
         for (int i = 0; i < MAX_DEVICES; i++) {
             if (s_devices[i].used && s_devices[i].short_addr != a &&
                 memcmp(s_devices[i].ieee, p->ieee_addr, 8) == 0) {
-                ESP_LOGI(TAG, "Gerät 0x%04hx → 0x%04hx (Rejoin, neue Adresse)",
+                ESP_LOGI(TAG, "设备 0x%04hx → 0x%04hx（重新入网，地址变化）",
                          s_devices[i].short_addr, a);
                 memset(&s_devices[i], 0, sizeof(s_devices[i]));
             }
@@ -1003,7 +1003,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             keepalive_stop();
             char ieee_str[24];
             iv_ieee_str(p->device_addr, ieee_str, sizeof(ieee_str));
-            ESP_LOGW(TAG, "Gerät verlässt Netzwerk: 0x%04hx (%s) rejoin=%u",
+            ESP_LOGW(TAG, "设备离开网络：0x%04hx (%s) rejoin=%u",
                      p->short_addr, ieee_str, (unsigned)p->rejoin);
             char line[192];
             snprintf(line, sizeof(line),
@@ -1038,7 +1038,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             esp_zb_app_signal_get_params(sg_p);
         if (p) {
             keepalive_stop();
-            ESP_LOGW(TAG, "Device-Update 0x%04hx status=%u",
+            ESP_LOGW(TAG, "设备更新 0x%04hx status=%u",
                      p->short_addr, (unsigned)p->status);
             char line[112];
             snprintf(line, sizeof(line),
@@ -1066,7 +1066,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                      (unsigned)p->authorization_type,
                      (unsigned)p->authorization_status);
             ha_mqtt_emit_raw(line);
-            ESP_LOGW(TAG, "Device authorized 0x%04x type=%u status=%u",
+            ESP_LOGW(TAG, "设备已授权 0x%04x type=%u status=%u",
                      p->short_addr, (unsigned)p->authorization_type,
                      (unsigned)p->authorization_status);
             if (p->authorization_status == 0 && s_iv.ep_count > 0) {
@@ -1086,7 +1086,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                  "{\"t\":\"zb_signal\",\"sig\":\"%s\",\"id\":\"0x%02x\",\"err\":\"0x%x\"}",
                  name ? name : "?", (unsigned)sig, (unsigned)err);
         ha_mqtt_emit_raw(line);
-        ESP_LOGD(TAG, "ZB-Signal: %s (0x%x) %s",
+        ESP_LOGD(TAG, "ZBOSS 信号：%s (0x%x) %s",
                  name ? name : "?", (unsigned)sig, esp_err_to_name(err));
         break;
     }
@@ -1112,11 +1112,11 @@ static void zb_task(void *arg) {
     uint8_t ch = load_channel();
     uint8_t fallback = (ch == ZB_FALLBACK_CHANNEL) ? ZB_DEFAULT_CHANNEL
                                                     : ZB_FALLBACK_CHANNEL;
-    ESP_LOGI(TAG, "Zigbee primär Kanal %d, Fallback Kanal %d", ch, fallback);
+    ESP_LOGI(TAG, "Zigbee 主信道 %d，备用信道 %d", ch, fallback);
 
     /* 先定表的大小 —— 必须在 esp_zb_init() 之前。 */
     esp_err_t siz = esp_zb_overall_network_size_set(MAX_DEVICES);
-    ESP_LOGI(TAG, "Netzgröße %d Geräte (overall_network_size_set=%s)",
+    ESP_LOGI(TAG, "网络容量 %d 台设备 (overall_network_size_set=%s)",
              MAX_DEVICES, esp_err_to_name(siz));
 
     esp_zb_cfg_t cfg = {
@@ -1280,7 +1280,7 @@ static void zb_task(void *arg) {
      * add-on 开机后立刻发 read_onoff，而 uart_rx 任务是跟当前这个任务
      * **并行**跑的。 */
     s_zb_ready = true;
-    ESP_LOGI(TAG, "Zigbee-Stack bereit – UART-Befehle werden angenommen");
+    ESP_LOGI(TAG, "Zigbee 协议栈就绪 – 开始接收串口命令");
 
     esp_zb_stack_main_loop();   /* SDK ≥1.5.0: ersetzt esp_zb_main_loop_iteration() */
 }
@@ -1337,7 +1337,7 @@ void zb_gateway_devices_json(char *buf, size_t len) {
 
 void zb_gateway_set_channel(uint8_t ch) {
     if (ch < 11 || ch > 26) {
-        ESP_LOGE(TAG, "Ungültiger Kanal: %d (erlaubt: 11-26)", ch);
+        ESP_LOGE(TAG, "无效信道：%d（允许 11-26）", ch);
         return;
     }
 
@@ -1347,9 +1347,9 @@ void zb_gateway_set_channel(uint8_t ch) {
         nvs_set_u8(h, ZB_NVS_KEY_CHANNEL, ch);
         nvs_commit(h);
         nvs_close(h);
-        ESP_LOGI(TAG, "Kanal %d in NVS gespeichert", ch);
+        ESP_LOGI(TAG, "信道 %d 已写入 NVS", ch);
     } else {
-        ESP_LOGE(TAG, "NVS-Schreibfehler");
+        ESP_LOGE(TAG, "NVS 写入失败");
         return;
     }
 
@@ -1358,12 +1358,12 @@ void zb_gateway_set_channel(uint8_t ch) {
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "zb_storage");
     if (part) {
         esp_err_t err = esp_partition_erase_range(part, 0, part->size);
-        ESP_LOGI(TAG, "zb_storage gelöscht: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "zb_storage 已擦除：%s", esp_err_to_name(err));
     } else {
-        ESP_LOGW(TAG, "Partition zb_storage nicht gefunden");
+        ESP_LOGW(TAG, "未找到 zb_storage 分区");
     }
 
-    ESP_LOGI(TAG, "Neustart für Kanalwechsel auf %d...", ch);
+    ESP_LOGI(TAG, "即将重启以切换到信道 %d…", ch);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
 }
@@ -1537,7 +1537,7 @@ void zb_gateway_report_lqi(void) {
     static char line[LQI_LINE_MAX];
     zb_gateway_lqi_json(buf, sizeof(buf));
     uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    ESP_LOGI(TAG, "lqi-Snapshot gebaut (%u B, %llu ms)",
+    ESP_LOGI(TAG, "LQI 快照已生成（%u B，%llu ms）",
              (unsigned)strlen(buf), (unsigned long long)ms);
     snprintf(line, sizeof(line), "{\"t\":\"lqi\",\"ms\":%lu,\"dev\":%s}",
              (unsigned long)ms, buf);
@@ -1563,7 +1563,7 @@ int8_t zb_gateway_get_tx_power(void) {
 
 void zb_gateway_list_devices(void) {
     xSemaphoreTake(s_dev_mutex, portMAX_DELAY);
-    ESP_LOGI(TAG, "Gepairte Geräte:");
+    ESP_LOGI(TAG, "已配对设备：");
     for (int i = 0; i < MAX_DEVICES; i++) {
         if (s_devices[i].used) {
             ESP_LOGI(TAG, "  [%d] 0x%04x", i, s_devices[i].short_addr);
@@ -1646,7 +1646,7 @@ void zb_gateway_remove_device(uint16_t addr) {
              found ? "true" : "false",
              s_rm_has_ieee ? "true" : "false");
     ha_mqtt_emit_raw(line);
-    ESP_LOGW(TAG, "Gerät 0x%04x entfernt (war in Tabelle: %s, IEEE: %s)",
+    ESP_LOGW(TAG, "设备 0x%04x 已移除（原在表中：%s，IEEE：%s）",
              addr, found ? "ja" : "nein", ieee_str);
 
     xTaskCreate(rm_leave_task, "dev_leave", 3072, NULL, 2, NULL);
@@ -1948,7 +1948,7 @@ void zb_gateway_read_onoff(uint16_t addr, uint8_t ep) {
         esp_zb_scheduler_alarm(read_onoff_send, i, (uint32_t)(10 + i * 45));
         return;
     }
-    ESP_LOGW(TAG, "read_onoff: alle %d Slots belegt – Anfrage verworfen", RD_SLOTS);
+    ESP_LOGW(TAG, "read_onoff：%d 个槽位全被占用 – 请求已丢弃", RD_SLOTS);
 }
 
 

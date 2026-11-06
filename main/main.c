@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_zigbee_core.h"
+#include "esp_ota_ops.h"
 
 #include "ha_mqtt.h"
 #include "net_link.h"
@@ -22,9 +23,19 @@
 #define TAG "main"
 
 /* 开机早期 Wi-Fi 扫频（诊断用，见 app_main 里的说明）。
- * 正式固件必须是 0：打开会让开机多等约 3 秒。
- * 2026-11-06 用它定位到"本板 Wi-Fi 收不到任何信号"之后已关回 0。 */
+ * 正式固件必须是 0：打开会让开机多等约 3 秒，且会在纯 JSON 串口上多一行文本。
+ * 2026-11-07 00:4x 做过同一次开机内的判决实验：三次复位 BOOTSCAN 全为
+ *   n=0，稳定后命令 wifi_scan 也是 n=0 ⇒ Zigbee 启动前后都收不到 AP，
+ *   运行时初始化顺序不是根因。刷写前那条 n=11 判定为串口缓冲残留。
+ * 实验结论见 `ESPHome与本项目WiFi连接差异核对-2026-11-07.md` §8。 */
 #define NET_BOOTSCAN 0
+
+/* 诊断：在 zb_gateway_start() **之前**把 Wi-Fi 完整连一遍（connect + 等 IP）。
+ * 2026-11-07 01:0x 实测：ZBOSS 完全没起来时 EARLYJOIN 仍回
+ *   {"ok":0,"why":201} ⇒ 「Wi-Fi 先联网、Zigbee 后启动」不是根因，
+ *   Zigbee 运行时占射频 / ch20 运行时干扰一并排除。详见核对报告 §9。
+ * 正式固件必须是 0（会固定多等最多 20 s）。 */
+#define NET_EARLY_JOIN 0
 
 /* ── ZBOSS「大锁」─────────────────────────────────────────────────────────
  *
@@ -90,7 +101,7 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
      * → 每 ~20 s 复位一次，从外面看就是「网关一直在重启」。
      * 所以这里直接丢弃命令，不排队。 */
     if (!zb_gateway_is_ready()) {
-        ESP_LOGW(TAG, "Befehl '%s' verworfen – Zigbee-Stack startet noch", cmd);
+        ESP_LOGW(TAG, "命令 '%s' 已丢弃：Zigbee 协议栈尚未启动完成", cmd);
         return;
     }
 
@@ -158,7 +169,7 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         /* payload: 可选 "DELAY_MS"。给了就先等这么久再 dump（add-on 会在等待
          * 期间逐台发 node_desc 触发按需路由发现）；不给就立刻 dump 现有表。 */
         int delay = payload ? atoi(payload) : 0;
-        ESP_LOGI(TAG, "topo dump (delay %d ms)", delay);
+        ESP_LOGI(TAG, "拓扑采集（延迟 %d ms）", delay);
         if (delay > 0) zb_topo_request_full((uint32_t)delay);
         else           zb_topo_request();
     } else if (strcmp(cmd, "scan_chan") == 0) {
@@ -209,7 +220,7 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
          * 一个小时的无线带宽）。 */
         zb_ota_server_stop();
     } else if (strcmp(cmd, "switch2wifi") == 0) {
-        ESP_LOGI(TAG, "switch2wifi -> ZCL an alle Devices");
+        ESP_LOGI(TAG, "切到 Wi-Fi：向所有设备下发 ZCL");
         zb_gateway_send_switch2wifi_all();
     } else if (strcmp(cmd, "set_tx_power") == 0) {
         /* payload = "-24" … "20"（dBm）。运行期改功率，方便不重刷固件就做
@@ -326,7 +337,7 @@ static void btn_task(void *arg) {
     while (1) {
         bool cur = gpio_get_level(BTN_PERMIT_JOIN);
         if (last && !cur) {
-            ESP_LOGI(TAG, "Permit Join %d s (Boot-Taste)", PERMIT_JOIN_SECS);
+            ESP_LOGI(TAG, "开放入网 %d s（Boot 按键）", PERMIT_JOIN_SECS);
             bool held = zb_lock();
             zb_gateway_permit_join(PERMIT_JOIN_SECS);
             zb_unlock(held);
@@ -371,9 +382,45 @@ void app_main(void) {
     ha_mqtt_set_cmd_cb(on_uart_cmd);
     ESP_ERROR_CHECK(ha_mqtt_init(NULL, NULL, NULL));
 
+#if NET_EARLY_JOIN
+    /* ★ 诊断：ZBOSS 还完全没起来之前，先做一次完整 Wi-Fi 连接。
+     *   ha_mqtt_init() 内部已经跑过 net_link_start() → cfg_load()，
+     *   所以这里的 s_cfg.ssid/pass/host 都是 NVS 里的真实值。
+     *   net_link_join_json() 会走 wifi_begin → wifi_apply_cfg →
+     *   esp_wifi_start → 等 STA_START → esp_wifi_connect → 等 IP（20 s）。
+     *   如果这一步能拿到 IP，就证明「Wi-Fi 先联网、Zigbee 后启动」可行，
+     *   正式修复方向即是把连接顺序固化下来。 */
+    {
+        static char ej[256];
+        net_link_join_json(ej, sizeof(ej));
+        printf("EARLYJOIN %s\n", ej);
+        fflush(stdout);
+    }
+#endif
+
     zb_gateway_start();
 
     xTaskCreate(btn_task,       "btn",       2048, NULL, 3, NULL);
     /* 栈：64 台设备时 lqi_buf + line 约 6,6 KB，再加 snprintf/MQTT 缓冲 */
     xTaskCreate(heartbeat_task, "heartbeat", 12288, NULL, 2, NULL);
+
+    /* ── OTA 首启自检 ────────────────────────────────────────────────────
+     * serial_ota.c 用的是标准 esp_ota_*：写完新分区后 esp_ota_set_boot_partition()
+     * 会把新镜像标成 PENDING_VERIFY。开了 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+     * 之后，如果应用不在这里确认，下次启动 bootloader 就会回滚到旧镜像 ——
+     * 表现是「OTA 明明成功了，重启又变回旧固件」。
+     * 放在 app_main 末尾：Zigbee 已启动、心跳和按键任务都建起来了，说明这份
+     * 镜像至少能正常跑到主流程末尾，可以确认健康。 */
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    if (running &&
+        esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+        ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t mr = esp_ota_mark_app_valid_cancel_rollback();
+        if (mr != ESP_OK) {
+            ESP_LOGE(TAG, "首启自检：标记镜像有效失败 %s", esp_err_to_name(mr));
+        } else {
+            ESP_LOGI(TAG, "首启自检通过：镜像已标记有效，取消 OTA 回滚");
+        }
+    }
 }

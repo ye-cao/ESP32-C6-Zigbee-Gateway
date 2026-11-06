@@ -73,7 +73,7 @@ void serial_ota_start(uint32_t size)
              "\"part\":\"%s\",\"size\":%lu",
              s_part->label, (unsigned long)size);
     fw_emit("begin", extra);
-    ESP_LOGI(TAG, "OTA begin → %s size=%lu", s_part->label, (unsigned long)size);
+    ESP_LOGI(TAG, "开始 OTA → %s size=%lu", s_part->label, (unsigned long)size);
 }
 
 void serial_ota_data(uint32_t off, const char *hex, int hex_len)
@@ -142,7 +142,7 @@ void serial_ota_end(void)
     snprintf(extra, sizeof(extra),
              "\"written\":%lu", (unsigned long)s_written);
     fw_emit("done", extra);
-    ESP_LOGI(TAG, "OTA done – %lu bytes, Neustart …", (unsigned long)s_written);
+    ESP_LOGI(TAG, "OTA 完成 – %lu 字节，即将重启 …", (unsigned long)s_written);
 
     /* 先让这一行发出去，再重启 */
     vTaskDelay(pdMS_TO_TICKS(300));
