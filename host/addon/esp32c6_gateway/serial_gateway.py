@@ -1049,6 +1049,32 @@ def on_message(client, userdata, msg):
         uart_msg = _js({"cmd": "read_onoff", "addr": addr, "ep": ep})
         ser.write(uart_msg.encode())
         print(f"[→C6] {uart_msg.strip()}")
+    elif cmd == "net_status":
+        # 查当前传输通道 / Wi-Fi 状态。回执是一条 {"t":"net_status",…}。
+        # ★ 这条也是「固件里到底跑的是不是新版本」最省事的判据：
+        #   老固件不认识它，会回 {"t":"error","why":"unknown_cmd"}。
+        uart_msg = _js({"cmd": "net_status"})
+        ser.write(uart_msg.encode())
+        print(f"[→C6] {uart_msg.strip()}")
+    elif cmd == "net_cfg":
+        # 配置 Wi-Fi。payload 直接给一个 JSON 对象：
+        #   {"ssid":"…","pass":"…","host":"<ha-ip>","port":12345,"tr":1}
+        # 只写想改的字段即可（空/缺省 = 这一项不动）。
+        # ★ 这里整包转发，不在 add-on 侧拆字段 —— 拆了就又变成「两处解析」，
+        #   而固件那边（ha_mqtt.c）已经在拆。让它一处说了算。
+        try:
+            body = json.loads(payload)
+            if not isinstance(body, dict) or not body:
+                raise ValueError
+        except (ValueError, TypeError, json.JSONDecodeError):
+            print(f"[WARN] net_cfg：载荷必须是 JSON 对象，收到 {payload!r}")
+            return
+        body["cmd"] = "net_cfg"
+        uart_msg = _js(body)
+        ser.write(uart_msg.encode())
+        print(f"[→C6] {uart_msg.strip()}")
+        print("[NET] 配置已下发；固件会回一条 net_status，"
+              "之后按 tr 的值决定是否切到 Wi-Fi")
 
 mq.on_connect = on_connect
 mq.on_message = on_message
@@ -3907,7 +3933,14 @@ def dispatch(line: str):
         # 验证「拔掉 USB 之后还通不通」时，这行是唯一的直接证据。
         with _state_lock:
             _state["net"] = dict(msg)
-        if t == "net_status" or msg.get("up"):
+        if t == "net_status":
+            # 查询回执：把真实状态照实说。这里**不能**当成「已连通」——
+            # 串口模式下 Transport=uart、ip 是 0.0.0.0，说「已连通」会误导排查。
+            print(f"[NET] 状态：通道={msg.get('transport')} "
+                  f"state={msg.get('state')} ssid={msg.get('ssid')!r} "
+                  f"ip={msg.get('ip')} rssi={msg.get('rssi')} "
+                  f"→ {msg.get('host')}:{msg.get('port')}")
+        elif msg.get("up"):
             print(f"[NET] 通道已连通 ip={msg.get('ip')} rssi={msg.get('rssi')} "
                   f"→ {msg.get('host')}:{msg.get('port')}")
         else:

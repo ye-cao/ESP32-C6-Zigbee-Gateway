@@ -82,6 +82,14 @@ static volatile uint32_t s_cfg_gen = 0;   /* 配置代次：变了就重新下�
 /* 运行期状态，只用于状态回执 */
 static volatile bool     s_wifi_started = false;
 static volatile bool     s_wifi_inited  = false;
+static bool              s_netif_created = false;
+static bool              s_task_started  = false;
+/* ★★★ s_task_started 必须是**文件级**的，而且 net_link_start 和
+ *     net_link_configure 共用它。第一版把开关做成了 net_link_configure 里的
+ *     函数级 static，于是「开机 tr=1 已经建过任务」之后再发一条 net_cfg，
+ *     会再建**第二个** net_task：两个任务同时 esp_wifi_connect、同时
+ *     tcp_connect、抢同一个 s_sock，收包循环互相踩。这种双任务问题在日志里
+ *     表现为连接莫名其妙每几秒重建一次，极难定位。 */
 
 typedef struct {
     char     ssid[33];
@@ -184,9 +192,15 @@ static esp_err_t wifi_begin(void) {
         ESP_LOGE(TAG, "事件循环创建失败：%s", esp_err_to_name(r));
         return r;
     }
-    if (!esp_netif_create_default_wifi_sta()) {
-        ESP_LOGE(TAG, "创建默认 STA netif 失败");
-        return ESP_FAIL;
+    if (!s_netif_created) {
+        /* ★ 单独设标记：netif 创建成功后若后面的 esp_wifi_init 失败，
+         *   下次重试时不能再建一个 STA netif（wifi_begin 的 s_wifi_inited
+         *   只在全部成功后置位，挡不住这种中途失败的重试）。 */
+        if (!esp_netif_create_default_wifi_sta()) {
+            ESP_LOGE(TAG, "创建默认 STA netif 失败");
+            return ESP_FAIL;
+        }
+        s_netif_created = true;
     }
 
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
@@ -398,11 +412,14 @@ static void net_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(300));
         }
 
-        /* ── 3. 发起连接（驱动自己会重试，我们只负责叫醒它）── */
-        ESP_LOGI(TAG, "连接 Wi-Fi '%s' …", s_cfg.ssid);
-        esp_err_t cr = esp_wifi_connect();
-        if (cr != ESP_OK && cr != ESP_ERR_WIFI_CONN) {
-            ESP_LOGW(TAG, "esp_wifi_connect：%s", esp_err_to_name(cr));
+        /* ── 3. 发起连接（只在还没有 IP 时；驱动自己会重试，我们负责叫醒它）── */
+        if (!(xEventGroupGetBits(s_ev) & BIT_IP)) {
+            ESP_LOGI(TAG, "连接 Wi-Fi '%s' …", s_cfg.ssid);
+            esp_err_t cr = esp_wifi_connect();
+            /* 已经连着的时候再 connect 会返回 ESP_ERR_WIFI_CONN，不是错 */
+            if (cr != ESP_OK && cr != ESP_ERR_WIFI_CONN) {
+                ESP_LOGW(TAG, "esp_wifi_connect：%s", esp_err_to_name(cr));
+            }
         }
 
         /* ── 4. 等关联 + DHCP ── */
@@ -433,6 +450,14 @@ static void net_task(void *arg) {
 
         ESP_LOGI(TAG, "TCP 已连上 %s:%u —— 数据通道切换到 Wi-Fi",
                  s_cfg.host, (unsigned)s_cfg.port);
+
+        /* ★★ 补发一条 {"t":"boot"}。
+         *    ha_mqtt_init() 里那条 boot 是在 TCP 还没连上时发出的，只能落到
+         *    串口回退上；而 add-on 在 link=tcp 时**只读 TCP**，永远看不到它。
+         *    后果很实在：网关状态不上线、发射功率不会被重新下发
+         *    （固件不持久化 TX 功率，见 zb_gateway 那边的说明）。
+         *    每次重连都补发是安全的 —— add-on 的 boot 处理是幂等的。 */
+        ha_mqtt_emit_raw("{\"t\":\"boot\"}");
         announce(true);
 
         tcp_rx_loop(fd);
@@ -453,6 +478,23 @@ static void net_task(void *arg) {
 }
 
 /* ── 对外接口 ─────────────────────────────────────────────────────────── */
+/* 建事件组/互斥量并起 net_task。★ 只允许成功一次 —— 见 s_task_started 处的说明。 */
+static esp_err_t net_task_spawn(void) {
+    if (s_task_started) return ESP_OK;
+    if (!s_ev)   s_ev   = xEventGroupCreate();
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!s_ev || !s_lock) {
+        ESP_LOGE(TAG, "事件组/互斥量创建失败");
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(net_task, "net_rx", 5120, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "net_task 创建失败");
+        return ESP_ERR_NO_MEM;
+    }
+    s_task_started = true;
+    return ESP_OK;
+}
+
 bool net_link_ready(void)      { return s_tcp_up; }
 uint8_t net_link_transport(void) {
     return s_cfg.transport;
@@ -518,19 +560,11 @@ esp_err_t net_link_configure(const char *ssid, const char *pass,
         if (!s_cfg.ssid[0] || !s_cfg.host[0]) {
             ESP_LOGW(TAG, "通道=Wi-Fi 但 ssid 或 host 为空，会一直重连");
         }
-        if (!s_ev) {
-            /* 开机时通道是串口 ⇒ net_task 没起过，现在补起 */
-            s_ev   = xEventGroupCreate();
-            s_lock = xSemaphoreCreateMutex();
-        }
-        /* 已经起过就不重复建任务：s_cfg_gen 变化会让它自己重新下发参数 */
-        static bool task_started = false;
-        if (!task_started) {
-            task_started = true;
-            if (xTaskCreate(net_task, "net_rx", 5120, NULL, 4, NULL) != pdPASS) {
-                ESP_LOGE(TAG, "net_task 创建失败");
-                return ESP_ERR_NO_MEM;
-            }
+        /* 已经起过就不会再建（s_task_started 守着）；s_cfg_gen 变了由它自己重下发 */
+        esp_err_t tr = net_task_spawn();
+        if (tr != ESP_OK) {
+            s_cfg.transport = NET_LINK_UART;
+            return tr;
         }
     } else {
         net_link_kick();     /* 切回串口：把现有 TCP 掐掉 */
@@ -579,16 +613,9 @@ esp_err_t net_link_start(void) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_ev   = xEventGroupCreate();
-    s_lock = xSemaphoreCreateMutex();
-    if (!s_ev || !s_lock) {
-        ESP_LOGE(TAG, "事件组/互斥量创建失败");
-        s_cfg.transport = NET_LINK_UART;
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (xTaskCreate(net_task, "net_rx", 5120, NULL, 4, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "net_task 创建失败 → 降级串口");
+    /* 事件组/互斥量都交给 net_task_spawn 建，避免两处各建一套 */
+    if (net_task_spawn() != ESP_OK) {
+        ESP_LOGE(TAG, "net_task 起不来 → 降级串口");
         s_cfg.transport = NET_LINK_UART;
         return ESP_ERR_NO_MEM;
     }

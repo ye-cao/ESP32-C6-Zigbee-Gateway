@@ -173,6 +173,53 @@ static void rx_task(void *arg) {
 void ha_mqtt_handle_line(char *buf) {
     if (!buf || !s_cmd_cb) return;
 
+    /* ★★★ 这两个必须放在链首。
+     *   下面的分支大量使用无引号的 strstr()（`"topo"`、`"probe"`、`"lqi"`
+     *   之类），只要 SSID 或 Wi-Fi 密码里恰好含这些字母组合，命令就会被
+     *   前面那条分支劫持 —— 表现是「发 net_cfg 没反应」，而且极难想到原因。
+     *   net_cfg 的载荷本身是用户填的任意文本，所以必须最先认它。 */
+    if (strstr(buf, "net_cfg")) {
+        /* Wi-Fi / 传输通道配置：
+         *   {"cmd":"net_cfg","ssid":"…","pass":"…","host":"…","port":12345,"tr":1}
+         * 拼成 payload = "SSID\x1fPASS\x1fHOST\x1fPORT\x1fTR" 交给 main.c。
+         *
+         * ★ 用 \x1f（unit separator）而不是逗号：SSID 和密码里完全可能有
+         *   逗号。用逗号切会把密码拦腰截断，症状是「一直连不上但看不出
+         *   为什么」—— 这种 bug 查起来最费时间。
+         * ★ 空字段 = 「这一项不改」，由 main.c 解释。
+         * ★★ 这个分支和 main.c::on_uart_cmd 里的同名分支**必须成对存在**。
+         *    只改一处，协调器就回 {"t":"error","why":"unknown_cmd"} ——
+         *    node_desc / fw_ota_data / dev_remove 已经这么死过三次。
+         *    本次第一版又漏了一遍，是提交后自审才抓到的。 */
+        static char payload[320];
+        static const char *const keys[5] = {
+            "\"ssid\"", "\"pass\"", "\"host\"", "\"port\"", "\"tr\""
+        };
+        size_t pos = 0;
+        for (int i = 0; i < 5; i++) {
+            if (i && pos < sizeof(payload) - 1) payload[pos++] = '\x1f';
+            const char *v = json_val(buf, keys[i]);
+            if (!v) continue;
+            if (*v == '"') {
+                v++;
+                while (*v && *v != '"' && pos < sizeof(payload) - 1)
+                    payload[pos++] = *v++;
+            } else {
+                while (*v && *v != ',' && *v != '}' && *v != ' ' &&
+                       pos < sizeof(payload) - 1)
+                    payload[pos++] = *v++;
+            }
+        }
+        payload[pos] = '\0';
+        s_cmd_cb("net_cfg", payload, (int)pos);
+        return;
+    }
+    if (strstr(buf, "net_status")) {
+        /* {"cmd":"net_status"} —— 回一条 {"t":"net_status",…} */
+        s_cmd_cb("net_status", "", 0);
+        return;
+    }
+
     if (strstr(buf, "permit_join")) {
             char *p = strstr(buf, "\"sec\":");
             char secs_str[8] = "180";

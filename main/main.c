@@ -60,6 +60,16 @@ static inline void zb_unlock(bool held) {
     if (held) esp_zb_lock_release();
 }
 
+/* net_cfg 的单字段取值约定：
+ *   空      → NULL（这一项不改）
+ *   "-"     → ""  （清空这一项；用来抹掉写错的 SSID / 密码）
+ *   其他    → 原样 */
+static const char *net_fld(const char *f) {
+    if (!f[0]) return NULL;
+    if (f[0] == '-' && f[1] == '\0') return "";
+    return f;
+}
+
 /* ── 命令处理：来自树莓派的 UART1 命令 ────────────────────────────────── */
 static void on_uart_cmd(const char *cmd, const char *payload, int len) {
     char buf[8] = {0};
@@ -228,9 +238,9 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
             for (int i = 0; i < nn && nf < 5; i++) {
                 if (nb[i] == '\x1f') { nb[i] = '\0'; fld[nf++] = &nb[i + 1]; }
             }
-            const char *ssid = fld[0][0] ? fld[0] : NULL;
-            const char *pass = (nf > 1 && fld[1][0]) ? fld[1] : NULL;
-            const char *host = (nf > 2 && fld[2][0]) ? fld[2] : NULL;
+            const char *ssid = net_fld(fld[0]);
+            const char *pass = (nf > 1) ? net_fld(fld[1]) : NULL;
+            const char *host = (nf > 2) ? net_fld(fld[2]) : NULL;
             int  port = (nf > 3 && fld[3][0]) ? atoi(fld[3]) : 0;
             int  tr   = (nf > 4 && fld[4][0]) ? atoi(fld[4]) : -1;
 

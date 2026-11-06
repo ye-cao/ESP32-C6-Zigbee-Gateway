@@ -27,6 +27,7 @@ JSON 发给主机。协议一个字没改，只换了"那根线"。
   ★ 按既定规矩**两处都登记**：`main.c::on_uart_cmd` + `ha_mqtt.c` 的
   JSON→payload 分支。二者都列入了免锁白名单（只写 NVS / 只读自有结构体，
   持 ZBOSS 锁做 NVS 写毫无必要）。
+  字段约定：空 = 不改，`"-"` = 清空（`net_fld()`）。
 - 通道存在 NVS 命名空间 `netlink`，**默认 `tr=0` 即串口** —— 配错了插回 USB
   就能改，而不是变砖。`net_link_start()` 全程不 `ESP_ERROR_CHECK`，
   任何失败都降级回串口并记一条日志。
@@ -50,6 +51,10 @@ JSON 发给主机。协议一个字没改，只换了"那根线"。
   add-on 启动**，拔掉 USB 就打不开，正好废掉本功能的全部意义。
 - `{"t":"net"}` / `{"t":"net_status"}` 的 dispatch 分支：打 `[NET] …` 日志并写进
   `_state["net"]`（`/api/state` 可见）。
+- `on_message` 新增两条命令：`{BASE}/cmd/net_status` 与 `{BASE}/cmd/net_cfg`。
+  后者把 JSON 对象**整包转发**给固件、不在 add-on 侧拆字段 —— 拆了就又变成
+  「两处解析」，而固件那边已经在拆。有了这两条，配 Wi-Fi 不需要接串口、
+  也不用写终端，在 HA 的「服务 → MQTT: Publish」里发就行。
 - `flash_apply()` 在 TCP 模式下**明确拒绝**：esptool 只能走 USB，硬闯只会半途失败；
   提示改用 App 级 OTA。
 - 新增回归检查 **`tools/checks/check_link_tcp.py`**（已加入 `run_all.py`）：
@@ -58,12 +63,44 @@ JSON 发给主机。协议一个字没改，只换了"那根线"。
 
 ### 修正
 
+- **`net_cfg` / `net_status` 一开始只登记在 `main.c`，没登记 `ha_mqtt.c`** ——
+  提交后自审才抓到。这正是项目里已经死过三次的那个毛病（`node_desc`、
+  `fw_ota_data`、`dev_remove`），老固件会回 `{"t":"error","why":"unknown_cmd"}`。
+  已补上，并把两个分支**放在解析链最前面**：链中大量 `strstr()` 没有引号
+  （`"topo"`、`"probe"`、`"lqi"`），密码里若含这些字母组合就会被前面那条劫持。
+- **`net_task` 可能被创建两次** —— `net_link_start()` 建任务时没置标志，
+  `net_link_configure()` 里的 `task_started` 是**函数级** static，两者不共享。
+  「开机 tr=1 后再发一条 net_cfg」会造出第二个 net_task，两个任务同时
+  `esp_wifi_connect` / `tcp_connect`、抢同一个 socket。改成文件级
+  `s_task_started` + 统一的 `net_task_spawn()`。
+- **Wi-Fi 参数一次都没下发过** —— `applied` 与 `s_cfg_gen` 初值同为 0，
+  「配置变了」判定恒为假 ⇒ `wifi_apply_cfg()` 被跳过 ⇒ `esp_wifi_connect()`
+  拿空 SSID 去连，日志只报 AUTH_EXPIRE，看起来像密码错。改法：`applied`
+  初值 `0xFFFFFFFF`，并把 apply 挪到 `esp_wifi_start()` **之前**。
+- **add-on 在 `link=tcp` 时收不到 `{"t":"boot"}`** —— `ha_mqtt_init()` 里那条
+  boot 是在 TCP 还没连上时发的，只能落到串口回退；而 TCP 模式下 add-on
+  只读 socket。后果是网关状态不上线、发射功率不会被重新下发（固件不持久化
+  它）。现在每次 TCP 连上都会补发一条 boot（add-on 侧处理是幂等的）。
+- `announce()` / `net_status` 的日志措辞：串口模式下 `state=uart`、`ip=0.0.0.0`
+  却说「通道已连通」，会误导排查。改为照实打印。
+- `wifi_begin()` 中途失败重试时不会重复创建 STA netif（单独加了 `s_netif_created`）。
 - 清掉一批上一轮漏译的德文（运行日志、注释、测试描述）：`verbinde`、
   `Beendet`、`Abfrage fehlgeschlagen`、`Lese-Fehler`、`gestartet`、
-  `abgemeldet`、`FEHLER`、`koordinierter` 等，以及 `run.sh`、`build.sh`、
+  `abgemeldet`、`FEHLER`、`angefordert` 等，以及 `run.sh`、`build.sh`、
   `host/install.sh`、`test_packaging.py` 里的德文说明。
 - `serial_gateway.py` 局部变量 `gehoert_uns` → `owns_it`。
-- `config.json` / `sdkconfig.defaults` 行尾统一为 LF（打包检查会拦 CRLF）。
+- `config.json` / `sdkconfig.defaults` 行尾统一为 LF（打包检查会拦 CRLF），
+  并新增 `.gitattributes` 钉死 add-on 打包文件的行尾。
+
+### 实机验证（2026-11-06）
+
+直刷上机后确认：设备正常启动、Zigbee 网络完整（`ch 20 / pan 0xa311` 不变，
+无需重新配网）、`cmd/net_status` 有正确回执、`\x1f` 分字段在密码含逗号时
+不串位、NVS 落盘跨重启有效、`"-"` 清空语义有效。
+新固件的确凿证据：启动横幅
+`I (306) main:   JSON : 串口 USB-Serial-JTAG（默认）/ Wi-Fi+TCP（NVS 里 tr=1）`。
+
+**真正的 Wi-Fi/TCP 数据通路尚未验证** —— 需要真实 SSID 与密码。
 
 ### 暂未做（下一步）
 

@@ -98,8 +98,44 @@ C6 换成 5V 电源头供电。它自己会重新连 Wi-Fi → 连主机 → 继
 | `{"cmd":"net_status"}` | 查询当前通道 / SSID / IP / RSSI / AP 信道 |
 | `{"cmd":"net_cfg","ssid":…,"pass":…,"host":…,"port":…,"tr":…}` | 写配置并立即生效 |
 
+字段约定（三个字段都一样）：
+
+- **缺省或空串** = 这一项不改（方便只换 host、只翻通道）
+- **`"-"`** = 清空这一项（用来抹掉写错的 SSID / 密码）
+- 字段之间在固件内部用 `\x1f` 分隔，所以 SSID 或密码里有逗号也不会被截断
+
+三条下发途径，效果完全一样：
+
+1. **MQTT**（推荐，不用接串口）：
+   ```
+   gw/coordinator/cmd/net_status        载荷留空
+   gw/coordinator/cmd/net_cfg           载荷 = 上面那个 JSON 对象
+   ```
+   HA 里可以直接用「开发者工具 → 服务 → MQTT: Publish」发。
+2. **网页 / 其它工具**：add-on 的 `{BASE}/cmd/*` 通道与上面是同一入口。
+3. **串口**：USB 插着时可以直接把一行 JSON 写进 `/dev/ttyACM0`。
+
 固件在以下时机**主动**上报 `{"t":"net",…}`：TCP 连上、TCP 断开、配置变更回执。
 add-on 会把它打成 `[NET] …` 一行日志，并放进 `/api/state` 的 `net` 键里。
+
+## 实机验证记录（1.5.5）
+
+在真机上跑过、确认无误的：
+
+| 项 | 判据 |
+|---|---|
+| 新固件确实在跑 | 启动横幅 `I (306) main:   JSON : 串口 USB-Serial-JTAG（默认）/ Wi-Fi+TCP（NVS 里 tr=1）`；`net_status` 能应答（老固件只回 `unknown_cmd`） |
+| 命令两处登记生效 | `cmd/net_status` → `{"t":"net_status",…}` |
+| `\x1f` 分字段 | 密码给 `"p,a,s s"`，host 解析出来仍是完整 IPv4（说明没被逗号截断） |
+| NVS 落盘 | 写入后重启，`net_status` 里 ssid/host 仍在 |
+| 清空语义 | `ssid/host` 给 `"-"` → 回执变 `""` |
+| 直刷不丢配对 | 刷完 `ch:20 pan:0xa311` 不变，设备自动回来，无需重新配网 |
+
+**尚未验证**：真正的 Wi-Fi/TCP 数据通路（需要真实 SSID 与密码）。
+
+顺带确认一件事：`ESP_LOGI` 虽然在 `ha_mqtt_init()` 里被 `null_vprintf` 静音，
+但那之前（开机前 ~300 ms）的日志仍然会从串口漏出来 —— 上面那条横幅就是这么
+看到的。这也意味着 panic 前的几行不一定全丢。
 
 ## 信道规划（重要）
 
