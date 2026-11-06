@@ -32,3 +32,6 @@ _ha_token.tmp
 
 # 临时日志
 *.log
+
+# 整片 Flash 备份（含 Zigbee 配网凭据，体积大，不入库）
+backup/
