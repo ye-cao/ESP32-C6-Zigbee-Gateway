@@ -255,7 +255,7 @@ check("已经不可能重发", pend.get("tries") == ns["_MAX_TRIES"], str(pend))
 time.sleep(0.3)
 check("超时之后也没有第 2 条命令", len(devcmds()) == 1, str(devcmds()))
 
-print("\n8) Controller + noread → switch abgemeldet")
+print("\n8) Controller + noread → switch 已注销")
 mq.pub.clear()
 ns["_ha_sent"].clear()          # 否则第 2 项测试的去重会生效
 ns["_ha_mark_controller"]("0x747d", 1)
@@ -376,7 +376,7 @@ ns["_ha_db"]["ABC123X1"] = {"caps": ["switch"], "model": "X", "description": "Po
 ns["_ha_db"]["ABC123Y1"] = {"caps": ["switch", "action"], "model": "Y",
                             "description": "Smart 1 key scene wall switch"}
 D["0xf002"] = {"model": "ABC123Z9"}
-check("gemischte Familie → kein Hinweis", ns["_ha_db_hint"]("0xf002")[0] is None,
+check("混合家族 → 无提示", ns["_ha_db_hint"]("0xf002")[0] is None,
       str(ns["_ha_db_hint"]("0xf002")))
 check("型号短时前缀不生效",
       ns["_ha_db_family"]("FTB56")[0] is None, str(ns["_ha_db_family"]("FTB56")))

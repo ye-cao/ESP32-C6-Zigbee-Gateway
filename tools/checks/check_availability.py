@@ -190,7 +190,7 @@ mod._disc_remote.clear()
 mod._disc_remote["homeassistant/switch/c6_0x2ad6/ep16_on_off/config"] = json.dumps(
     {"name": "alt", "availability": [alt]}, sort_keys=True, ensure_ascii=False)
 mod._disc_remote["homeassistant/switch/c6_0x2ad6/ep17_on_off/config"] = json.dumps(
-    {"name": "schon neu", "availability": [alt, neu2],
+    {"name": "已经新建", "availability": [alt, neu2],
      "availability_mode": "all"}, sort_keys=True, ensure_ascii=False)
 mod._disc_remote["homeassistant/switch/fremd_x/y/config"] = json.dumps(
     {"name": "fremd", "availability": [fremd]}, sort_keys=True, ensure_ascii=False)

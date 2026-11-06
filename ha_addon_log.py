@@ -61,7 +61,7 @@ async def main():
         await ws.recv()
         await ws.send(json.dumps({"type": "auth", "access_token": TOKEN}))
         if json.loads(await ws.recv()).get("type") != "auth_ok":
-            sys.exit("auth fehlgeschlagen")
+            sys.exit("认证失败")
         ha = Ha(ws)
 
         if mode == "list":
@@ -78,7 +78,7 @@ async def main():
             res = await ha.sup("/addons")
             cand = [a for a in res.get("addons", []) if match(a)]
             if not cand:
-                sys.exit("kein Add-on gefunden – erst 'list'")
+                sys.exit("没找到 add-on – 先执行 'list'")
             slug = cand[0]["slug"]
 
         if mode == "log":

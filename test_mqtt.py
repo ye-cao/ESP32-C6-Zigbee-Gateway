@@ -140,7 +140,7 @@ mq.subs.clear()
 ns["_addr_nodes"]["0x07da"] = "c6_0x07da"       # 设备存量已加载
 ns["_ieee_nodes"]["00:12:4b:00:01"] = "c6_0x07da"
 ns["_disc_begin_window"]()
-check("Fenster ist offen", ns["_disc_ready"] is False, str(ns["_disc_ready"]))
+check("窗口已开启", ns["_disc_ready"] is False, str(ns["_disc_ready"]))
 check("Discovery-Topic abonniert",
       "homeassistant/+/+/+/config" in mq.subs, str(mq.subs))
 disc_send("switch", "c6_0x07da", "ep16_on_off", cfg("开关"))
@@ -153,7 +153,7 @@ gleich = json.dumps(cfg("开关"), sort_keys=True, ensure_ascii=False)
 ns["_disc_remote"]["homeassistant/switch/c6_0x07da/ep16_on_off/config"] = gleich
 time.sleep(ns["_DISC_WAIT"] + 0.1)          # Timer von _disc_begin_window
 check("Fenster ist zu", ns["_disc_ready"] is True, str(ns["_disc_ready"]))
-check("Abo wieder abgemeldet", "homeassistant/+/+/+/config" not in mq.subs, str(mq.subs))
+check("订阅已取消", "homeassistant/+/+/+/config" not in mq.subs, str(mq.subs))
 check("只发了那份有差别的配置",
       [t for t, p, r in mq.pub] == ["homeassistant/sensor/c6_0x07da/ep1_battery/config"],
       str(mq.pub))

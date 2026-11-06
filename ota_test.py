@@ -158,7 +158,7 @@ def main():
                 lambda x: x.get("t") == "fw_ota" and x.get("st") in
                           ("write", "error", "done"), args.ack_timeout)
             if not ack:
-                print(f"\nFAIL  Timeout: gesendet {off}/{size}, "
+                print(f"\nFAIL  超时：已发送 {off}/{size}, "
                       f"letzter ACK {last_ack} "
                       f"({last_ack * 100 // size} %)")
                 print(f"      卡住了，停在 {time.time()-t0:.1f}s")
@@ -171,7 +171,7 @@ def main():
                 return 3
             last_ack = ack.get("off", last_ack)
             print(f"  ACK off={last_ack} ({ack.get('pct', '?')} %) "
-                  f"[gesendet {off}]")
+                  f"[已发送 {off}]")
 
     print(f"\n全部字节发完，用时 {time.time()-t0:.1f}s -> fw_ota_end")
     link.send({"cmd": "fw_ota_end"})

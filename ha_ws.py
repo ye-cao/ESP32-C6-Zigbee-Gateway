@@ -15,7 +15,7 @@ async def main():
         a = json.loads(await ws.recv())
         print("auth:", a.get("type"))
         if a.get("type") != "auth_ok":
-            sys.exit("auth fehlgeschlagen: %s" % a)
+            sys.exit("认证失败：%s" % a)
 
         async def call(i, typ, **kw):
             await ws.send(json.dumps({"id": i, "type": typ, **kw}))

@@ -77,7 +77,7 @@ def main():
         pass
 
     L = Link(ser)
-    print(f"--- {args.port} offen, warte auf boot ---")
+    print(f"--- {args.port} 已打开，等待启动 ---")
     L.wait(lambda m: m.get("t") == "boot", args.boot_timeout)
 
     print("\n=== 1) probe ===")

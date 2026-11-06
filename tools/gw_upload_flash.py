@@ -42,7 +42,7 @@ def post_file(path, endpoint):
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=120) as r:
-        print(endpoint, "->", r.status, len(data), "B gesendet")
+        print(endpoint, "->", r.status, len(data), "B 已发送")
 
 
 def state():

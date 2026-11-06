@@ -508,7 +508,7 @@ def main():
     asyncio.run_coroutine_threadsafe(_matter_ws_loop(), loop)
     asyncio.run_coroutine_threadsafe(_otbr_poll_loop(), loop)
 
-    log.info("Gateway Service gestartet – Matter=%s  OTBR=%s",
+    log.info("网关服务已启动 – Matter=%s  OTBR=%s",
              MATTER_WS_URL, OTBR_REST_URL)
 
     # Web-Server blockiert (Haupt-Thread)

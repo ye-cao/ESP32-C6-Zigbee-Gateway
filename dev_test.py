@@ -74,7 +74,7 @@ def main():
 
     ser = open_port(args.port)
     sink = []
-    print(f"--- warte {args.wait_boot:.0f}s auf Boot ---")
+    print(f"--- 等待 {args.wait_boot:.0f}s 启动 ---")
     pump(ser, args.wait_boot, sink)
 
     if not args.skip_probe:

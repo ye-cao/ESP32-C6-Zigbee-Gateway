@@ -97,7 +97,7 @@ def do_connect():
                       5: "not authorized"}.get(rc, "?")))
         return rc == 0
     except Exception as e:
-        print("CONNECT fehlgeschlagen:", type(e).__name__, e)
+        print("CONNECT 失败：", type(e).__name__, e)
         return False
     finally:
         try:

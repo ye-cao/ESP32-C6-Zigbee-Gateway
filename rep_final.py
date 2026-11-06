@@ -77,7 +77,7 @@ print("--- 8 s Stabilisierung ---", flush=True)
 pump(8)
 
 toggle(1)
-print("--- warte auf Interview (max 45 s) ---", flush=True)
+print("--- 等待面试模式（最多 45 s）---", flush=True)
 end = time.time() + 45
 while time.time() < end and not iv_done:
     pump(1)

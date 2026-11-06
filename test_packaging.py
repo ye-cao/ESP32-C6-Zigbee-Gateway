@@ -57,9 +57,9 @@ def main():
         cr = raw.count(b"\r")
         bom = raw.startswith(b"\xef\xbb\xbf")
         ok &= check(cr == 0, f"{name}：没有 CR（发现 {cr}）")
-        ok &= check(not bom, f"{name}: kein UTF-8-BOM")
+        ok &= check(not bom, f"{name}：无 UTF-8 BOM")
 
-    print("\n[2] Shebang von run.sh")
+    print("\n[2] run.sh 的 shebang")
     first = (ADDON / "run.sh").read_bytes().split(b"\n", 1)[0]
     ok &= check(first == b"#!/usr/bin/env bash",
                 f"Shebang exakt richtig: {first!r}")
@@ -78,7 +78,7 @@ def main():
         except OSError as e:
             print(f"  SKIP  bash 执行不了（{e}）")
 
-    print("\n[4] Versionsgleichheit config.json ↔ serial_gateway.py")
+    print("\n[4] 版本号一致性 config.json ↔ serial_gateway.py")
     cfg = json.loads((ADDON / "config.json").read_text(encoding="utf-8"))
     m = re.search(r'^GW_VERSION = "([^"]+)"',
                   (ADDON / "serial_gateway.py").read_text(encoding="utf-8"), re.M)
@@ -87,15 +87,15 @@ def main():
         ok &= check(cfg["version"] == m.group(1),
                     f"config.json={cfg['version']} == GW_VERSION={m.group(1)}")
 
-    print("\n[5] Dockerfile COPY-Ziele existieren")
+    print("\n[5] Dockerfile 里 COPY 的源文件都存在")
     docker = (ADDON / "Dockerfile").read_text(encoding="utf-8")
     copies = re.findall(r"^COPY\s+(\S+)\s+\S+", docker, re.M)
     ok &= check(bool(copies), f"COPY-Zeilen gefunden ({len(copies)})")
     for src in copies:
-        ok &= check((ADDON / src).is_file(), f"{src} existiert")
+        ok &= check((ADDON / src).is_file(), f"{src} 存在")
 
-    print("\n[6] Dockerfile normalisiert CRLF")
-    ok &= check("s/\\r$//" in docker, "sed 's/\\r$//' Guard vorhanden")
+    print("\n[6] Dockerfile 会规范化 CRLF")
+    ok &= check("s/\\r$//" in docker, "存在 sed 's/\\r$//' 保护")
     ok &= check("chmod a+x /run.sh" in docker, "run.sh 被设为可执行")
 
     print()

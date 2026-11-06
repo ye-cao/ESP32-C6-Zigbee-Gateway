@@ -89,7 +89,7 @@ def main():
         (ok if cond else fail).append(label)
         print(("  OK   " if cond else "  FAIL ") + label + (f"   {detail}" if detail else ""))
 
-    print(f"--- {args.port} geoeffnet, warte auf Boot ---")
+    print(f"--- {args.port} 已打开，等待启动 ---")
     boot = L.wait(lambda m: m.get("t") == "boot", 15)
     chk(boot is not None, "Boot-Meldung empfangen")
 
@@ -120,7 +120,7 @@ def main():
         hx = dr.get("hex", "")
         # ZCL-Header = [frame-control][seq][command]  →  command 0x0B = Default
         # Response 的负载 = [command_id][status]，status 就落在
-        # Byte 4 (hex[8:10]), NICHT auf Byte 2.
+        # Byte 4 (hex[8:10]), 不是 Byte 2.
         st = hx[8:10] if len(hx) >= 10 else "?"
         print(f"  Default Response: {hx}  (command_id=0x{hx[6:8]}, status=0x{st})")
     chk(dr is not None and len(dr.get("hex", "")) >= 10
