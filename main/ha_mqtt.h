@@ -49,3 +49,9 @@ void        ha_mqtt_logf(const char *tag, const char *fmt, ...)
 
 /* 直接吐出一行原始 JSON（用于扫描结果） */
 void ha_mqtt_emit_raw(const char *line);
+
+/* 临时打开/关闭 IDF 自身的日志输出。
+ * 默认是关闭的（见 ha_mqtt.c 的 null_vprintf）—— 关掉才能保证串口上只有
+ * JSON 行。排查 Wi-Fi/ZBOSS 驱动内部问题时用 log_on 打开，害处是日志会
+ * 混进串口数据流，所以只在 TCP 通道下用，用完记得 log_off。 */
+void ha_mqtt_log_verbose(bool on);

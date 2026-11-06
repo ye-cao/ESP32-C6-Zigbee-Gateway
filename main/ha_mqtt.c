@@ -49,6 +49,23 @@ static int null_vprintf(const char *fmt, va_list args) {
     return 0;
 }
 
+/* ★ 临时把 IDF 的日志放出来，排查完再关。
+ *
+ * 为什么需要这个开关：ha_mqtt_init() 把日志换成了 null_vprintf，串口上只剩
+ * JSON 行 —— 这是为了让 add-on 的解析不被日志污染。代价是 Wi-Fi 驱动自己
+ * 的诊断信息（"sta is connecting"、"scan failed"、PHY 报错之类）一个字都看不到，
+ * 只能靠 net_status 的一个数字瞎猜。2026-11-06 查 wifi_scan 返回 0 个 AP
+ * 时就是被这个卡住的。
+ *
+ * ★ 只能在**传输通道是 TCP** 时开：那时数据走 socket，日志混进串口无害。
+ *   串口通道下开会把日志插进 JSON 流里，add-on 会收到解析不了的半截行。 */
+void ha_mqtt_log_verbose(bool on) {
+    esp_log_set_vprintf(on ? vprintf : null_vprintf);
+    if (on) {
+        ESP_LOGW("ha_mqtt", "日志输出已打开 —— 串口上会混进 IDF 日志，排查完请发 log_off");
+    }
+}
+
 static void tx_task(void *arg) {
     (void)arg;
     char *line = NULL;
@@ -217,6 +234,25 @@ void ha_mqtt_handle_line(char *buf) {
     if (strstr(buf, "net_status")) {
         /* {"cmd":"net_status"} —— 回一条 {"t":"net_status",…} */
         s_cmd_cb("net_status", "", 0);
+        return;
+    }
+    if (strstr(buf, "wifi_scan")) {
+        /* {"cmd":"wifi_scan"} —— 让固件自己扫一遍，回一条 {"t":"wifi_scan",…}
+         * ★ 放在这里是因为本函数的命令链是"无引号 strstr"式的，
+         *   同一条命令必须在这里和 main.c::on_uart_cmd 各登记一次，
+         *   否则 C6 只会回 {"t":"error","why":"unknown_cmd"}。 */
+        s_cmd_cb("wifi_scan", "", 0);
+        return;
+    }
+    /* ★ log_on / log_off 必须排在 wifi_scan 之后、且用完整串匹配 ——
+     *   "log_on" 里没有会和上面几条撞的字符组合，但顺序上放在这里可以确保
+     *   wifi_scan 之类名字更长的先被匹配到。 */
+    if (strstr(buf, "\"log_on\"")) {
+        ha_mqtt_log_verbose(true);
+        return;
+    }
+    if (strstr(buf, "\"log_off\"")) {
+        ha_mqtt_log_verbose(false);
         return;
     }
 

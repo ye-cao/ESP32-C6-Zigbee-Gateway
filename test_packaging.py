@@ -82,7 +82,7 @@ def main():
     cfg = json.loads((ADDON / "config.json").read_text(encoding="utf-8"))
     m = re.search(r'^GW_VERSION = "([^"]+)"',
                   (ADDON / "serial_gateway.py").read_text(encoding="utf-8"), re.M)
-    ok &= check(m is not None, "GW_VERSION im Python gefunden")
+    ok &= check(m is not None, "Python 里找到 GW_VERSION")
     if m:
         ok &= check(cfg["version"] == m.group(1),
                     f"config.json={cfg['version']} == GW_VERSION={m.group(1)}")
@@ -90,7 +90,7 @@ def main():
     print("\n[5] Dockerfile 里 COPY 的源文件都存在")
     docker = (ADDON / "Dockerfile").read_text(encoding="utf-8")
     copies = re.findall(r"^COPY\s+(\S+)\s+\S+", docker, re.M)
-    ok &= check(bool(copies), f"COPY-Zeilen gefunden ({len(copies)})")
+    ok &= check(bool(copies), f"COPY 行数 ({len(copies)})")
     for src in copies:
         ok &= check((ADDON / src).is_file(), f"{src} 存在")
 

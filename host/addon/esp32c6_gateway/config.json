@@ -12,6 +12,7 @@
   "boot": "auto",
   "init": false,
   "udev": true,
+  "uart": true,
   "host_network": true,
   "map": [
     "share"

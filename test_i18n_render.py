@@ -134,7 +134,7 @@ for path, name in [
     try:
         mod = load(path, name)
     except Exception as e:
-        print(f"   !! IMPORT FEHLER: {type(e).__name__}: {e}")
+        print(f"   !! 导入失败： {type(e).__name__}: {e}")
         fail += 1
         continue
 

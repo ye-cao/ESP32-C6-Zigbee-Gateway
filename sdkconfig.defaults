@@ -17,12 +17,22 @@ CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_SW_COEXIST_ENABLE=y
 CONFIG_LWIP_MAX_SOCKETS=10
 
+# ★★★ WPA3-SAE 必须显式编进来，而且必须写在这个文件里。
+#   sdkconfig 是 .gitignore 掉的，只在本地有效 —— 换台机器干净构建就会丢掉
+#   这三项，届时连纯 WPA3 的路由器会一直 STA_DISCONNECTED 且不给任何提示。
+#   2026-11-06：家里的 'yecao' 就是 WPA3-个人，栽在这上面。
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
+CONFIG_ESP_WIFI_ENABLE_SAE_PK=y
+CONFIG_ESP_WIFI_ENABLE_SAE_H2E=y
+
 # ── CPU / System ──────────────────────────────────────────────────────────────
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 
-# ── Console: USB Serial JTAG (/dev/ttyACM0) – Logs per vprintf stumm ────────
+# ── 控制台走 USB Serial JTAG（/dev/ttyACM0）────────────────────────────────
+# 注意：ESP_LOGI 等日志在 ha_mqtt_init() 里被 null_vprintf 静默掉，
+# 串口上只剩 JSON 行；排查内部状态请看 net_status / 各设备的回执。
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # ── Flash / Partition Table ───────────────────────────────────────────────────

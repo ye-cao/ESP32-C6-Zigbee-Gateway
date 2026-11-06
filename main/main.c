@@ -21,6 +21,11 @@
 
 #define TAG "main"
 
+/* 开机早期 Wi-Fi 扫频（诊断用，见 app_main 里的说明）。
+ * 正式固件必须是 0：打开会让开机多等约 3 秒。
+ * 2026-11-06 用它定位到"本板 Wi-Fi 收不到任何信号"之后已关回 0。 */
+#define NET_BOOTSCAN 0
+
 /* ── ZBOSS「大锁」─────────────────────────────────────────────────────────
  *
  * ★★★ 2026-10-26：这才是反复重启的真凶，不是栈溢出，也不是阻塞式串口写。
@@ -101,11 +106,16 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
      *
      *  - net_cfg / net_status：只写 NVS / 只读自己的结构体，同样不碰 SDK。
      *    写 NVS 要几十毫秒，持着 ZBOSS 锁做这件事会把整个 Zigbee 栈顶住，
-     *    毫无必要。 */
+     *    毫无必要。
+     *  - wifi_scan：扫频要 2~4 s，且中途会让 STA 离开当前信道。持着 ZBOSS
+     *    锁做这件事等于把整个 Zigbee 网络冻住 4 秒，绝对不行。 */
     bool held = (strncmp(cmd, "fw_ota", 6) == 0 ||
                  strcmp(cmd, "ota_data")    == 0 ||
                  strcmp(cmd, "net_cfg")     == 0 ||
-                 strcmp(cmd, "net_status")  == 0) ? false : zb_lock();
+                 strcmp(cmd, "net_status")  == 0 ||
+                 strcmp(cmd, "wifi_scan")   == 0 ||
+                 strcmp(cmd, "log_on")      == 0 ||
+                 strcmp(cmd, "log_off")     == 0) ? false : zb_lock();
 
     if (strcmp(cmd, "dev_cmd") == 0) {
         /* payload: "ADDR,EP,CMD"  CMD: 0=关 1=开 2=切换 */
@@ -256,6 +266,16 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         char st[256];
         net_link_status_json(st, sizeof(st));
         ha_mqtt_emit_raw(st);
+    } else if (strcmp(cmd, "wifi_scan") == 0) {
+        /* ★ static：24 个 AP 约 2 KB，做成局部变量会顶穿 uart_rx 那 4 KB 栈
+         *   （本文件里已经因为同类问题翻过车，见 net_fld 附近的说明）。 */
+        static char scan[3072];
+        net_link_scan_json(scan, sizeof(scan));
+        ha_mqtt_emit_raw(scan);
+    } else if (strcmp(cmd, "log_on") == 0) {
+        ha_mqtt_log_verbose(true);
+    } else if (strcmp(cmd, "log_off") == 0) {
+        ha_mqtt_log_verbose(false);
     }
 
     zb_unlock(held);
@@ -325,6 +345,23 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+#if NET_BOOTSCAN
+    /* ★ 诊断用：在 Zigbee 起来**之前**先扫一遍 2.4 GHz。
+     *   目的只有一个 —— 把"Wi-Fi 收不到信号"和"Zigbee 占住了射频"分开。
+     *   两者都在这里出 0 个 AP，就说明问题在 Wi-Fi 本身（天线/PHY/板子），
+     *   而不是共存。测完把 NET_BOOTSCAN 改回 0，别留在正式固件里：
+     *   它会让开机多等 4 秒左右。 */
+    {
+        static char bs[3072];
+        if (net_link_scan_early(bs, sizeof(bs)) == ESP_OK) {
+            printf("BOOTSCAN %s\n", bs);
+        } else {
+            printf("BOOTSCAN 扫描失败\n");
+        }
+        fflush(stdout);
+    }
+#endif
 
     ha_mqtt_set_cmd_cb(on_uart_cmd);
     ESP_ERROR_CHECK(ha_mqtt_init(NULL, NULL, NULL));

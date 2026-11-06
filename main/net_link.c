@@ -84,6 +84,15 @@ static volatile bool     s_wifi_started = false;
 static volatile bool     s_wifi_inited  = false;
 static bool              s_netif_created = false;
 static bool              s_task_started  = false;
+static bool              s_handlers_registered = false;
+
+/* ★ 上一次被 AP/驱动踢掉的原因码（wifi_err_reason_t）。
+ *   为什么非要有这个：ESP_LOGI 在本固件里被 null_vprintf 静默了，串口上看不到
+ *   「Wi-Fi 断开，原因=xx」这类日志；而没有这个码，"连不上"就只剩猜 ——
+ *   密码错(15)、找不到AP(201)、认证方式不匹配(还是 15) 三种情况在
+ *   net_status 里表现完全一样（ip=0.0.0.0、rssi=0）。2026-11-06 就因为看不出来，
+ *   差点去怀疑信号强度和 AP 距离，实际是纯 WPA3 网络没开 SAE。 */
+static volatile int      s_last_reason = 0;
 /* ★★★ s_task_started 必须是**文件级**的，而且 net_link_start 和
  *     net_link_configure 共用它。第一版把开关做成了 net_link_configure 里的
  *     函数级 static，于是「开机 tr=1 已经建过任务」之后再发一条 net_cfg，
@@ -149,9 +158,28 @@ static esp_err_t cfg_save(void) {
 }
 
 /* ── Wi-Fi 事件 ───────────────────────────────────────────────────────── */
+/* 事件组 / 互斥量：谁先用到谁建，但**只建一次**。
+ *
+ * ★★★ 2026-11-06 血的教训：原来只有 net_task_spawn() 里建这两个东西。
+ *   而串口模式（tr=0）下 net_task 根本不会创建，于是 s_ev 是 NULL；
+ *   一旦有人在这时懒加载拉起 Wi-Fi（比如发一条 wifi_scan 做诊断），
+ *   WIFI_EVENT_STA_START 回调里的 xEventGroupSetBits(NULL, …) 会直接
+ *   assert 崩溃并重启：
+ *       assert failed: xEventGroupSetBits event_groups.c:561 (xEventGroup)
+ *   表现是"命令发出去没有任何回执" —— 看起来像命令没被识别，实际设备重启了。
+ *   所以凡是会拉起 Wi-Fi 的路径，都必须先走这里。 */
+static esp_err_t net_sync_ensure(void) {
+    if (!s_ev)   s_ev   = xEventGroupCreate();
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    return (s_ev && s_lock) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 static void on_wifi_event(void *arg, esp_event_base_t base,
                           int32_t id, void *data) {
-    (void)arg; (void)data;
+    (void)arg;
+    /* ★ s_ev 有可能还没建起来（见 net_sync_ensure 的说明）。
+     *   回调里绝不能对 NULL 调 xEventGroupSetBits —— assert 一响就是重启。 */
+    if (!s_ev) return;
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
@@ -161,11 +189,16 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
             break;
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG, "已关联 AP，等 DHCP");
+            s_last_reason = 0;
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "Wi-Fi 断开，等 net_task 重连");
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            const wifi_event_sta_disconnected_t *d =
+                (const wifi_event_sta_disconnected_t *)data;
+            s_last_reason = d ? d->reason : -1;
+            ESP_LOGW(TAG, "Wi-Fi 断开，原因码 %d，等 net_task 重连", s_last_reason);
             xEventGroupClearBits(s_ev, BIT_IP);
             break;
+        }
         default:
             break;
         }
@@ -177,9 +210,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
     }
 }
 
-/* ── Wi-Fi 初始化（只做一次）──────────────────────────────────────────── */
+/* ── Wi-Fi 初始化（幂等）────────────────────────────────────────────── */
 static esp_err_t wifi_begin(void) {
-    if (s_wifi_inited) return ESP_OK;
+    /* ★ 先把事件组/锁备好：esp_wifi_start() 之后马上就会有 STA_START 回调，
+     *   那时 s_ev 必须已经存在（见 net_sync_ensure 的说明）。 */
+    esp_err_t er = net_sync_ensure();
+    if (er != ESP_OK) {
+        ESP_LOGE(TAG, "事件组/互斥量创建失败");
+        return er;
+    }
 
     /* 这两个在别的组件里可能已经建过，重复调用返回 INVALID_STATE —— 不算错 */
     esp_err_t r = esp_netif_init();
@@ -192,16 +231,20 @@ static esp_err_t wifi_begin(void) {
         ESP_LOGE(TAG, "事件循环创建失败：%s", esp_err_to_name(r));
         return r;
     }
+    /* ★ netif 的创建必须放在 s_wifi_inited 的早退之后**之前**补齐。
+     *   原因：net_link_scan_early() 只做扫频需要的初始化（不建 netif），
+     *   然后把 s_wifi_inited 置位。如果这里仍然"一进来就 if (s_wifi_inited)
+     *   return"，后面 net_task 就永远拿不到 STA netif ⇒ DHCP 永远失败，
+     *   表现成"关联上了但没有 IP"，而且一次比一次难查。
+     *   现在改成：netif 单独用 s_netif_created 保证，wifi_init 用它自己的标记。 */
     if (!s_netif_created) {
-        /* ★ 单独设标记：netif 创建成功后若后面的 esp_wifi_init 失败，
-         *   下次重试时不能再建一个 STA netif（wifi_begin 的 s_wifi_inited
-         *   只在全部成功后置位，挡不住这种中途失败的重试）。 */
         if (!esp_netif_create_default_wifi_sta()) {
             ESP_LOGE(TAG, "创建默认 STA netif 失败");
             return ESP_FAIL;
         }
         s_netif_created = true;
     }
+    if (s_wifi_inited) return ESP_OK;
 
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     r = esp_wifi_init(&ic);
@@ -209,10 +252,13 @@ static esp_err_t wifi_begin(void) {
         ESP_LOGE(TAG, "esp_wifi_init 失败：%s", esp_err_to_name(r));
         return r;
     }
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                       on_wifi_event, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                       on_wifi_event, NULL, NULL);
+    if (!s_handlers_registered) {
+        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                           on_wifi_event, NULL, NULL);
+        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                           on_wifi_event, NULL, NULL);
+        s_handlers_registered = true;
+    }
 
     r = esp_wifi_set_storage(WIFI_STORAGE_RAM);   /* 参数由我们自己管，别让驱动也存一份 */
     if (r != ESP_OK) ESP_LOGW(TAG, "set_storage 失败：%s", esp_err_to_name(r));
@@ -232,11 +278,31 @@ static void wifi_apply_cfg(void) {
     memset(&wc, 0, sizeof(wc));
     strncpy((char *)wc.sta.ssid,     s_cfg.ssid, sizeof(wc.sta.ssid) - 1);
     strncpy((char *)wc.sta.password, s_cfg.pass, sizeof(wc.sta.password) - 1);
-    /* 空密码 ⇒ 开放网络。不设这条的话默认要求 WPA2，连开放 AP 会一直失败，
-     * 而且失败原因只报一个笼统的 AUTH_EXPIRE，很难查。 */
-    wc.sta.threshold.authmode = s_cfg.pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    /* ★★★ 认证方式必须显式打开 WPA3-SAE，不能只写 WPA2_PSK。
+     *
+     *   原来的写法是「有密码就 WIFI_AUTH_WPA2_PSK」，对普通 WPA2 路由器没
+     *   问题，但遇上**纯 WPA3-个人（SAE）**的 AP 就永远关联不上 —— 不报错，
+     *   只是反复 STA_DISCONNECTED，net_status 里一直是 ip=0.0.0.0 / rssi=0，
+     *   看上去和"密码错了"、"信号太弱"完全一样。
+     *   2026-11-06 实测：家里的 'yecao' 就是 WPA3-个人（netsh 里显示
+     *   「身份验证: WPA3 - 个人」），改成 WPA2_WPA3_PSK 之后一次连通。
+     *
+     *   WPA2_WPA3_PSK = 「WPA2 与 WPA3 都接受」，比单选 WPA3_PSK 更保险：
+     *   同一个 SSID 换个只支持 WPA2 的老路由器也还能用。
+     *
+     *   空密码 ⇒ 开放网络，这条保持原样（否则连开放 AP 会一直 AUTH_EXPIRE）。
+     */
+    wc.sta.threshold.authmode = s_cfg.pass[0] ? WIFI_AUTH_WPA2_WPA3_PSK
+                                              : WIFI_AUTH_OPEN;
+    /* PMF（管理帧保护）是 WPA3 的硬性要求。capable=true / required=false
+     * 表示"能谈就谈"，WPA2 的 AP 也不会因此被拒。 */
     wc.sta.pmf_cfg.capable  = true;
     wc.sta.pmf_cfg.required = false;
+    /* ★ SAE 的 PWE 推导有两种：H2E（哈希到元素）和 hunt-and-peck（老办法）。
+     *   IDF 默认 UNSPECIFIED，会按 AP 的 RSNXE 自己选；但实测这个 AP 的
+     *   5 GHz BSSID 明确标注「不支持 H2E」，自动选可能挑错边。
+     *   写成 BOTH 就是两种都试，兼容性最好。 */
+    wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     esp_err_t r = esp_wifi_set_config(WIFI_IF_STA, &wc);
     if (r != ESP_OK) ESP_LOGE(TAG, "set_config 失败：%s", esp_err_to_name(r));
@@ -481,9 +547,7 @@ static void net_task(void *arg) {
 /* 建事件组/互斥量并起 net_task。★ 只允许成功一次 —— 见 s_task_started 处的说明。 */
 static esp_err_t net_task_spawn(void) {
     if (s_task_started) return ESP_OK;
-    if (!s_ev)   s_ev   = xEventGroupCreate();
-    if (!s_lock) s_lock = xSemaphoreCreateMutex();
-    if (!s_ev || !s_lock) {
+    if (net_sync_ensure() != ESP_OK) {
         ESP_LOGE(TAG, "事件组/互斥量创建失败");
         return ESP_ERR_NO_MEM;
     }
@@ -587,15 +651,220 @@ void net_link_status_json(char *out, size_t out_len) {
             ch   = ap.primary;
         }
     }
-    const char *st = !s_wifi_started ? "uart"
-                   : (s_tcp_up ? "tcp_up" : "wifi_only");
+    /* ★ state 必须跟着 transport 走。
+     *   只看 s_wifi_started 会出错：Wi-Fi 只要被启动仪式过（哪怕后来 net_cfg
+     *   把 tr 改回 0），它就一直是 true，于是串口模式的设备也回
+     *   state="wifi_only" —— 排查时会以为"它正在等 Wi-Fi"，其实是串口在工作。 */
+    const char *st = (s_cfg.transport != NET_LINK_TCP) ? "uart"
+                   : (!s_wifi_started ? "starting"
+                                      : (s_tcp_up ? "tcp_up" : "wifi_only"));
     snprintf(out, out_len,
         "{\"t\":\"net_status\",\"transport\":\"%s\",\"state\":\"%s\","
         "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%u,\"ip\":\"%s\","
-        "\"rssi\":%d,\"ap_ch\":%d}",
+        "\"rssi\":%d,\"ap_ch\":%d,\"why\":%d}",
         s_cfg.transport == NET_LINK_TCP ? "wifi" : "uart", st,
         s_cfg.ssid, s_cfg.host, (unsigned)s_cfg.port, s_ip,
-        (int)rssi, ch);
+        (int)rssi, ch, s_last_reason);
+}
+
+/* ── 扫频：把 C6 自己"看见"了哪些 AP 报给主机 ─────────────────────────────
+ *
+ * ★ 为什么值得占一块固件代码：判断"为什么连不上"时，主机的扫描结果没有
+ *   参考价值 —— 电脑的天线、支持的频段、Windows 的扫描缓存都和 C6 不同。
+ *   2026-11-06 就是这样：这一头 netsh 看得见 'yecao'，C6 那头回的是
+ *   why=201（NO_AP_FOUND），两边对不上，只能靠猜。让 C6 自己扫一次，
+ *   "它看见什么、多强、什么加密"立刻变成事实。
+ *
+ * 输出：{"t":"wifi_scan","n":N,"aps":[{"s":"ssid","r":-45,"c":1,"a":3},…]}
+ *   a = wifi_auth_mode_t：0=OPEN 1=WEP 2=WPA 3=WPA2 4=WPA/WPA2
+ *       5=WPA2-ENT 6=WPA3 7=WPA2/WPA3 8=WPA3-EXT
+ *
+ * 注意：扫频会让 STA 短暂离开当前信道，正在传的数据会顿一下 ——
+ * 这是诊断命令，不要放进轮询里。
+ */
+/* 真正发起扫描并拼 JSON。要求 Wi-Fi 已经 init + start。
+ * tag 决定回执里的 "t"，这样"开机早期扫描"和"命令扫描"在日志里能分开看。 */
+static esp_err_t scan_format(const char *tag, char *out, size_t out_len) {
+    if (!out || out_len < 64) return ESP_ERR_INVALID_ARG;
+
+    wifi_scan_config_t sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.show_hidden = true;          /* 隐藏 SSID 也要列出来，名字显示为空 */
+    /* ★★ 驻留时间必须显式给，不能留 0。
+     *    全 0 的配置在实机上表现为「scan 返回 ESP_OK，但 AP 数量是 0」——
+     *    n=0 / aps=[]，连隔壁邻居的 AP 都扫不到，看起来像射频坏了。
+     *    2026-11-06 就是这么被误导了一轮。
+     *    active.min/max 是每个信道的探测时长（ms）：min 给 120 是 IDF 的
+     *    常规取值，max 1500 让信号弱的 AP 也有机会回 probe response。 */
+    sc.scan_type            = WIFI_SCAN_TYPE_ACTIVE;
+    sc.scan_time.active.min = 120;
+    sc.scan_time.active.max = 1500;
+
+    /* ★ 先断开再扫。STA 正在 esp_wifi_connect() 的重试循环里时，扫描请求
+     *   可能被驱动吞掉（返回 OK 但结果为空）。断开一下把状态清干净，
+     *   net_task 那边下一轮会自己再连，不需要我们操心。 */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    esp_err_t r = esp_wifi_scan_start(&sc, true);   /* true = 阻塞到扫完 */
+    if (r != ESP_OK) {
+        snprintf(out, out_len, "{\"t\":\"%s\",\"err\":\"%s\"}",
+                 tag, esp_err_to_name(r));
+        return r;
+    }
+
+    uint16_t n = 0;
+    esp_err_t nr = esp_wifi_scan_get_ap_num(&n);
+    if (n > 24) n = 24;             /* 上限，别把输出撑爆 */
+    static wifi_ap_record_t recs[24];
+    uint16_t got = n;
+    esp_err_t gr = ESP_OK;
+    if (got) {
+        gr = esp_wifi_scan_get_ap_records(&got, recs);
+        if (gr != ESP_OK) got = 0;
+    }
+
+    /* ★ n 和 got 必须分开报。
+     *   n   = 驱动说"扫到了几个"
+     *   got = 我实际取回来几个
+     *   把两者合成一个字段的话，"取记录失败"会被显示成"扫到 0 个"，
+     *   把排查方向从"驱动"带到"射频"上去 —— 这个坑我自己先踩了一次。 */
+    size_t pos = 0;
+    pos += snprintf(out + pos, out_len - pos,
+                    "{\"t\":\"%s\",\"n\":%u,\"got\":%u,\"aps\":[",
+                    tag, (unsigned)n, (unsigned)got);
+    if (nr != ESP_OK || gr != ESP_OK) {
+        pos += snprintf(out + pos, out_len - pos, "],\"e_num\":\"%s\",\"e_rec\":\"%s\"}",
+                        esp_err_to_name(nr), esp_err_to_name(gr));
+        return ESP_OK;
+    }
+    for (uint16_t i = 0; i < got && pos + 96 < out_len; i++) {
+        /* SSID 里理论上可能有引号/反斜杠，JSON 会被打断 —— 只保留可打印字符 */
+        char ssid[33];
+        size_t k = 0;
+        for (; k < 32 && recs[i].ssid[k]; k++) {
+            unsigned char c = recs[i].ssid[k];
+            ssid[k] = (c >= 0x20 && c != '"' && c != '\\') ? (char)c : '?';
+        }
+        ssid[k] = 0;
+        pos += snprintf(out + pos, out_len - pos,
+                        "%s{\"s\":\"%s\",\"r\":%d,\"c\":%u,\"a\":%u}",
+                        i ? "," : "", ssid, (int)recs[i].rssi,
+                        (unsigned)recs[i].primary, (unsigned)recs[i].authmode);
+    }
+    snprintf(out + pos, out_len - pos, "]}");
+    return ESP_OK;
+}
+
+esp_err_t net_link_scan_json(char *out, size_t out_len) {
+    if (!out || out_len < 64) return ESP_ERR_INVALID_ARG;
+
+    /* 串口模式下 net_task 根本没起（net_link_start 直接 return 了），
+     * 所以要在这里按需把 Wi-Fi 拉起来。wifi_begin 现在是幂等的，
+     * 重复调用安全；esp_wifi_start 的 ESP_ERR_WIFI_INIT_STATE 表示
+     * "已经起过了"，同样当成功处理。
+     *
+     * ★★ 任何一步失败都必须**写一条错误回执**再返回。
+     *    原来这里是直接 `return r`，调用方（main.c）不管返回值照样把
+     *    缓冲区发出去，而缓冲区是空的 ⇒ 串口上什么都不出现，
+     *    表现成"这条命令石沉大海"。2026-11-06 在 tr=0 的设备上就是这样
+     *    白试了两轮。诊断命令尤其不能静默失败。 */
+    if (!s_wifi_inited) {
+        esp_err_t r = wifi_begin();
+        if (r != ESP_OK) {
+            snprintf(out, out_len, "{\"t\":\"wifi_scan\",\"err\":\"wifi_begin:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+    }
+    if (!s_wifi_started) {
+        esp_err_t r = esp_wifi_start();
+        if (r != ESP_OK && r != ESP_ERR_WIFI_INIT_STATE) {
+            snprintf(out, out_len, "{\"t\":\"wifi_scan\",\"err\":\"start:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+        s_wifi_started = true;
+    }
+    return scan_format("wifi_scan", out, out_len);
+}
+
+/* ★ 开机早期扫频：必须在 esp_zb_start() **之前**调用。
+ *
+ * 存在的意义：用来把"Wi-Fi 到底能不能收到信号"和"Zigbee 是否把射频占住了"
+ * 这两件事分开。如果这一步能扫到 AP，而开机之后（Zigbee 已经在跑）扫不到，
+ * 那就是共存/射频仲裁的问题；如果这一步也是 0 个，那就是 Wi-Fi 本身
+ * （天线、PHY、板子）的问题，别再去动共存配置。
+ *
+ * 这里**故意不建 STA netif**：此时还没起 Zigbee，多建一个默认 netif
+ * 有可能和后续初始化抢同一个实例。扫频不需要 lwIP。
+ * wifi_begin() 之后会自己把 netif 补上（见那边的注释）。
+ */
+esp_err_t net_link_scan_early(char *out, size_t out_len) {
+    if (!out || out_len < 64) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t r = esp_netif_init();
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) return r;
+    r = esp_event_loop_create_default();
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) return r;
+
+    /* 事件组要早建：下面等 STA_START 要靠它置位 */
+    if (net_sync_ensure() != ESP_OK) {
+        snprintf(out, out_len, "{\"t\":\"wifi_bootscan\",\"err\":\"no_mem\"}");
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (!s_wifi_inited) {
+        wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
+        r = esp_wifi_init(&ic);
+        if (r != ESP_OK) {
+            snprintf(out, out_len, "{\"t\":\"wifi_bootscan\",\"err\":\"init:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+        if (!s_handlers_registered) {
+            esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               on_wifi_event, NULL, NULL);
+            esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               on_wifi_event, NULL, NULL);
+            s_handlers_registered = true;
+        }
+        esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        r = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (r != ESP_OK) {
+            snprintf(out, out_len, "{\"t\":\"wifi_bootscan\",\"err\":\"mode:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+        s_wifi_inited = true;
+    }
+    if (!s_wifi_started) {
+        r = esp_wifi_start();
+        if (r != ESP_OK && r != ESP_ERR_WIFI_INIT_STATE) {
+            snprintf(out, out_len, "{\"t\":\"wifi_bootscan\",\"err\":\"start:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+        s_wifi_started = true;
+    }
+
+    /* ★★★ 必须等 WIFI_EVENT_STA_START 之后才能扫描。
+     *   esp_wifi_start() 是异步的：它返回 OK 不代表 STA 已经就绪。
+     *   在 STA_START 之前调 esp_wifi_scan_start()，**返回 ESP_OK、1 毫秒就回来、
+     *   结果永远是 0 个 AP** —— 看起来跟"射频坏了"一模一样。
+     *   2026-11-06 第一次跑开机扫描就栽在这儿：日志显示 403 ms 出结果，
+     *   于是误判成"Zigbee 没起来时也扫不到 ⇒ 不是共存问题"，结论整个跑偏。
+     *   正常路径不会踩这个坑，因为那时 STA 早就 start 过了。 */
+    if (!(xEventGroupGetBits(s_ev) & BIT_STARTED)) {
+        EventBits_t b = xEventGroupWaitBits(s_ev, BIT_STARTED, pdFALSE, pdTRUE,
+                                            pdMS_TO_TICKS(5000));
+        if (!(b & BIT_STARTED)) {
+            snprintf(out, out_len,
+                     "{\"t\":\"wifi_bootscan\",\"err\":\"STA_START 等超时\"}");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+    return scan_format("wifi_bootscan", out, out_len);
 }
 
 esp_err_t net_link_start(void) {

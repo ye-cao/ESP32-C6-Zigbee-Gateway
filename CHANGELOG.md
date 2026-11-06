@@ -102,6 +102,75 @@ JSON 发给主机。协议一个字没改，只换了"那根线"。
 
 **真正的 Wi-Fi/TCP 数据通路尚未验证** —— 需要真实 SSID 与密码。
 
+### 追加修正（2026-11-06 下午，真实凭据实测后）
+
+拿到真实 SSID/密码后做端到端验证，过程中又抓出一批问题，全部已修：
+
+固件（`main/`）：
+
+- **纯 WPA3 的 AP 连不上**。原来只要有密码就写
+  `threshold.authmode = WIFI_AUTH_WPA2_PSK`，遇上 WPA3-个人（SAE）的 AP 不会走
+  SAE，表现只是反复 `STA_DISCONNECTED`，没有任何提示。改为
+  `WIFI_AUTH_WPA2_WPA3_PSK` + `sae_pwe_h2e = WPA3_SAE_PWE_BOTH`（该 AP 明确
+  不支持 H2E）。
+- **`sdkconfig.defaults` 补上 WPA3/SAE 三项配置**。`sdkconfig` 是
+  `.gitignore` 掉的，只在本地有效 —— 换台机器干净构建就会丢掉 WPA3 支持，
+  届时连纯 WPA3 路由器会静默失败。
+- **新增 `{"cmd":"wifi_scan"}`**：让 C6 用它自己的射频扫一遍并回
+  `{"t":"wifi_scan","n":…,"got":…,"aps":[{"s","r","c","a"}]}`。
+  排查"连不上"时主机扫描结果没有参考价值，这个才是事实来源。
+- **`net_status` 增加 `why`**（`wifi_err_reason_t` 断开原因码）。没有它，
+  密码错(15)、找不到 AP(201)、认证方式不匹配(也是 15) 在回执里长得一模一样。
+- **新增 `{"cmd":"log_on"}` / `{"cmd":"log_off"}`**：临时把 `null_vprintf` 换回
+  真 `vprintf`，用于看 Wi-Fi 驱动的内部日志。只在 TCP 通道下用（否则日志会
+  混进串口 JSON 流）。
+- **修 assert 崩溃**：串口模式（`tr=0`）下 `net_task` 不会创建，`s_ev` 是 NULL；
+  此时懒加载拉起 Wi-Fi（例如发 `wifi_scan`），`STA_START` 回调里
+  `xEventGroupSetBits(NULL,…)` 直接 `assert failed: event_groups.c:561` 并重启 ——
+  表现成"命令没有回执"。改为 `net_sync_ensure()` 统一建事件组/锁，回调内也加了
+  空指针保护。
+- **`state` 字段跟 `transport` 走**：原来只看 `s_wifi_started`，串口模式的设备
+  也会回 `state="wifi_only"`，误导排查。
+- 诊断命令不再静默失败：`net_link_scan_json()` 任何一步出错都会写一条
+  `{"t":"wifi_scan","err":"…"}`，而不是空回执。
+- `wifi_begin()` 改为真正幂等：netif 用 `s_netif_created` 单独保证，
+  不再因为 `s_wifi_inited` 早退而漏建 STA netif。
+
+Add-on（`serial_gateway.py`）：
+
+- **`[→C6] …` 不再撒谎**。原来这条回显在 `ser.write()` 之前打印，
+  通道死掉时照样打出来，看起来"命令已下发"。现在写失败会紧跟一句
+  「上面那行 `[→C6]` 实际上没有发出去」。`_NullSerial.write()` 也计入失败。
+- **串口重开加候选兜底**：前 3 次试配置端口，全失败后扫 `/dev/ttyACM*`、
+  `/dev/ttyUSB*`，打通会提示把 `serial_port` 改成实际路径。
+  （`/dev/serial/by-id/…` 是 udev 符号链接，设备重新枚举后会失效甚至变成断链。）
+- **重开节流 10 秒**：端口彻底不在时，看门狗每 6 秒就刷三段失败日志，把有用的行
+  全淹掉。
+- 「端口被刷机占用」措辞改为「另一个重开/刷机流程正占着端口」—— 那把锁也会被
+  另一个正在退避的重开流程占着，原文案会把排查方向带偏到 esptool。
+- 新增 `/api/wifi_scan` 与 MQTT `cmd/wifi_scan`，回执打印成 `[SCAN]` 并进
+  `/api/state`。
+- `config.json` 增加 **`"uart": true`** —— `serial_port` 从 `device(subsystem=tty)`
+  选择器改成普通字符串后，Supervisor 不再自动注入串口设备，容器里
+  `/dev/ttyACM*` 和 `/dev/serial/by-id/*` 全都不存在。`uart: true` 无条件映射，
+  且设备不在时也不阻塞启动。
+- 三处德语残留（`lese vorhandene`、`LQI-Momentaufnahme angefordert`、
+  `[FLASH] angefordert`）改中文。
+
+新增诊断工具：
+
+- `tools/c6_serial_cmd.py` —— 经 USB 串口给 C6 下发一条 JSON 并打印回执。
+- `tools/c6_flash_and_capture.py` —— 刷写后**立刻**接管串口抓开机日志。
+  板子的 USB 是 C6 自带 USB-Serial-JTAG，RTS 没接 EN，"打开串口拉 RTS 复位"
+  无效；唯一可靠的复位点是 esptool 结束时那次 hard_reset，所以刷写与抓取
+  必须在同一个进程里完成。
+- `tools/tcp_probe.py` —— 本机当假网关：12345 等 C6 连入，12346 当遥控口。
+
+**结论：本次未通过 —— 阻塞点是硬件。** 同一块板子上跑 IDF 官方
+`examples/wifi/scan` 也是 `Total APs scanned = 0`（2.5 s 真扫、无 Zigbee），
+说明该板 Wi-Fi 接收不工作（Zigbee 一切正常）。详见
+`Wi-Fi通道-测试报告-2026-11-06.md`。
+
 ### 暂未做（下一步）
 
 - **`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` 仍是关闭的。** 没有 USB 时，一份连不上

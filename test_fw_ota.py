@@ -41,7 +41,7 @@ def load_gateway(chunk):
     chunks = [ast.get_source_segment(src, n)
               for n in ast.parse(src).body
               if isinstance(n, ast.FunctionDef) and n.name in WANT]
-    assert len(chunks) == len(WANT), f"{len(chunks)}/{len(WANT)} Funktionen gefunden"
+    assert len(chunks) == len(WANT), f"{len(chunks)}/{len(WANT)} 个函数都找到了"
 
     class _NoThread:                        # 测试里不启动看门狗
         def __init__(self, *a, **k):

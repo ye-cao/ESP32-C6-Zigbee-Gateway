@@ -47,6 +47,16 @@ esp_err_t net_link_configure(const char *ssid, const char *pass,
  * 供 {"cmd":"net_status"} 回执与故障排查用。 */
 void net_link_status_json(char *out, size_t out_len);
 
+/* 让 C6 自己扫一遍 2.4 GHz，把看见的 AP 列表拼成一行 JSON。
+ * 诊断用：连不上 Wi-Fi 时，这个才是"以固件的眼睛看世界"的事实。
+ * 会短暂占用射频，别放进轮询。 */
+esp_err_t net_link_scan_json(char *out, size_t out_len);
+
+/* 开机早期扫频：必须在 esp_zb_start() 之前调用。
+ * 用来把"Wi-Fi 能不能收到信号"和"Zigbee 是不是占住了射频"分开判断。
+ * 回执类型是 {"t":"wifi_bootscan",…}，字段与 wifi_scan 相同。 */
+esp_err_t net_link_scan_early(char *out, size_t out_len);
+
 /* 主动踢掉现有 TCP 连接，让 net_task 尽快重连（改配置后用）。 */
 void net_link_kick(void);
 

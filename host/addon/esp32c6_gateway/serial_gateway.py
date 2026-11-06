@@ -1049,6 +1049,14 @@ def on_message(client, userdata, msg):
         uart_msg = _js({"cmd": "read_onoff", "addr": addr, "ep": ep})
         ser.write(uart_msg.encode())
         print(f"[→C6] {uart_msg.strip()}")
+    elif cmd == "wifi_scan":
+        # 让 C6 用它自己的射频扫一遍 2.4 GHz，回执是一条 {"t":"wifi_scan",…}。
+        # ★ 这是判断"连不上 Wi-Fi 到底怪谁"的关键：主机的扫描结果不能当依据
+        #   —— 电脑的天线、频段能力、Windows 的扫描缓存都和板子不同。
+        #   2026-11-06 就是靠它确认"板子本身一个 AP 都收不到"的。
+        uart_msg = _js({"cmd": "wifi_scan"})
+        ser.write(uart_msg.encode())
+        print(f"[→C6] {uart_msg.strip()}")
     elif cmd == "net_status":
         # 查当前传输通道 / Wi-Fi 状态。回执是一条 {"t":"net_status",…}。
         # ★ 这条也是「固件里到底跑的是不是新版本」最省事的判据：
@@ -1080,7 +1088,25 @@ mq.on_connect = on_connect
 mq.on_message = on_message
 
 # ── Serial ─────────────────────────────────────────────────────────────────
-_write_err = 0        # 累计写失败次数（只用于限速日志，见 CoordinatorSerial.write）
+_write_err = 0        # 累计写失败次数（只用于限速日志，见 _note_write_fail）
+
+
+def _note_write_fail(why):
+    """记一次写失败，并按 1/10/200 次限速打印。
+
+    ★ 为什么要专门写一句「上面那行 [→C6] 并没有真的发出去」：
+      2026-11-06 排查 Wi-Fi 通道时，日志里明明有
+          [→C6] {"ssid":"yecao",...,"cmd":"net_cfg"}
+      看起来命令已下发，实际 ser 是 _NullSerial（端口早死了），
+      写进去等于扔进黑洞 —— 白白多排查了半小时。下发回显和写入结果
+      必须绑在一起，否则这条日志就是在骗人。
+    """
+    global _write_err
+    _write_err += 1
+    if _write_err in (1, 10) or _write_err % 200 == 0:
+        print(f"[Serial] 写失败 {_write_err} 次：{why}"
+              + ("  → 上面那行 [→C6] 实际上没有发出去，等通道重开"
+                 if _write_err == 1 else ""))
 
 
 class CoordinatorSerial:
@@ -1120,14 +1146,10 @@ class CoordinatorSerial:
         之后 HA 发来的开关命令全部失灵，日志只刷 traceback，而真正的病根
         （端口已死）没人处理。这里只记数，端口重开统一交给读循环的看门狗。
         """
-        global _write_err
         try:
             return self.ser.write(d)
         except Exception as e:                          # noqa: BLE001
-            _write_err += 1
-            if _write_err in (1, 10) or _write_err % 200 == 0:
-                print(f"[Serial] 写失败 {_write_err} 次: {e}"
-                      + ("  → 端口已死，等读循环重开" if _write_err == 1 else ""))
+            _note_write_fail(e)
             return 0
 
     def close(self):     self.ser.close()
@@ -1158,13 +1180,18 @@ class _NullSerial:
     """
     can_reset = True
 
-    def read(self, n):   raise OSError("serial not open")
-    def write(self, d):  return 0
+    def read(self, n):   raise OSError("串口未打开（占位通道）")
     def close(self):     pass
+
+    def write(self, d):
+        # ★ 必须显式记一次失败：这里返回 0 是"静默丢弃"，调用方看到 0
+        #   之前就已经把 [→C6] 回显打出去了（见 _note_write_fail 的说明）。
+        _note_write_fail("串口未打开（占位通道）")
+        return 0
 
     @property
     def in_waiting(self):
-        raise OSError("serial not open")
+        raise OSError("串口未打开（占位通道）")
 
 
 # ── TCP 通道（C6 走 Wi-Fi 连过来）──────────────────────────────────────────
@@ -1307,6 +1334,28 @@ def _tcp_open(bind, port, attempts=3):
     return _NullSerial()
 
 
+def _serial_other_ports(preferred):
+    """除配置端口之外，还值得一试的串口节点。
+
+    ★ 为什么需要这个兜底：`/dev/serial/by-id/...` 是 udev 生成的**符号链接**，
+      设备重新枚举（刷机、换 USB 口、主机重启、板子掉电重连）之后它可能
+      指向新的 /dev/ttyACMx，甚至变成断链。2026-11-06 就卡在这儿：
+      按 by-id 打开一直报
+          [Errno 1] Operation not permitted
+      而换 /dev/ttyACM0 就正常 —— 日志里只有一句 EPERM，完全看不出是
+      「路径失效」而不是「设备没了」。
+
+      所以重开失败到一定次数后，主动扫一遍常见的串口节点试一次；
+      打通了就把实际用的路径打进日志，提示把选项改过去。
+    """
+    import glob
+    out = []
+    for p in sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*")):
+        if p != preferred and p not in out:
+            out.append(p)
+    return out
+
+
 def _serial_open(port, baud, attempts=3, first_delay=0.0):
     """打开串口，失败就重试几次。全失败时返回 _NullSerial（不抛异常）。"""
     delay = first_delay
@@ -1323,6 +1372,9 @@ def _serial_open(port, baud, attempts=3, first_delay=0.0):
     return _NullSerial()
 
 
+_last_reopen_ts = 0.0     # 上次尝试重开的时间（节流用，见 _serial_reopen）
+
+
 def _serial_reopen(reason: str = "") -> bool:
     """掉线自愈：关掉旧 fd 重新打开端口。
 
@@ -1331,32 +1383,49 @@ def _serial_reopen(reason: str = "") -> bool:
       实测：连续 100+ 次读全是 EIO，网关一台设备都收不到（页面空列表），
       而 read() 里原来那句「sleep 0.5 继续」永远不会自己好 —— 只能换 fd。
 
+    ★ 10 秒内只尝试一次：端口彻底不在时（比如板子被拔去接电脑），
+      主循环的看门狗每 6 秒就会喊一次重开，每次都刷三段失败日志，
+      日志直接被淹没，真正有用的行反而看不见了。
+
     返回 True 表示端口已恢复。与 esptool 刷机互斥：正在刷就让开。
     """
-    global ser
+    global ser, _last_reopen_ts
+    now = time.time()
+    if now - _last_reopen_ts < 10:
+        return False
+    _last_reopen_ts = now
     if _serial_pause.is_set():
         return False                       # esptool 正在用端口
     if not _flash_mutex.acquire(blocking=False):
-        print("[Serial] 端口被刷机占用，本次不重开")
+        # ★ 措辞要说实话：这把锁除了刷机，还被**另一个正在跑的重开流程**占着
+        #   （那串退避合计 45 s）。原来一律写"端口被刷机占用"，会把排查方向
+        #   直接带偏到 esptool 上。
+        print("[Serial] 另一个重开/刷机流程正占着端口，本次跳过")
         return False
     try:
         try:
             ser.close()
         except Exception:
             pass
+        # 前 3 次只试配置端口（偶发 EIO 重开一次就好，不必乱换）；
+        # 都失败说明这个路径本身有问题，再把候选节点排进队列。
+        ports = [args.port] * 3 + _serial_other_ports(args.port)
         delay = 1.0
-        for i in range(1, 7):
+        for i, port in enumerate(ports, 1):
             time.sleep(delay)
             try:
-                ser = CoordinatorSerial(args.port, args.baud)
+                ser = CoordinatorSerial(port, args.baud)
                 global _write_err
                 _write_err = 0
-                print(f"[Serial] 端口已重开（{reason}）· 第 {i} 次尝试成功")
+                if port != args.port:
+                    print(f"[Serial] ★ 配置的 {args.port} 打不开，已改用 {port}"
+                          f"（建议把 add-on 选项 serial_port 改成这个路径）")
+                print(f"[Serial] 端口已重开（{reason} · {port} · 第 {i} 次尝试）")
                 return True
             except Exception as e:                      # noqa: BLE001
-                print(f"[Serial] 重开失败 第 {i} 次: {e}")
+                print(f"[Serial] 重开失败 第 {i} 次（{port}）: {e}")
                 delay = min(delay * 2, 15.0)
-        print("[Serial] !! 端口连续 6 次打不开，稍后再试")
+        print(f"[Serial] !! {len(ports)} 个候选端口全打不开，稍后再试")
         return False
     finally:
         _flash_mutex.release()
@@ -1405,7 +1474,7 @@ def _link_reopen(reason: str = "") -> bool:
     if _serial_pause.is_set():
         return False
     if not _flash_mutex.acquire(blocking=False):
-        print("[Link] 通道被刷机占用，本次不重开")
+        print("[Link] 另一个重开/刷机流程正占着通道，本次跳过")
         return False
     try:
         try:
@@ -1722,7 +1791,7 @@ def _disc_begin_window():
     _disc_remote.clear()
     try:
         mq.subscribe(f"{HA_PREFIX}/+/+/+/config", qos=0)
-        print(f"[HA] lese vorhandene Discovery-Configs ({_DISC_WAIT:.0f} s)")
+        print(f"[HA] 读取 broker 里已有的 Discovery 配置（最多等 {_DISC_WAIT:.0f} s）")
         threading.Timer(_DISC_WAIT, _disc_flush).start()
     except Exception as e:
         print(f"[HA] 打不开启动窗口：{e}")
@@ -3926,6 +3995,24 @@ def dispatch(line: str):
                 # 那里有没有状态存在（见 _probe_*）。
                 _probe_start(a, msg.get("eps") or [])
 
+    elif t in ("wifi_scan", "wifi_bootscan"):
+        # C6 自己扫频的结果。n/got 分开报：n 是驱动说扫到几个，
+        # got 是实际取回来几个 —— 两者不等说明是取记录失败，不是没信号。
+        aps = msg.get("aps") or []
+        with _state_lock:
+            _state[t] = dict(msg)
+        if msg.get("err"):
+            print(f"[SCAN] 扫描失败：{msg.get('err')}")
+        else:
+            print(f"[SCAN] C6 扫到 {msg.get('got', 0)} 个 AP"
+                  f"（驱动计数 {msg.get('n', 0)}）：")
+            for a in aps:
+                print(f"       {a.get('s')!r:24} rssi={a.get('r')} dBm "
+                      f"ch={a.get('c')} auth={a.get('a')}")
+            if not aps:
+                print("[SCAN] 一个都没扫到 —— 先确认板子的 Wi-Fi 接收是否正常，"
+                      "别急着改 SSID/密码")
+
     elif t in ("net", "net_status"):
         # Wi-Fi/TCP 通道状态。C6 在「Wi-Fi 连上 / TCP 连上 / 断开 / 配置变更」
         # 时主动发一条；{"cmd":"net_status"} 也会回一条同格式的。
@@ -4921,7 +5008,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/lqi":
             mq_put(f"{BASE}/cmd/lqi", "", qos=1)
-            print("[Web] LQI-Momentaufnahme angefordert")
+            print("[Web] 已请求一次 LQI 快照")
 
         elif path == "/api/fw_ota":
             if ctype.startswith("multipart/form-data"):
@@ -4944,11 +5031,17 @@ class _Handler(BaseHTTPRequestHandler):
                 bin_path = params.get("path", [""])[0].strip()
             if bin_path and os.path.isfile(bin_path):
                 size = os.path.getsize(bin_path)
-                print(f"[FLASH] angefordert: {bin_path} ({size} B @ {APP_OFFSET})")
+                print(f"[FLASH] 收到刷机请求：{bin_path}（{size} B @ {APP_OFFSET}）")
                 threading.Thread(target=flash_apply, args=(bin_path,),
                                  daemon=True).start()
             else:
                 print("[FLASH] 没有固件路径 / 上传为空 —— 已中止")
+
+        elif path == "/api/wifi_scan":
+            # 让 C6 自己扫一遍 2.4 GHz。结果会以 [SCAN] 打出来，也进 /api/state。
+            # ★ 排查 Wi-Fi 连不上时的第一条命令：主机扫描结果不能当依据。
+            ser.write(_js({"cmd": "wifi_scan"}).encode())
+            print("[SCAN] 已请求 C6 扫频，结果稍后以 [SCAN] 打印")
 
         elif path == "/api/ota/stop":
             # ★ 中止 OTA：否则一次误点会白占一个多小时的无线带宽（~110 B/s）。

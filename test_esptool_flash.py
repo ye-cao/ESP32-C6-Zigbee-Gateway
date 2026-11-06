@@ -144,7 +144,7 @@ def main():
 
     print("\n[5] Dockerfile")
     docker = (ADDON / "Dockerfile").read_text(encoding="utf-8")
-    ok &= check("esptool" in docker, "esptool wird installiert")
+    ok &= check("esptool" in docker, "会安装 esptool")
     ok &= check("esptool>=4.7,<5" in docker, "auf <5 gepinnt (write_flash)")
 
     print()
