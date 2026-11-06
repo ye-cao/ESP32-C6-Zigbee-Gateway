@@ -272,6 +272,11 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         static char scan[3072];
         net_link_scan_json(scan, sizeof(scan));
         ha_mqtt_emit_raw(scan);
+    } else if (strcmp(cmd, "wifi_join") == 0) {
+        /* ★ 诊断：真正连一次。判 Wi-Fi 通不通要用"连"，不能用"扫"。 */
+        static char join[256];
+        net_link_join_json(join, sizeof(join));
+        ha_mqtt_emit_raw(join);
     } else if (strcmp(cmd, "log_on") == 0) {
         ha_mqtt_log_verbose(true);
     } else if (strcmp(cmd, "log_off") == 0) {

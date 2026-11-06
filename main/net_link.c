@@ -756,6 +756,71 @@ static esp_err_t scan_format(const char *tag, char *out, size_t out_len) {
     return ESP_OK;
 }
 
+/* ★★★ 诊断（2026-11-06）：真正做一次 esp_wifi_connect()，而不是扫频。
+ *
+ * 为什么要单独留这一条：扫描是「13 个信道轮流各停 120 ms 的主动探测」，
+ * ESPHome 那种"很快就连上"是「守在目标信道上反复重试、累计几十秒」。
+ * 同一条边际链路上，前者会全灭、后者能成。所以**判 Wi-Fi 能不能用必须用
+ * "连"来判，不能用"扫"来判** —— 这是 2026-11-06 折腾一整晚的根本教训。
+ *
+ * 输出：{"t":"wifi_join","ok":0|1,"conn":"ESP_OK","ip":"…","rssi":-45,"ch":1,"why":N}
+ */
+esp_err_t net_link_join_json(char *out, size_t out_len) {
+    if (!out || out_len < 96) return ESP_ERR_INVALID_ARG;
+    if (!s_cfg.ssid[0]) {
+        snprintf(out, out_len, "{\"t\":\"wifi_join\",\"err\":\"no_ssid\"}");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t r = wifi_begin();
+    if (r != ESP_OK) {
+        snprintf(out, out_len, "{\"t\":\"wifi_join\",\"err\":\"begin:%s\"}",
+                 esp_err_to_name(r));
+        return r;
+    }
+    wifi_apply_cfg();
+
+    if (!s_wifi_started) {
+        r = esp_wifi_start();
+        if (r != ESP_OK && r != ESP_ERR_WIFI_INIT_STATE) {
+            snprintf(out, out_len, "{\"t\":\"wifi_join\",\"err\":\"start:%s\"}",
+                     esp_err_to_name(r));
+            return r;
+        }
+        s_wifi_started = true;
+    }
+    /* 等 STA_START：在它之前 connect 是无效的（见 net_link_scan_early 的注释） */
+    xEventGroupWaitBits(s_ev, BIT_STARTED, pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
+
+    /* 先把旧状态清掉，保证接下来等到的 BIT_IP 是这一次的 */
+    xEventGroupClearBits(s_ev, BIT_IP);
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_err_t cr = esp_wifi_connect();
+    EventBits_t b = 0;
+    if (cr == ESP_OK) {
+        /* 20 s：ESPHome 那种"很快连上"也是这个量级的重试窗口 */
+        b = xEventGroupWaitBits(s_ev, BIT_IP, pdFALSE, pdTRUE,
+                                pdMS_TO_TICKS(20000));
+    }
+
+    int8_t rssi = 0;
+    int    ch   = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        rssi = ap.rssi;
+        ch   = ap.primary;
+    }
+    bool ok = (b & BIT_IP) != 0;
+    snprintf(out, out_len,
+             "{\"t\":\"wifi_join\",\"ok\":%d,\"conn\":\"%s\",\"ip\":\"%s\","
+             "\"rssi\":%d,\"ch\":%d,\"why\":%d}",
+             ok ? 1 : 0, esp_err_to_name(cr), s_ip, (int)rssi, ch,
+             s_last_reason);
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t net_link_scan_json(char *out, size_t out_len) {
     if (!out || out_len < 64) return ESP_ERR_INVALID_ARG;
 

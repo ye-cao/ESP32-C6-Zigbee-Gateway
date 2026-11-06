@@ -52,6 +52,11 @@ void net_link_status_json(char *out, size_t out_len);
  * 会短暂占用射频，别放进轮询。 */
 esp_err_t net_link_scan_json(char *out, size_t out_len);
 
+/* 真正做一次「连上现有 SSID」的尝试（最长等 20 s），回 {"t":"wifi_join",…}。
+ * 诊断用：判 Wi-Fi 到底通不通，必须用"连"而不是"扫" —— 扫描每个信道只停
+ * 120 ms，边际链路上会全灭，而 connect 会守在目标信道上反复重试。 */
+esp_err_t net_link_join_json(char *out, size_t out_len);
+
 /* 开机早期扫频：必须在 esp_zb_start() 之前调用。
  * 用来把"Wi-Fi 能不能收到信号"和"Zigbee 是不是占住了射频"分开判断。
  * 回执类型是 {"t":"wifi_bootscan",…}，字段与 wifi_scan 相同。 */

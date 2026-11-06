@@ -244,6 +244,13 @@ void ha_mqtt_handle_line(char *buf) {
         s_cmd_cb("wifi_scan", "", 0);
         return;
     }
+    if (strstr(buf, "wifi_join")) {
+        /* {"cmd":"wifi_join"} —— 真正连一次现有 SSID，回 {"t":"wifi_join",…}
+         * ★ 判 Wi-Fi 通不通要用"连"，不能用"扫"：扫描 13 个信道每道只停
+         *   120 ms，边际链路上会全灭；connect 守在目标信道上能累计几十秒。 */
+        s_cmd_cb("wifi_join", "", 0);
+        return;
+    }
     /* ★ log_on / log_off 必须排在 wifi_scan 之后、且用完整串匹配 ——
      *   "log_on" 里没有会和上面几条撞的字符组合，但顺序上放在这里可以确保
      *   wifi_scan 之类名字更长的先被匹配到。 */
