@@ -9,6 +9,7 @@
 #include "esp_zigbee_core.h"
 
 #include "ha_mqtt.h"
+#include "net_link.h"
 #include "zb_gateway.h"
 #include "zb_topo.h"
 #include "zb_ota_server.h"
@@ -86,9 +87,15 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
      *    ota_next_data_cb 跑在 ZBOSS 任务里，要数据时就在等这把信号量。
      *    如果 rx_task 在这里持锁，feed_data 永远送不进去 → 每块卡 10 s
      *    → OTA 直接停住。
-     *    （实测：OTA 卡在 8 / 610976 字节，之后客户端直接 abort。） */
+     *    （实测：OTA 卡在 8 / 610976 字节，之后客户端直接 abort。）
+     *
+     *  - net_cfg / net_status：只写 NVS / 只读自己的结构体，同样不碰 SDK。
+     *    写 NVS 要几十毫秒，持着 ZBOSS 锁做这件事会把整个 Zigbee 栈顶住，
+     *    毫无必要。 */
     bool held = (strncmp(cmd, "fw_ota", 6) == 0 ||
-                 strcmp(cmd, "ota_data") == 0) ? false : zb_lock();
+                 strcmp(cmd, "ota_data")    == 0 ||
+                 strcmp(cmd, "net_cfg")     == 0 ||
+                 strcmp(cmd, "net_status")  == 0) ? false : zb_lock();
 
     if (strcmp(cmd, "dev_cmd") == 0) {
         /* payload: "ADDR,EP,CMD"  CMD: 0=关 1=开 2=切换 */
@@ -201,6 +208,44 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         if (secs < 10) secs = 10;
         ESP_LOGI(TAG, "set_sleep %lu s", (unsigned long)secs);
         zb_gateway_send_set_sleep(secs);
+    } else if (strcmp(cmd, "net_cfg") == 0) {
+        /* Wi-Fi / 传输通道配置。payload 用 \x1f（unit separator）分字段：
+         *     "SSID\x1fPASS\x1fHOST\x1fPORT\x1fTR"
+         * 为什么不用逗号：SSID 和密码里完全可能有逗号，用逗号切会把密码
+         * 拦腰截断，而且症状是「一直连不上但看不出为什么」。
+         * 空字段 = 这一项不改（方便只换 host 或只翻通道）。
+         * TR：0 = 串口，1 = Wi-Fi。 */
+        static char nb[320];           /* ★ static：本函数只在 4 KB 栈的任务里跑 */
+        int nn = len < (int)sizeof(nb) - 1 ? len : (int)sizeof(nb) - 1;
+        if (nn <= 0) {
+            ESP_LOGW(TAG, "net_cfg 载荷为空，忽略");
+        } else {
+            memcpy(nb, payload, nn);
+            nb[nn] = '\0';
+
+            char *fld[5] = { nb, NULL, NULL, NULL, NULL };
+            int nf = 1;
+            for (int i = 0; i < nn && nf < 5; i++) {
+                if (nb[i] == '\x1f') { nb[i] = '\0'; fld[nf++] = &nb[i + 1]; }
+            }
+            const char *ssid = fld[0][0] ? fld[0] : NULL;
+            const char *pass = (nf > 1 && fld[1][0]) ? fld[1] : NULL;
+            const char *host = (nf > 2 && fld[2][0]) ? fld[2] : NULL;
+            int  port = (nf > 3 && fld[3][0]) ? atoi(fld[3]) : 0;
+            int  tr   = (nf > 4 && fld[4][0]) ? atoi(fld[4]) : -1;
+
+            ESP_LOGI(TAG, "net_cfg ssid='%s' host='%s' port=%d tr=%d",
+                     ssid ? ssid : "(不变)", host ? host : "(不变)", port, tr);
+            net_link_configure(ssid, pass, host, port, tr);
+
+            char st[256];
+            net_link_status_json(st, sizeof(st));
+            ha_mqtt_emit_raw(st);
+        }
+    } else if (strcmp(cmd, "net_status") == 0) {
+        char st[256];
+        net_link_status_json(st, sizeof(st));
+        ha_mqtt_emit_raw(st);
     }
 
     zb_unlock(held);
@@ -260,7 +305,8 @@ static void btn_task(void *arg) {
 void app_main(void) {
     ESP_LOGI(TAG, "=== ESP32-C6 Zigbee Gateway ===");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "  JSON : UART1 TX=GPIO16 RX=GPIO17 → Pi /dev/ttyACM0");
+    ESP_LOGI(TAG, "  JSON : 串口 USB-Serial-JTAG（默认）/ Wi-Fi+TCP（NVS 里 tr=1）");
+    ESP_LOGI(TAG, "         串口引脚备选 UART0 TX=GPIO16 RX=GPIO17");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||

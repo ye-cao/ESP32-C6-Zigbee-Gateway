@@ -4,14 +4,16 @@
 #include "esp_err.h"
 
 /*
- * ha_mqtt – USB Serial JTAG JSON-Lines Bridge
+ * ha_mqtt – JSON-Lines 收发层（串口 / Wi-Fi 共用）
  *
- * C6 → Pi: {"t":"boot"}
- *           {"t":"zigbee","addr":<uint>,"sub":"<name>","p":{...}}
- *           {"t":"permit_join","p":{"open":true/false,"seconds":<n>}}
- *           {"t":"heartbeat","uptime":<s>,"ch":<n>,"pan":"0x<hex>"}
- * Pi → C6: {"cmd":"permit_join","sec":<n>}
- *           {"cmd":"set_channel","ch":<11-26>}
+ * C6 → 主机：{"t":"boot"}
+ *            {"t":"zigbee","addr":<uint>,"sub":"<name>","p":{...}}
+ *            {"t":"permit_join","p":{"open":true/false,"seconds":<n>}}
+ *            {"t":"heartbeat","uptime":<s>,"ch":<n>,"pan":"0x<hex>"}
+ *            {"t":"net","up":<bool>,"ip":"<ip>","rssi":<dbm>,...}
+ * 主机 → C6：{"cmd":"permit_join","sec":<n>}
+ *            {"cmd":"set_channel","ch":<11-26>}
+ *            {"cmd":"net_cfg","ssid":"…","pass":"…","host":"<ip>","port":<n>,"tr":1}
  */
 
 typedef void (*mqtt_cmd_cb_t)(const char *cmd, const char *payload, int len);
@@ -21,6 +23,11 @@ esp_err_t ha_mqtt_init(const char *broker_uri,
                        const char *password);
 
 void ha_mqtt_set_cmd_cb(mqtt_cmd_cb_t cb);
+
+/* 处理**一整行**已去掉换行的 JSON（就地改写 buf）。
+ * ★ 串口（rx_task）和 Wi-Fi（net_link.c 收包循环）都调这里 ——
+ *   命令解析只允许存在一份，否则「两处只改一处」的老毛病会立刻回来。 */
+void ha_mqtt_handle_line(char *buf);
 
 void ha_mqtt_publish_zigbee(uint16_t addr,
                              const char *subtopic,

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "ha_mqtt.c"
+        "net_link.c"
         "zb_gateway.c"
         "zb_topo.c"
         "zb_ota_server.c"
@@ -10,10 +11,15 @@ idf_component_register(
     REQUIRES
         nvs_flash
         driver
+        esp_driver_usb_serial_jtag
         esp_timer
         espressif__esp-zigbee-lib
         app_update
         freertos
         log
         ieee802154
+        esp_wifi
+        esp_netif
+        lwip
+        esp_event
 )

@@ -1,10 +1,21 @@
-# ESP32-C6 – Zigbee Coordinator + Radar → UART Bridge
-# Kein WiFi, kein MQTT – Ausgabe über UART0 (GPIO16/17)
+# ESP32-C6 – Zigbee Coordinator + Radar → UART/USB 或 Wi-Fi/TCP
+# Wi-Fi 默认**不启用**（NVS 里 netlink/tr 的默认值是 0 = 串口），
+# 但组件编进来是必须的：不编就没法在运行期打开第二条通道。
 
 # ── Zigbee ────────────────────────────────────────────────────────────────────
 CONFIG_ZB_ENABLED=y
 CONFIG_ZB_COORDINATOR_ROLE=y
 CONFIG_ZB_GP_ENABLED=n
+
+# ── Wi-Fi（可选的第二条传输通道，见 main/net_link.c）─────────────────────────
+# C6 只有一个 2.4 GHz 射频，Wi-Fi 与 802.15.4 必须靠软件时分复用。
+# 不开共存的话两个协议会互相把对方的包撞掉，表现为「设备偶尔离线」这种
+# 最难查的毛病。信道规划：Zigbee 25 ↔ Wi-Fi 1 或 6，别用 Zigbee 20。
+CONFIG_ESP_COEX_ENABLED=y
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_SW_COEXIST_ENABLE=y
+CONFIG_LWIP_MAX_SOCKETS=10
 
 # ── CPU / System ──────────────────────────────────────────────────────────────
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y

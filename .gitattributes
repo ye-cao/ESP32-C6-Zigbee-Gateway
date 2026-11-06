@@ -1,0 +1,11 @@
+# 行尾策略
+#
+# 本机 core.autocrlf=true，checkout 时会把工作区的 LF 换成 CRLF。
+# 但 add-on 的这几个文件会被原样打进容器，而 test_packaging.py 会拦 CRLF
+#（run.sh 带 CR 会让 bash 报 `$'\r': command not found`；
+#  serial_gateway.py 带 CR 会让容器里的 python 把 \r 当成行内容）。
+# 所以给它们钉死 LF，不跟随全局设置。
+host/addon/esp32c6_gateway/* text eol=lf
+
+# 脚本同理：CRLF 会让 shebang 失效。
+*.sh text eol=lf

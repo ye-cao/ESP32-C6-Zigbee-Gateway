@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-serial_gateway.py —— 读取 ESP32-C6 的 JSON-Lines（COM 口），
-转成 MQTT 发到 broker，同时写进 MariaDB。
-Web 面板在 8080 端口。
+serial_gateway.py —— 读取 ESP32-C6 的 JSON-Lines，转成 MQTT 发到 broker，
+同时写进 MariaDB。Web 面板在 8080 端口。
+
+「线」有两条，协议完全相同（一行一条 JSON）：
+  uart —— USB 串口（/dev/ttyACM*），C6 插在主机 USB 口上；
+  tcp  —— 本进程当服务端监听，C6 通过 Wi-Fi 主动连过来。
+用 --link 选，默认 uart（和原来的行为一字不差）。
 
 用法：
     python3 serial_gateway.py
     python3 serial_gateway.py --port /dev/ttyACM1 --broker 192.168.178.218
+    python3 serial_gateway.py --link tcp --tcp-port 12345
 """
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -104,16 +110,22 @@ DB_USER = os.getenv("DB_USER", "gh")
 DB_PASS = os.getenv("DB_PASS", "a12345")
 DB_NAME = os.getenv("DB_NAME", "wagodb")
 
-# ── Argumente ──────────────────────────────────────────────────────────────
+# ── 命令行参数 ─────────────────────────────────────────────────────────────
 ap = argparse.ArgumentParser()
 ap.add_argument("--port",   default=DEFAULT_PORT)
 ap.add_argument("--baud",   default=DEFAULT_BAUD,   type=int)
+ap.add_argument("--link",   default="uart", choices=["uart", "tcp"],
+                help="传输通道：uart=USB 串口（默认），tcp=Wi-Fi/TCP 服务端")
+ap.add_argument("--tcp-port", default=12345, type=int, dest="tcp_port",
+                help="--link tcp 时监听的端口，要和 C6 里 net_cfg 用的端口一致")
+ap.add_argument("--tcp-bind", default="0.0.0.0", dest="tcp_bind",
+                help="--link tcp 时绑定的地址，默认全部网卡")
 ap.add_argument("--broker", default=DEFAULT_BROKER)
 ap.add_argument("--mqport", default=DEFAULT_MQPORT, type=int)
 ap.add_argument("--user",   default=None)
 ap.add_argument("--pass",   default=None, dest="passwd")
 ap.add_argument("--base",   default="gw/c6serial",
-                help="MQTT base topic (z.B. gw/coordinator)")
+                help="MQTT 基础主题（例如 gw/coordinator）")
 ap.add_argument("--topo-interval", default=60, type=int, dest="topo_interval",
                 help="自动采集网络拓扑的间隔秒数，0 = 关闭（拓扑页从此自动更新）")
 args = ap.parse_args()
@@ -123,7 +135,7 @@ DB_MAC = BASE.split("/")[-1][:8]
 
 # 必须跟 config.json 里的版本号一致。它出现在启动横幅和网页上 ——
 # 这样一眼就能看出容器是不是真的在跑新代码。
-GW_VERSION = "1.5.4"
+GW_VERSION = "1.5.5"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
 # 每个 Zigbee 设备/端点都会在第一条数据帧到达时自动注册成 HA 实体 ——
@@ -1046,7 +1058,13 @@ _write_err = 0        # 累计写失败次数（只用于限速日志，见 Coor
 
 
 class CoordinatorSerial:
-    """持久串口连接，不触发 ESP32-C6 复位。"""
+    """持久串口连接，不触发 ESP32-C6 复位。
+
+    与 CoordinatorTcp 的公共接口：read / write / close / in_waiting / can_reset。
+    主循环只认这几个名字，因此换通道不需要改主循环。
+    """
+    can_reset = True      # 有 RTS ⇒ 能硬复位芯片（见 _serial_kick_reset）
+
     def __init__(self, port, baudrate):
         # 在 pyserial 打开之前关掉 HUPCL ⇒ WCH 芯片不会因 DTR 触发复位
         import subprocess
@@ -1112,6 +1130,8 @@ class _NullSerial:
     读一律抛 OSError，所以主循环的看门狗会自动走「重开」分支，等设备回来了
     自己接上 —— 总比开机就 traceback 退出、被 Supervisor 反复重启好。
     """
+    can_reset = True
+
     def read(self, n):   raise OSError("serial not open")
     def write(self, d):  return 0
     def close(self):     pass
@@ -1119,6 +1139,146 @@ class _NullSerial:
     @property
     def in_waiting(self):
         raise OSError("serial not open")
+
+
+# ── TCP 通道（C6 走 Wi-Fi 连过来）──────────────────────────────────────────
+class CoordinatorTcp:
+    """TCP **服务端**：等 ESP32-C6 主动连上来。
+
+    为什么由主机监听、C6 当客户端：
+      - C6 的目标地址是固定的（HA 主机），主机 IP 变了改一处就行；
+      - 主机这边是被动方，DHCP 换地址也不会让 C6「找不到人」；
+      - 一个端口只能有一路连接，旧连接会被新连接顶掉 —— 正好匹配
+        「一块板子一个网关」的部署方式。
+
+    接口与 CoordinatorSerial 一致（read/write/close/in_waiting/can_reset），
+    所以主循环一个字都不用改。
+
+    ★ can_reset = False：TCP 通道没有 RTS，没法给芯片硬复位。主循环里的
+      「45 s 没数据就复位」看门狗必须跳过它，否则日志会一直喊「强制复位」
+      却什么也没发生，误导排查方向。
+    """
+    can_reset = False
+
+    def __init__(self, bind="0.0.0.0", port=12345):
+        self.bind = bind
+        self.port = port
+        self.conn = None
+        self.peer = None
+        self._err_logged = False
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.srv.bind((bind, port))
+            self.srv.listen(1)
+        except OSError:
+            self.srv.close()
+            raise
+        self.srv.settimeout(0.5)      # accept 不能无限等，否则主循环卡死
+        print(f"[Link] 已监听 {bind}:{port} —— 等 C6 通过 Wi-Fi 连上来")
+
+    # -- 内部 ---------------------------------------------------------------
+    def _accept(self):
+        try:
+            c, addr = self.srv.accept()
+        except socket.timeout:
+            return False
+        except OSError as e:
+            print(f"[Link] accept 出错：{e}")
+            return False
+        try:
+            c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+        c.settimeout(1.0)
+        old, self.conn = self.conn, c
+        self.peer = addr
+        self._err_logged = False
+        if old:
+            try:
+                old.close()
+            except Exception:                           # noqa: BLE001
+                pass
+            print("[Link] 有新的 C6 连接进来，旧的已断开")
+        print(f"[Link] C6 已连接：{addr[0]}:{addr[1]}")
+        return True
+
+    def drop(self):
+        """丢掉当前连接（保留监听套接字，下轮 read 会重新 accept）。"""
+        c, self.conn = self.conn, None
+        self.peer = None
+        if c:
+            try:
+                c.close()
+            except Exception:                           # noqa: BLE001
+                pass
+
+    # -- 与串口一致的接口 ---------------------------------------------------
+    def read(self, n):
+        if self.conn is None:
+            self._accept()
+            return b""
+        try:
+            # ★ 至少读 4 KB：主循环传进来的 n 是 in_waiting or 1，也就是 1。
+            #   真按 1 字节读的话，一次 4 KB 的拓扑 dump 要 4000 次 recv，
+            #   白白多出几十毫秒延迟。调用方本来就只是往 buf 里追加。
+            d = self.conn.recv(max(int(n), 4096))
+        except socket.timeout:
+            return b""
+        except OSError as e:
+            print(f"[Link] 连接出错：{e} → 断开，等 C6 重连")
+            self.drop()
+            return b""
+        if not d:
+            print("[Link] C6 断开了，等它重连（板上会自动重试）")
+            self.drop()
+        return d
+
+    def write(self, d):
+        global _write_err
+        if self.conn is None:
+            return 0
+        try:
+            self.conn.sendall(d)
+            return len(d)
+        except OSError as e:
+            _write_err += 1
+            # 断线期间 HA 的命令会一直打到这里，日志必须限速 ——
+            # 否则一次网络抖动就能刷满整个日志缓冲（HA 只回最后 100 行）。
+            if not self._err_logged:
+                self._err_logged = True
+                print(f"[Link] 写失败：{e} → 连接已断开，等 C6 重连")
+            self.drop()
+            return 0
+
+    def close(self):
+        self.drop()
+        try:
+            self.srv.close()
+        except Exception:                               # noqa: BLE001
+            pass
+
+    @property
+    def in_waiting(self):
+        # 恒返回 0：让主循环走 read(1) 这条阻塞路径，由 recv 自己等数据。
+        return 0
+
+
+def _tcp_open(bind, port, attempts=3):
+    """起监听。失败重试；全失败时返回 _NullSerial 顶着，不抛异常退出。
+
+    ★ 不抛异常是为了保住「开机不让 Supervisor 反复重启」这条底线：
+      端口被占 / 网卡还没起来，都会在第 10 次读失败后由 _link_reopen 重试。
+    """
+    for i in range(1, attempts + 1):
+        try:
+            return CoordinatorTcp(bind, port)
+        except Exception as e:                          # noqa: BLE001
+            print(f"[Link] 监听 {bind}:{port} 失败（第 {i}/{attempts} 次）：{e}")
+            time.sleep(1.0)
+    print(f"[Link] !! {bind}:{port} 监听不起来，先用占位通道顶着，稍后自动重试")
+    return _NullSerial()
 
 
 def _serial_open(port, baud, attempts=3, first_delay=0.0):
@@ -1200,8 +1360,49 @@ def _serial_kick_reset(reason: str = "") -> bool:
         return False
 
 
-def _esptool_cmd(bin_path: str) -> list:
-    return [sys.executable, "-m", "esptool",
+# ── 通道分发：主循环只调 _link_*，不直接碰串口 ─────────────────────────────
+# 这样加一条新通道（Wi-Fi/TCP）不需要动主循环里任何一行，
+# 也就不会出现「串口分支修好了、TCP 分支忘了改」这种半吊子状态。
+def _link_open():
+    """按 --link 打开当前通道。开机只走这一处。"""
+    if args.link == "tcp":
+        return _tcp_open(args.tcp_bind, args.tcp_port)
+    return _serial_open(args.port, args.baud)
+
+
+def _link_reopen(reason: str = "") -> bool:
+    """掉线自愈。串口要换 fd；TCP 只要丢掉连接重新 accept。"""
+    global ser
+    if args.link != "tcp":
+        return _serial_reopen(reason)
+
+    if _serial_pause.is_set():
+        return False
+    if not _flash_mutex.acquire(blocking=False):
+        print("[Link] 通道被刷机占用，本次不重开")
+        return False
+    try:
+        try:
+            ser.close()
+        except Exception:                           # noqa: BLE001
+            pass
+        ser = _tcp_open(args.tcp_bind, args.tcp_port)
+        global _write_err
+        _write_err = 0
+        print(f"[Link] 监听已重建（{reason}）")
+        return not isinstance(ser, _NullSerial)
+    finally:
+        _flash_mutex.release()
+
+
+def _link_kick_reset(reason: str = "") -> bool:
+    """硬复位。只有串口能做到 —— TCP 通道没有 RTS，可能连芯片都不在一块板子上。"""
+    if args.link == "tcp":
+        return False
+    return _serial_kick_reset(reason)
+
+
+def _esptool_cmd(bin_path: str) -> list:    return [sys.executable, "-m", "esptool",
             "--chip", "esp32c6",
             "--port", args.port,
             "--baud", str(FLASH_BAUD),
@@ -1224,10 +1425,20 @@ def flash_is_running() -> bool:
 def flash_apply(bin_path: str) -> bool:
     """通过 bootloader 写入 bin_path。阻塞到 esptool 跑完。"""
     global ser
+    if args.link == "tcp":
+        # ★ 这条路径要靠 esptool 走 USB-Serial-JTAG 进下载模式，本质上是
+        #   **物理接触**，TCP 通道根本够不着。别让它半途失败，
+        #   直接拒绝并说清原因 —— 换成 App 级 OTA（/api/fw_ota）就行。
+        print("[FLASH] 拒绝：当前是 TCP 通道，esptool 走不了网络。"
+              "请改用 App 级 OTA（固件在线升级），或者插上 USB 切回串口。")
+        with _flash_state_lock:
+            _flash_state.update({"status": "error", "bin": bin_path,
+                                 "tail": ["当前是 TCP 通道，esptool 需要 USB 串口"]})
+        return False
     if not _flash_mutex.acquire(blocking=False):
         print("[FLASH] 已经在跑了 —— 忽略本次请求")
         return False
-    _serial_pause.set()                 # Hauptschleife anhalten
+    _serial_pause.set()                 # 暂停主循环
     with _flash_state_lock:
         _flash_state.update({"status": "running", "bin": bin_path, "tail": []})
     ok = False
@@ -1238,7 +1449,7 @@ def flash_apply(bin_path: str) -> bool:
         except Exception:
             pass
         cmd = _esptool_cmd(bin_path)
-        print("[FLASH] starte: " + " ".join(cmd[1:]))
+        print("[FLASH] 启动：" + " ".join(cmd[1:]))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 errors="replace", bufsize=1)
@@ -1261,7 +1472,7 @@ def flash_apply(bin_path: str) -> bool:
         # 刷完恢复串口。用 _serial_open：刷机后设备正在重新枚举，一次打不开
         # 很正常，别让整个 finally 抛异常（会把 _flash_state 卡在 running）。
         ser = _serial_open(args.port, args.baud, attempts=5, first_delay=1.0)
-        print("[FLASH] Serial 恢复流程结束 – 桥接继续")
+        print("[FLASH] 串口已恢复，桥接继续")
         with _flash_state_lock:
             _flash_state["status"] = "done" if ok else "error"
         _serial_pause.clear()
@@ -1285,7 +1496,7 @@ _ha_last    = {}     # addr → {sub: payload} 最后一次已知状态
 # 照 Z2M 的做法（lib/extension/homeassistant.ts），现在按 topic 比较成品 JSON：
 #     if (!discoveredMessage || discoveredMessage.payload !== payloadStr)
 # 这样内容一变就自动重发，而内容没变的重启一条都不会发。_DISC_VER 取消。
-_ha_sent   = {}      # topic → zuletzt publizierter JSON-String
+_ha_sent   = {}      # topic → 上一次发布的 JSON 串
 _sent_addr  = {}     # topic → addr（仅用于 _purge_addr / 清理）
 
 # 启动窗口：Z2M 启动时订阅 Discovery topic 5 秒，把 broker 上 retained 的
@@ -1552,10 +1763,10 @@ def _disc_purge_orphans():
             continue
         av = cfg.get("availability")
         if isinstance(av, list) and av and isinstance(av[0], dict):
-            gehoert_uns = av[0].get("topic") == eigen
+            owns_it = av[0].get("topic") == eigen
         else:
-            gehoert_uns = cfg.get("availability_topic") == eigen   # alte Fassung
-        if not gehoert_uns:
+            owns_it = cfg.get("availability_topic") == eigen      # 老版本的字段名
+        if not owns_it:
             continue
         grund = None
         if node not in bekannt:
@@ -1758,7 +1969,7 @@ _addr_nodes = {}
 _ieee_nodes = {}
 _addr_ieee  = {}
 _ieee_addr  = {}      # ieee → 当前 addr（用于清理旧地址）
-_addr_subs  = {}      # addr → [sub, …]      (was wir je auf diesem Topic publiziert haben)
+_addr_subs  = {}      # addr → [sub, …]      (本 topic 上发布过哪些 sub)
 
 
 def _nodes_load():
@@ -2350,10 +2561,10 @@ def _ha_drop_switch(addr, ep, why):
     mq_put(topic, "", retain=True, qos=1)
     _ha_sent.pop(topic, None)
     _sent_addr.pop(topic, None)
-    print(f"[HA] {addr} ep{ep}: switch/{node}/{obj_id} abgemeldet – {why}")
+    print(f"[HA] {addr} ep{ep}: switch/{node}/{obj_id} 已注销 – {why}")
 
 
-_dropped = set()       # "addr/ep" – switch-Entity in dieser Laufzeit schon abgemeldet
+_dropped = set()       # "addr/ep" – 本次运行期已注销的 switch 实体
 
 
 def _classify(addr, ep, why=""):
@@ -3689,6 +3900,19 @@ def dispatch(line: str):
                 # 那里有没有状态存在（见 _probe_*）。
                 _probe_start(a, msg.get("eps") or [])
 
+    elif t in ("net", "net_status"):
+        # Wi-Fi/TCP 通道状态。C6 在「Wi-Fi 连上 / TCP 连上 / 断开 / 配置变更」
+        # 时主动发一条；{"cmd":"net_status"} 也会回一条同格式的。
+        # 这里只做两件事：记进 _state（/api/state 里能看到）和打一行日志 ——
+        # 验证「拔掉 USB 之后还通不通」时，这行是唯一的直接证据。
+        with _state_lock:
+            _state["net"] = dict(msg)
+        if t == "net_status" or msg.get("up"):
+            print(f"[NET] 通道已连通 ip={msg.get('ip')} rssi={msg.get('rssi')} "
+                  f"→ {msg.get('host')}:{msg.get('port')}")
+        else:
+            print("[NET] TCP 断开，等待 C6 重连（板上会自动重试）")
+
     elif t == "aps":
         # 原始 APS 帧：里面含按键（见 _ha_aps_action）。
         # 能收到它的帧 = 这台设备刚刚真的发了东西，判活最硬的证据。
@@ -3814,7 +4038,7 @@ def dispatch(line: str):
             _fw_ota_close()
         elif st == "error":
             why = msg.get("why")
-            print(f"[OTA] coordinator FEHLER: {why}")
+            print(f"[OTA] coordinator 出错：{why}")
             if why == "busy":
                 print("[OTA] C6 里还卡着一个中断的传输 "
                       "（s_active=true）。必须重启 C6，"
@@ -4337,7 +4561,7 @@ def _device_html(addr):
         role_html = (f'{role_txt}<br><span style="color:#888">cap={nd.get("cap")} · '
                      f'{nd.get("power")} · rx_idle={nd.get("rx_idle")}</span>')
     elif nd and nd.get("error"):
-        role_html = f'<span style="color:#f66">Abfrage fehlgeschlagen ({nd.get("error")})</span>'
+        role_html = f'<span style="color:#f66">查询失败 ({nd.get("error")})</span>'
     else:
         role_html = '<span style="color:#888">未查询（下方“命令”里选 node_desc）</span>'
 
@@ -4703,14 +4927,15 @@ class _Handler(BaseHTTPRequestHandler):
             print("[OTA] 已中止（ota_stop 已下发）")
 
         elif path == "/api/serial_reopen":
-            # 手动兜底：串口 EIO 卡住时不用重启整个 add-on。
-            # 先重开 fd；再硬复位一次 C6（端口活着但芯片挂了也一并治好）。
-            # ⚠ 最多阻塞 ~45 s（6 次指数退避重试），浏览器可能先超时，属正常。
-            print("[Serial] 收到手动重开请求")
-            ok = _serial_reopen("手动 /api/serial_reopen")
-            print(f"[Serial] 手动重开结果: {'成功' if ok else '失败（见上面的重试日志）'}")
+            # 手动兜底：通道卡住时不用重启整个 add-on。
+            # 串口：先重开 fd；再硬复位一次 C6（端口活着但芯片挂了也一并治好）。
+            # TCP：丢掉旧连接重新监听（C6 那边会自动重连）。
+            # ⚠ 串口路径最多阻塞 ~45 s（6 次指数退避重试），浏览器可能先超时，属正常。
+            print("[Link] 收到手动重开请求")
+            ok = _link_reopen("手动 /api/serial_reopen")
+            print(f"[Link] 手动重开结果：{'成功' if ok else '失败（见上面的重试日志）'}")
             if ok:
-                _serial_kick_reset("手动 /api/serial_reopen 配套复位")
+                _link_kick_reset("手动 /api/serial_reopen 配套复位")
 
         elif path == "/api/ota":
             # image type: 0x0001 终端节点 / 0x0002 中继器
@@ -4742,18 +4967,21 @@ def _run_web():
 # ── Start ───────────────────────────────────────────────────────────────────
 db_init()
 
-print(f"[Serial] 正在打开 {args.port} @ {args.baud} …")
+if args.link == "tcp":
+    print(f"[Link] 传输通道 = Wi-Fi/TCP，监听 {args.tcp_bind}:{args.tcp_port}")
+else:
+    print(f"[Link] 传输通道 = 串口 {args.port} @ {args.baud}")
 # ★ 开机打不开端口时**不要**直接抛异常退出：那会被 Supervisor 判定成
-#   "启动失败" 反复重启（2026-10-26 重建后就是这样）。先用占位串口把
+#   "启动失败" 反复重启（2026-10-26 重建后就是这样）。先用占位通道把
 #   Web UI / MQTT 拉起来，主循环的看门狗会自己重连。
-ser = _serial_open(args.port, args.baud)
+ser = _link_open()
 
 # 加载持久化的节点归属 —— 必须在第一次 discovery 发布**之前**，
 # 否则重启后会生成新的 Node-ID，也就生成了新实体。
 _nodes_load()
 _txp_load()
 
-print(f"[MQTT] verbinde {args.broker}:{args.mqport} …")
+print(f"[MQTT] 正在连接 {args.broker}:{args.mqport} …")
 mq.connect(args.broker, args.mqport, keepalive=60)
 mq.loop_start()
 
@@ -4793,12 +5021,15 @@ try:
         if _serial_pause.is_set():
             time.sleep(0.2)
             continue
-        # ★ 饿死看门狗：端口不报错但**一个字节都没有**。协调器正常情况下
+        # ★ 饿死看门狗：通道不报错但**一个字节都没有**。协调器正常情况下
         #   每几秒就有心跳/上报，连续 45 s 静默 = 芯片侧挂了（固件卡死、
         #   USB-JTAG 端点停了），重开 fd 治不好，只能硬复位。见 _serial_kick_reset。
-        if time.time() - last_rx > 45 and time.time() - last_kick > 90:
+        #   ★ TCP 通道没有 RTS，也没有「端口」这个实体，这条看门狗对它无意义
+        #     （can_reset=False）—— 断线由 CoordinatorTcp.read 自己发现并重连。
+        if (getattr(ser, "can_reset", True)
+                and time.time() - last_rx > 45 and time.time() - last_kick > 90):
             last_kick = time.time()
-            _serial_kick_reset(f"已 {int(time.time() - last_rx)} s 没收到任何字节")
+            _link_kick_reset(f"已 {int(time.time() - last_rx)} s 没收到任何字节")
             last_rx = time.time()      # 给它 45 s 重新起来
         try:
             raw = ser.read(ser.in_waiting or 1)
@@ -4809,19 +5040,19 @@ try:
             now = time.time()
             if read_err == 1:
                 err_since = now
-                print(f"[Serial] Lese-Fehler: {e} – 累计到 10 次就重开端口")
+                print(f"[Link] 读取出错：{e} —— 累计到 10 次就重开通道")
             elif read_err == 10 or (read_err % 60 == 0):
-                print(f"[Serial] 读失败 {read_err} 次 / {now - err_since:.0f} s"
-                      f"（最后一次: {e}）→ 重开端口")
+                print(f"[Link] 读失败 {read_err} 次 / {now - err_since:.0f} s"
+                      f"（最后一次：{e}）→ 重开通道")
             if read_err >= 10 and not _serial_pause.is_set():
-                if _serial_reopen(f"连续 {read_err} 次读失败: {e}"):
+                if _link_reopen(f"连续 {read_err} 次读失败: {e}"):
                     buf = b""       # 半行必须丢掉，否则和下一行粘成非法 JSON
                     read_err = 0
                     last_rx  = time.time()
             time.sleep(0.5)
             continue
         if read_err:
-            print(f"[Serial] 读取恢复正常（此前连续失败 {read_err} 次）")
+            print(f"[Link] 读取恢复正常（此前连续失败 {read_err} 次）")
             read_err = 0
         if raw:
             last_rx = time.time()
@@ -4834,7 +5065,7 @@ try:
                     print(f"[C6] {decoded}")
                     dispatch(decoded)
 except KeyboardInterrupt:
-    print("\nBeendet.")
+    print("\n已退出。")
 finally:
     mq_put(f"{BASE}/status", "offline", retain=True, qos=1)
     db_upsert_gateway("offline")

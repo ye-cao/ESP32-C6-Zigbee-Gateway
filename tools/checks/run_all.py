@@ -19,6 +19,7 @@ CHECKS = [
     ("设备可用性 / discovery / Tx-Power", os.path.join(HERE, "check_availability.py")),
     ("拓扑采集（轮次 / 剪枝 / 闪烁）", os.path.join(HERE, "check_topology.py")),
     ("串口自愈（死 fd / 复位 / 写异常）", os.path.join(HERE, "check_serial_heal.py")),
+    ("Wi-Fi/TCP 通道（接口一致 / 断开重连）", os.path.join(HERE, "check_link_tcp.py")),
     ("Web UI 渲染 + i18n", os.path.join(ROOT, "test_i18n_render.py")),
 ]
 
@@ -47,7 +48,7 @@ def main() -> int:
             bad.append(name)
     print()
     if bad:
-        print(f"RESULT: {len(bad)} von {len(CHECKS)} Checks fehlgeschlagen")
+        print(f"RESULT: {len(bad)}/{len(CHECKS)} 项检查失败")
         return 1
     print(f"RESULT: ALL OK ({len(CHECKS)} Checks)")
     return 0

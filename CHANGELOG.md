@@ -6,6 +6,76 @@
 
 > 语言约定：说明、注释、文档一律中文（专有名词与 API 名保留原文）。
 
+## [1.5.5] – 2026-11-06
+
+重点：**不插 USB 也能当网关**。C6 可以用 5V 电源头供电，通过家里 Wi-Fi 把同样的
+JSON 发给主机。协议一个字没改，只换了"那根线"。
+
+### 新增 – 固件（协调器 `main/`）
+
+- **`main/net_link.c` / `net_link.h`**：Wi-Fi STA + TCP 客户端。内含
+  非阻塞 connect（5 s 超时）、1 s 粒度的 `select` 收包循环、指数退避重连
+  （2 s → 30 s 封顶）、`SO_SNDTIMEO=200 ms`（`tx_task` 绝不允许被写操作卡住）。
+- **`ha_mqtt_handle_line()`**：把原来 `rx_task` 里那一长串 if-else 抽成独立函数，
+  串口与 TCP 两个入口共用。这是「两处只改一处」老毛病的结构性预防 ——
+  `node_desc` / `fw_ota_data` / `dev_remove` 三次静默死亡都源于此。
+- `tx_task` 发送改为 **TCP 优先、串口回退**；回退前必须过
+  `usb_serial_jtag_is_connected()`。原因：USB-Serial-JTAG 的 VFS 写路径在
+  无主机时是 `timeout = non_blocking ? 0 : portMAX_DELAY`（永久阻塞），
+  拔掉 USB 后无脑 `fputs()` 会让整条上报链路静默死掉。
+- 新命令 `{"cmd":"net_cfg",…}`（写 NVS 并立即生效）与 `{"cmd":"net_status"}`。
+  ★ 按既定规矩**两处都登记**：`main.c::on_uart_cmd` + `ha_mqtt.c` 的
+  JSON→payload 分支。二者都列入了免锁白名单（只写 NVS / 只读自有结构体，
+  持 ZBOSS 锁做 NVS 写毫无必要）。
+- 通道存在 NVS 命名空间 `netlink`，**默认 `tr=0` 即串口** —— 配错了插回 USB
+  就能改，而不是变砖。`net_link_start()` 全程不 `ESP_ERROR_CHECK`，
+  任何失败都降级回串口并记一条日志。
+- 新增主动上报 `{"t":"net","up":…,"ip":…,"rssi":…,"host":…,"port":…}`。
+- `sdkconfig.defaults` 增加 Wi-Fi / 共存配置项（`CONFIG_ESP_COEX_SW_COEXIST_ENABLE`
+  等），并写明信道规划：Zigbee 25 + Wi-Fi 1/6，**不要用 Zigbee 20**。
+
+### 新增 – Add-on（`host/addon/esp32c6_gateway/`）
+
+- **`CoordinatorTcp`**：TCP 服务端，等 C6 连上来。接口与 `CoordinatorSerial`
+  完全一致（`read/write/close/in_waiting/can_reset`），主循环一行未改。
+  `in_waiting` 恒返回 0 ⇒ 主循环走 `read(1)` 阻塞路径；`read()` 内部至少
+  `recv(4096)`，避免 4 KB 拓扑 dump 被切成 4000 次系统调用。
+- **`_link_open` / `_link_reopen` / `_link_kick_reset`**：通道分发。主循环只调
+  这三个，所以加通道不再需要动主循环。
+- `can_reset`：TCP 通道为 `False`。主循环那条「45 s 没数据就复位芯片」的看门狗
+  据此跳过，否则会每 90 s 打一条"强制复位"却什么也没发生，误导排查。
+- 新参数 `--link {uart,tcp}`、`--tcp-port`、`--tcp-bind`；`config.json` 同步加
+  `link` / `tcp_port` 选项并把 `serial_port` 的 schema 从
+  `device(subsystem=tty)` 改成 `str` —— 原选择器在设备不存在时会**直接挡住
+  add-on 启动**，拔掉 USB 就打不开，正好废掉本功能的全部意义。
+- `{"t":"net"}` / `{"t":"net_status"}` 的 dispatch 分支：打 `[NET] …` 日志并写进
+  `_state["net"]`（`/api/state` 可见）。
+- `flash_apply()` 在 TCP 模式下**明确拒绝**：esptool 只能走 USB，硬闯只会半途失败；
+  提示改用 App 级 OTA。
+- 新增回归检查 **`tools/checks/check_link_tcp.py`**（已加入 `run_all.py`）：
+  验证通道选择、两个通道的接口一致性、`can_reset` 语义，以及用**真 socket**
+  走一遍 accept → 读 → 写 → 断开 → 重新 accept。
+
+### 修正
+
+- 清掉一批上一轮漏译的德文（运行日志、注释、测试描述）：`verbinde`、
+  `Beendet`、`Abfrage fehlgeschlagen`、`Lese-Fehler`、`gestartet`、
+  `abgemeldet`、`FEHLER`、`koordinierter` 等，以及 `run.sh`、`build.sh`、
+  `host/install.sh`、`test_packaging.py` 里的德文说明。
+- `serial_gateway.py` 局部变量 `gehoert_uns` → `owns_it`。
+- `config.json` / `sdkconfig.defaults` 行尾统一为 LF（打包检查会拦 CRLF）。
+
+### 暂未做（下一步）
+
+- **`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` 仍是关闭的。** 没有 USB 时，一份连不上
+  Wi-Fi 的固件就是砖。上生产前必须打开它并实现首启自检（Wi-Fi + TCP 都通了才
+  `mark_valid`）。本次**有意**不动：这个开关一旦打开，应用侧不同步实现
+  `mark_valid` 会导致每次 OTA 后都回滚。
+- 日志通道：拔掉 USB 后 `ESP_LOGI` 无人接收。需要时可把 console 挪到
+  UART0（GPIO16/17）接 USB-TTL。
+
+详见 `WiFi传输通道.md`。
+
 ## [1.5.4] – 2026-11-05
 
 重点：**让设备真的能被删掉**。已经搬到别的 Zigbee 网络的节点，以前会一直作为

@@ -1,8 +1,8 @@
 {
   "name": "ESP32-C6 Zigbee Gateway",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "slug": "esp32c6_gateway",
-  "description": "Bridges the ESP32-C6 Zigbee coordinator (JSON-Lines over USB-serial) to MQTT + Web UI",
+  "description": "Bridges the ESP32-C6 Zigbee coordinator to MQTT + Web UI. The link to the coordinator is either USB-serial (JSON-Lines) or Wi-Fi/TCP, where this add-on listens and the board connects in.",
   "url": "https://github.com/gerontec/esp32c6-zigbee-vital-gateway",
   "arch": [
     "aarch64",
@@ -17,7 +17,9 @@
     "share"
   ],
   "options": {
+    "link": "uart",
     "serial_port": "/dev/ttyACM0",
+    "tcp_port": 12345,
     "baud": 115200,
     "mqtt_host": "127.0.0.1",
     "mqtt_port": 1883,
@@ -31,7 +33,9 @@
     "topo_interval": 60
   },
   "schema": {
-    "serial_port": "device(subsystem=tty)",
+    "link": "list(uart|tcp)",
+    "serial_port": "str",
+    "tcp_port": "int(1,65535)",
     "baud": "int(110,3000000)",
     "mqtt_host": "str",
     "mqtt_port": "int(1,65535)",

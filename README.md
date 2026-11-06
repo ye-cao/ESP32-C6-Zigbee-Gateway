@@ -162,12 +162,20 @@ Add-on 配置（options）：
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `serial_port` | `/dev/ttyACM0` | C6 所在串口 |
+| `link` | `uart` | 到协调器的通道：`uart` = USB 串口，`tcp` = Wi-Fi/TCP（add-on 监听，板子连进来） |
+| `tcp_port` | `12345` | `link=tcp` 时监听的端口，要和固件里 `net_cfg` 的 `port` 一致 |
+| `serial_port` | `/dev/ttyACM0` | C6 所在串口（`link=tcp` 时用不到） |
 | `mqtt_host/port/user/pass` | 本机 1883 / 空 | broker 凭据（空 = 匿名） |
 | `base_topic` | `gw/coordinator` | MQTT 主题前缀 |
 | `web_port` | `8082` | Web 面板端口 |
 | `timezone` | `Asia/Shanghai` | 日志时区 |
 | `fw_chunk` | `80` | 串口 OTA 帧大小（旧固件兼容 256 B 缓冲） |
+
+> **不插 USB 也能跑**：把 `link` 改成 `tcp`，再用一条串口命令
+> `{"cmd":"net_cfg","ssid":…,"pass":…,"host":"<ha-ip>","port":12345,"tr":1}`
+> 把 Wi-Fi 参数写进 C6，之后 C6 就可以只用 5V 电源头供电。
+> 协议不变、设备不用重新配对。代价与注意事项见
+> [WiFi传输通道.md](WiFi传输通道.md)。
 
 ### 3. 旧版 systemd 路径（可选）
 

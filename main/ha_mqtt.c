@@ -1,8 +1,14 @@
 /*
- * ha_mqtt.c  ——  经 USB-JTAG/CDC 输出 JSON 到 ttyACM1
+ * ha_mqtt.c  ——  JSON-Lines 收发层（与「走哪根线」无关）
  *
- * CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 把 printf()/stdin 指向原生 USB-CDC
- * 端口（ttyACM1），不需要 UART 驱动。
+ * 两条传输通道共用这一份代码：
+ *   - 串口：CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y 把 printf()/stdin 指向
+ *           原生 USB-CDC 端口（ttyACM1），不需要 UART 驱动；
+ *   - Wi-Fi：net_link.c 提供的 TCP 连接。
+ * 发送在 emit() → tx_task 里二选一（TCP 优先，回退串口）；接收则是
+ * rx_task（fgets(stdin)）和 net_link 的收包循环各自攒够一行，都调
+ * ha_mqtt_handle_line()。**解析只有一份**，不会出现「串口能用、Wi-Fi 不能用」。
+ *
  * IDF 自身的日志用 null_vprintf 静音。
  */
 #include <stdio.h>
@@ -14,7 +20,9 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "driver/usb_serial_jtag.h"
 #include "ha_mqtt.h"
+#include "net_link.h"
 
 #define BUF_SIZE    4096
 
@@ -46,16 +54,33 @@ static void tx_task(void *arg) {
     char *line = NULL;
     while (1) {
         if (xQueueReceive(s_tx_q, &line, portMAX_DELAY) != pdTRUE) continue;
-        if (line) {
-            fputs(line, stdout);
-            fputc('\n', stdout);
-            fflush(stdout);
-            free(line);
+        if (!line) continue;
+
+        /* 先试 Wi-Fi（TCP）。没配 Wi-Fi、或者恰好在断线重连，都会返回非 OK。 */
+        bool sent = false;
+        if (net_link_transport() == NET_LINK_TCP) {
+            sent = (net_link_send_line(line) == ESP_OK);
         }
+
+        if (!sent) {
+            /* ★★ 串口回退必须带 is_connected() 判断。
+             * USB-Serial-JTAG 的 VFS 写路径在没有主机时是
+             *     timeout = s_ctx.non_blocking ? 0 : portMAX_DELAY;
+             * 也就是**永久阻塞**——FIFO 满了以后再也排不出去。
+             * 拔掉 USB 之后如果还无脑 fputs()，tx_task 就会永久卡死，
+             * 整条上报链路静默失效（表现是「拔线后网页全空，但设备还在
+             * 联网」）。is_connected() 靠 SOF 包判断主机在不在，正好治这个。 */
+            if (usb_serial_jtag_is_connected()) {
+                fputs(line, stdout);
+                fputc('\n', stdout);
+                fflush(stdout);
+            }
+        }
+        free(line);
     }
 }
 
-/* ⚠️ 这个函数会被 ZBOSS-Task 调用 – darf NIEMALS blockieren. */
+/* ⚠️ 这个函数会被 ZBOSS 任务调用 —— 绝不允许阻塞。 */
 static void emit(const char *line) {
     if (!s_tx_q || !line) return;
     size_t n = strlen(line) + 1;
@@ -64,7 +89,7 @@ static void emit(const char *line) {
     memcpy(c, line, n);
     if (xQueueSend(s_tx_q, &c, 0) != pdTRUE) {
         free(c);
-        s_tx_drop++;              /* Queue voll: lieber verlieren als blockieren */
+        s_tx_drop++;              /* 队列满了：宁丢一条，也不能卡住调用方 */
     }
 }
 
@@ -129,9 +154,26 @@ static void rx_task(void *arg) {
             n = acc_len;
             acc_len = 0;
         }
-        if (n == 0 || !s_cmd_cb) continue;
+        if (n == 0) continue;
+        ha_mqtt_handle_line(buf);
+    }
+}
 
-        if (strstr(buf, "permit_join")) {
+/* ── 一行 JSON → 命令 ────────────────────────────────────────────────────
+ *
+ * ★★ 这个函数是「串口」和「Wi-Fi」两个入口的**唯一**交汇点。
+ *    历史上 node_desc / fw_ota_data / dev_remove 三次「静默死亡」全是因为
+ *    命令在 main.c::on_uart_cmd 里登记了、这里没接线（或者反过来）。
+ *    以后加命令，这里是第一处、on_uart_cmd 是第二处，**两处都要改**。
+ *
+ * 注意：本函数会就地改写 buf（把引号换成 '\0' 之类），调用方别指望调用后
+ * 原样保留。两条通道各传各的缓冲，互不影响；唯一共享的是下面几个 static
+ * payload 缓冲，前提是「同一条命令不会被两个通道同时收到」—— 实际部署里
+ * 也只有一个通道在收，所以是安全的。 */
+void ha_mqtt_handle_line(char *buf) {
+    if (!buf || !s_cmd_cb) return;
+
+    if (strstr(buf, "permit_join")) {
             char *p = strstr(buf, "\"sec\":");
             char secs_str[8] = "180";
             if (p) snprintf(secs_str, sizeof(secs_str), "%d", atoi(p + 6));
@@ -355,7 +397,6 @@ static void rx_task(void *arg) {
                      "{\"t\":\"error\",\"why\":\"unknown_cmd\",\"cmd\":\"%s\"}", name);
             emit(line);
         }
-    }
 }
 
 esp_err_t ha_mqtt_init(const char *broker_uri,
@@ -378,6 +419,10 @@ esp_err_t ha_mqtt_init(const char *broker_uri,
      * JSON 拆分 + snprintf 比单纯的 fgets() 路径要费栈。
      * 栈很便宜，溢出一次就是一次重启。 */
     xTaskCreate(rx_task, "uart_rx", 4096, NULL, 4, NULL);
+
+    /* 传输通道。NVS 里选了 Wi-Fi 才会真的拉起 net_task；默认串口，
+     * 所以这里通常是空操作（只读一次 NVS 然后返回）。 */
+    net_link_start();
 
     /* 稍等一下，等 USB-CDC 就绪 */
     vTaskDelay(pdMS_TO_TICKS(500));
