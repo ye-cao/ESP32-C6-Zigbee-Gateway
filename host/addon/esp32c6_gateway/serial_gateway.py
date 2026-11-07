@@ -3960,6 +3960,18 @@ def dispatch(line: str):
                 d = _ha_devices.setdefault(addr, {})
                 if p.get("mfr"):   d["mfr"]   = p["mfr"]
                 if p.get("model"): d["model"] = p["model"]
+                # ★★★ 2026-11-07：必须同步一份到 _state["devices"]。
+                #   设备表和 /api/state 都是从 _state["devices"] 取字段的，而型号
+                #   以前只写进 _ha_devices —— 两份数据互不相通，于是页面
+                #   「制造商 / 型号」整列永远显示 "–"，连 payload 里明明已经读到
+                #   型号的设备（Feibit FTB56）也一样。这是用户指出的那个"设备
+                #   列表不对"。
+                with _state_lock:
+                    sd = _state["devices"].setdefault(addr, {
+                        "ieee": "", "name": addr,
+                        "last_seen": "", "clusters": {}})
+                    if d.get("mfr"):   sd["mfr"]   = d["mfr"]
+                    if d.get("model"): sd["model"] = d["model"]
                 hit = _ha_db.get((p.get("model") or "").strip())
                 if hit:
                     d["db"] = hit
@@ -4572,6 +4584,13 @@ def _html():
 
     dev_rows = ""
     for addr, d in s["devices"].items():
+        # ★ 型号有两个来源：_state["devices"]（新代码会同步过去）和 _ha_devices
+        #   （老路径只写这里）。两处都查，保证升级前后都已读到的型号立刻能显示。
+        _hd    = _ha_devices.get(addr) or {}
+        _mfr   = (d.get("mfr") or _hd.get("mfr") or "").strip()
+        _model = (d.get("model") or _hd.get("model") or "").strip()
+        if not _mfr and not _model:
+            _mfr = "–"          # 没读到就明确显示占位，别留空白让人以为是渲染坏了
         clusters_html = ""
         for k, v in d["clusters"].items():
             if isinstance(v, dict) and "payload" in v:
@@ -4597,7 +4616,7 @@ def _html():
         <tr style="cursor:pointer" onclick="location.href='/device/{addr}'"
             title="查看详情">
           <td><a href="/device/{addr}" style="color:#7ecbff;text-decoration:none">{addr}</a></td>
-          <td style="font-size:.85em;color:#aaa">{d.get("mfr","") or "–"}<br>{d.get("model","") or ""}</td>
+          <td style="font-size:.85em;color:#aaa">{_mfr} {('<br>' + _model) if _model else ''}</td>
           <td>{clusters_html}</td>
           <td>{lqi_html}</td>
           <td>{rssi_html}</td>
