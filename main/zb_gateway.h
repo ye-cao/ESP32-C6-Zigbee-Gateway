@@ -69,6 +69,11 @@ void zb_gateway_probe_basic(uint16_t addr, uint8_t ep);
  *  "power":"mains|battery","rx_idle":true|false} */
 void zb_gateway_node_desc(uint16_t addr);
 
+/* 手动重跑一次设备采访（Active-EP → Simple-Desc → Bind → 配置上报）。
+ * 平时只在入网时自动跑一次；设备出问题后想复核它到底注册了哪些簇时用这个。
+ * 典型用途：确认某台设备是不是 mfr=Espressif / model=ESP32-C6-Repeater 的中继器。 */
+void zb_gateway_interview(uint16_t addr);
+
 /* 主动回读 On/Off 状态（对 0x0006/0x0000 发 Read Attributes）。
  * 有些设备（如 HGZB-043）对远程命令只回 Default Response、不发 Report，
  * 需要这样回读，HA 才能确认真实状态而不是只拿到网关的乐观假设。

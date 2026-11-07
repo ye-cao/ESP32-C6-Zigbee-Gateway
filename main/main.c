@@ -149,6 +149,12 @@ static void on_uart_cmd(const char *cmd, const char *payload, int len) {
         unsigned long a = strtoul(payload, NULL, 0);
         ESP_LOGI(TAG, "node_desc 0x%04x", (uint16_t)a);
         zb_gateway_node_desc((uint16_t)a);
+    } else if (strcmp(cmd, "interview") == 0) {
+        /* payload: "ADDR" —— 重跑一次设备采访，回 {"t":"interview",...}。
+         * 用来复核设备注册了哪些簇（判断它到底是什么设备）。 */
+        unsigned long a = strtoul(payload, NULL, 0);
+        ESP_LOGI(TAG, "interview 0x%04x", (uint16_t)a);
+        zb_gateway_interview((uint16_t)a);
     } else if (strcmp(cmd, "dev_remove") == 0) {
         /* payload: "ADDR" —— 把设备彻底从列表（和 NVS 副本）里删掉 */
         unsigned long a = strtoul(payload, NULL, 0);

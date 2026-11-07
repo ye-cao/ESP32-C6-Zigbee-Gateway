@@ -416,6 +416,17 @@ void ha_mqtt_handle_line(char *buf) {
                 snprintf(payload, sizeof(payload), "%lu,%d", addr, atoi(pe));
                 s_cmd_cb("probe", payload, strlen(payload));
             }
+        } else if (strstr(buf, "interview")) {
+            /* 重跑设备采访：{"cmd":"interview","addr":"0x104d"}
+             * payload = "ADDR" —— 和 node_desc 一样的两处登记，只改一处会
+             * 回 unknown_cmd（node_desc / fw_ota_data / dev_remove 都这么死过）。 */
+            const char *pa = json_val(buf, "\"addr\"");
+            if (pa) {
+                unsigned long addr = strtoul((*pa == '"') ? pa + 1 : pa, NULL, 16);
+                char payload[16];
+                snprintf(payload, sizeof(payload), "%lu", addr);
+                s_cmd_cb("interview", payload, strlen(payload));
+            }
         } else if (strstr(buf, "node_desc")) {
             /* 节点描述符：{"cmd":"node_desc","addr":"0x07da"}
              * payload = "ADDR" —— 用来确认这台设备是不是以路由器（ZR）身份工作。 */

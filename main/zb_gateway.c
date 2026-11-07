@@ -1846,6 +1846,31 @@ void zb_gateway_write_tx_power(uint16_t addr, uint8_t ep, int8_t dbm) {
  *   bit1 = 1 → FFD / 路由器，bit2 = 1 → 市电供电，bit3 = 1 → 常开接收。 */
 static uint16_t s_nd_addr = 0xFFFF;
 
+/* ── 手动重跑一次「设备采访」──────────────────────────────────────────────
+ * interview_start() 平时只在**设备入网时**自动跑一次
+ * （Active-EP → Simple-Desc → Bind → 配置上报）。设备入网之后再想复核它到底
+ * 注册了哪些簇，就没有入口了 —— 2026-11-07 要判断 0x104d 究竟是不是
+ * mfr=Espressif / model=ESP32-C6-Repeater 的中继器，就卡在这里：
+ * 它只回 ZDO、不回任何 ZCL，probe 读不到型号，只能靠簇列表验明正身。
+ *
+ * 和 node_desc 一样走 scheduler_alarm：ZBOSS 的 API 必须在它自己的任务里调，
+ * 这里如果直接调 interview_start 会踩锁（assert vPortExitCritical）。 */
+static uint16_t s_iv_req_addr = 0xFFFF;
+
+static void interview_alarm(uint8_t param) {
+    (void)param;
+    if (s_iv_req_addr == 0xFFFF) return;
+    uint16_t a = s_iv_req_addr;
+    s_iv_req_addr = 0xFFFF;
+    interview_start(a, NULL);      /* NULL = IEEE 未知，函数内会清零处理 */
+}
+
+void zb_gateway_interview(uint16_t addr) {
+    if (addr == 0x0000 || addr == 0xFFFF) return;
+    s_iv_req_addr = addr;
+    esp_zb_scheduler_alarm(interview_alarm, 0, 10);
+}
+
 static void node_desc_cb(esp_zb_zdp_status_t status, uint16_t addr,
                          esp_zb_af_node_desc_t *nd, void *user_ctx) {
     (void)user_ctx;
