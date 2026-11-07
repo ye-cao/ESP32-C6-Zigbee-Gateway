@@ -9,19 +9,19 @@ managed_components/
 dependencies.lock
 *.pyc
 
-# Python-Bytecode – nichts davon gehoert ins Repo oder ins Add-on
+# Python 字节码缓存：仓库和 add-on 里都不应出现
 __pycache__/
 
-# Klon der Z2M-Converter – nur Eingabe fuer gen_device_db.py
+# Z2M 转换器克隆：只作为 gen_device_db.py 的输入源
 .zhc/
 
-# Klon von Koenkk/zigbee2mqtt – reine Referenz fuer die MQTT-Schicht (s. Report §19)
+# zigbee2mqtt 克隆：MQTT 层的纯参考资料（见接入报告 §19）
 .z2m/
 
-# Klon von tostmann/esp-coordinator – Referenz fuer Kapazitaet/NVRAM (s. Report §23)
+# esp-coordinator 克隆：容量/NVRAM 参考资料（见接入报告 §23）
 .tostmann/
 
-# Lokale Testumgebung (websockets fuer ha_ws.py)
+# 本地测试环境（ha_ws.py 用的 websockets 依赖）
 .mqttenv/
 
 # 项目工作数据（WorkBuddy 记忆/日志）——绝不上传

@@ -1,14 +1,15 @@
 # ESP32-C6 Zigbee Gateway
 
-Split-architecture Zigbee 网关：**ESP32-C6** 作为 Zigbee 协调器，通过 USB 串口以
-JSON-Lines 协议把设备数据转发给 **Home Assistant OS Add-on**，由 add-on 完成
-MQTT 桥接、HA 自动发现和 Web 面板，无需任何 YAML 配置。
+Split-architecture Zigbee 网关：**ESP32-C6** 作为 Zigbee 协调器，通过 USB 串口
+或 Wi-Fi/TCP 以同一套 JSON-Lines 协议把设备数据转发给
+**Home Assistant OS Add-on**，由 add-on 完成 MQTT 桥接、HA 自动发现和
+Web 面板，无需任何 YAML 配置。两条通道可切换，协议一个字不变。
 
 ```
 Zigbee 设备 ──802.15.4──► ESP32-C6（协调器, main/）
-                              │ USB 串口（JSON-Lines, 115200）
+                              │ USB 串口 或 Wi-Fi/TCP（JSON-Lines）
                      HAOS Add-on（host/addon/esp32c6_gateway/）
-                     serial_gateway.py v1.2.6
+                     serial_gateway.py v1.5.7
                               │
               ┌───────────────┼────────────────┐
         MQTT Broker      Web 面板 :8082    MariaDB（可选）
@@ -16,13 +17,25 @@ Zigbee 设备 ──802.15.4──► ESP32-C6（协调器, main/）
         Home Assistant（MQTT 自动发现）
 ```
 
+## 当前版本
+
+| 项 | 值 |
+|---|---|
+| Add-on | **1.5.7**（`host/addon/esp32c6_gateway/config.json`） |
+| 协调器固件 | ESP-IDF **v5.5.2** / esp-zigbee-lib 1.6.8 / ZBOSS 1.6.4 |
+| 型号库 | **4944** 条，源自 zigbee-herdsman-converters **v26.128.0** |
+| 默认通道 | `link=uart`（USB 串口）；`link=tcp` 走 Wi-Fi/TCP |
+
+版本变更详见 `CHANGELOG.md`。发版时版本号必须两处同步：
+`config.json` 的 `version` 与 `serial_gateway.py` 的 `GW_VERSION`。
+
 ## 组件
 
 | 路径 | 说明 |
 |---|---|
-| `main/` | 协调器固件（ESP-IDF v5.5.1 / ESP32-C6，esp-zigbee-lib 1.6.8）：64 设备容量、配对信息跨重启保持、运行时发射功率调节、LQI/RSSI 快照、串口 OTA |
+| `main/` | 协调器固件（ESP-IDF **v5.5.2** / ESP32-C6，esp-zigbee-lib 1.6.8 / ZBOSS 1.6.4）：64 设备容量、配对信息跨重启保持、运行时发射功率调节、LQI/RSSI 快照、串口与 Wi-Fi OTA、bootloader 回滚保护 + 首启确认 |
 | `client/` | 自研 Zigbee 终端节点固件（OnOff + 温度 + OTA client） |
-| `host/addon/esp32c6_gateway/` | **主线网关（HAOS Add-on）**：HA MQTT 自动发现、情景面板按键事件、设备型号库（4 882 型号）、发现去重与孤儿清理、Web 面板 |
+| `host/addon/esp32c6_gateway/` | **主线网关（HAOS Add-on）**：HA MQTT 自动发现、情景面板按键事件、设备型号库（**4944** 条）、发现去重与孤儿清理、Web 面板、设备采访与命令透传 |
 | `host/serial_gateway.py` | 旧版宿主机网关（systemd 路径），保留作对照 |
 | `DEVICE_INTEGRATION_REPORT.md` | 完整的接入、定位与修复记录 |
 
@@ -284,6 +297,24 @@ python txpower_ab.py --addr 0x747d --ep 2 --levels 20,14,8,2 --n 10
 
 ## 相关文档
 
+项目资料按用途归类，便于查阅：
+
+**设计与架构**
+- [`splitgateway.md`](splitgateway.md) — 分离网关架构说明
+- [`WiFi传输通道.md`](WiFi传输通道.md) — Wi-Fi/TCP 通道设计
+- [`compare.md`](compare.md) — Matter 与 Zigbee 对比
+
+**专题报告与实测记录**
 - [`DEVICE_INTEGRATION_REPORT.md`](DEVICE_INTEGRATION_REPORT.md) — 接入、定位与修复全记录
-- [`splitgateway.md`](splitgateway.md) / [`splitgateway_en.md`](splitgateway_en.md) — 架构说明
+- [`Wi-Fi通道-测试报告-2026-11-06.md`](Wi-Fi通道-测试报告-2026-11-06.md) — Wi-Fi 通道测试报告
+- [`ESPHome与本项目WiFi连接差异核对-2026-11-07.md`](ESPHome与本项目WiFi连接差异核对-2026-11-07.md) — 共存问题对照排查
+- [`OTA-调试记录-2026-10-26.md`](OTA-调试记录-2026-10-26.md) — 中继 OTA 调试记录
+
+**开发笔记**
+- [`devfindings.md`](devfindings.md) — 开发踩坑记录
+- [`otaflash.md`](otaflash.md) — OTA 刷机说明
 - [`zigbee2mqtt.md`](zigbee2mqtt.md) / [`esp32-c6_zigbee.md`](esp32-c6_zigbee.md) — 上游参考资料
+
+**变更与版本**
+- [`CHANGELOG.md`](CHANGELOG.md) — 变更日志（版本号与 add-on `config.json` 对齐）
+- [`host/database.md`](host/database.md) — 历史数据库表结构

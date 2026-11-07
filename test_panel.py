@@ -225,7 +225,7 @@ print("\n5) 陌生簇 / Read-Attributes 应答一律忽略")
 mq.pub.clear()
 ns["_ha_aps_action"](aps("0x07da", 16, "0x0006", "186c010000002001"))  # 这是应答
 ns["_ha_aps_action"](aps("0x07da", 16, "0x0001", "08000a35002000"))    # Power
-check("nichts publiziert", not mq.pub, str(mq.pub))
+check("没有发布任何消息", not mq.pub, str(mq.pub))
 
 print("\n6) 静默回读：3 次失败之后就记住了")
 ser.writes.clear(); mq.pub.clear()

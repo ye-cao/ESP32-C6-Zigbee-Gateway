@@ -197,7 +197,7 @@ def main():
         print("\n== 4. 通过 MQTT 问设备（probe）-> discovery ==")
         ha.publish(BASE + "/cmd/probe", "%s,%d" % (args.addr, ep))
         cfg = ha.find(disc_topic, timeout=15)
-        check("Discovery-Config fuer ep%d angekommen" % ep, cfg is not None, disc_topic)
+        check("ep%d 的 Discovery 配置已到达" % ep, cfg is not None, disc_topic)
         if cfg:
             check("state_topic korrekt", cfg.get("state_topic") == state_topic, cfg.get("state_topic"))
             check("command_topic korrekt", cfg.get("command_topic") == cmd_topic, cfg.get("command_topic"))

@@ -6,7 +6,35 @@
 
 > 语言约定：说明、注释、文档一律中文（专有名词与 API 名保留原文）。
 
-## [未发布]
+## [1.5.7] – 2026-11-07
+
+> **版本说明**：本版是 2026-11-07 全天工作的收尾版本。
+> `1.5.5` 引入 Wi-Fi 传输通道；`1.5.6` 是过渡版本（修复 USB 串口打不开）；
+> `1.5.7` 完成设备型号库升级与文档整理。三者共用同一套 JSON-Lines 协议，
+> 固件的 OTA 分区与 Zigbee 凭据在升级过程中保持不变，无需重新配网。
+
+### 本版概要（按主题归类）
+
+- **射频与固件**：注册 Wi-Fi ↔ 802.15.4 共存仲裁（升 IDF 5.5.2）、
+  修正 `threshold.authmode` 把同 SSID 多 AP 全滤掉、`wifi_scan` 不再踢断
+  已关联连接、启用 bootloader 回滚保护 + 首启 `mark_valid`、OTA 断流接管、
+  新增 `interview` 命令可手动重跑设备采访。
+- **传输通道**：串口/Wi-Fi 通道跟随（不再二选一）、心跳带 `who:"addon"`
+  身份标识；TCP 一次 `send` 失败不再立刻断链（200 ms → 800 ms、
+  连续 8 次才判定断开），并新增 `tcp_prev_down` 补报断连原因。
+- **实测**：协调器 Wi-Fi OTA 全流程跑通（1,333,232 B / 2 分 33 秒 /
+  约 10.5 KB/s，Zigbee 网络 `ch20 / pan=0xa311` 保持不变）；
+  中继器 OTA 链路打通并确认客户端会请求数据块（`src=0x8e4e`、`cmd=3`），
+  但因链路稳定性只传到几 KB，未完成整包升级。
+- **Add-on**：修复 `/api/permit_join`、`/api/tx_power`、`/api/lqi` 三个
+  按钮（原先只发 MQTT，C6 没有订阅方）、新增 `/api/cmd` 通用命令透传、
+  修复设备表「制造商/型号」列恒为 `–`、关闭容器内 `udev` 解决串口 EPERM。
+- **设备资料**：型号库从 Z2M v16.7.0 升到 **v26.128.0**，共 **4944 条**；
+  提取脚本加 `--src/--out`、旧键保护与人工补充表；新增 `/share` 免重建通道。
+- **构建**：固定 `PROJECT_VER` 去掉 git refs 依赖（增量编译 12 分钟 → 75 秒）、
+  并行度 8 → 16；清理残留德语注释与输出。
+
+以下为各主题的详细记录（按当天排查顺序保留，便于回溯）。
 
 ### 修复 – 固件（协调器 `main/`）
 
@@ -387,14 +415,15 @@ Add-on（`serial_gateway.py`）：
 说明该板 Wi-Fi 接收不工作（Zigbee 一切正常）。详见
 `Wi-Fi通道-测试报告-2026-11-06.md`。
 
-### 暂未做（下一步）
+### 当时未完成（后续状态）
 
-- **`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` 仍是关闭的。** 没有 USB 时，一份连不上
-  Wi-Fi 的固件就是砖。上生产前必须打开它并实现首启自检（Wi-Fi + TCP 都通了才
-  `mark_valid`）。本次**有意**不动：这个开关一旦打开，应用侧不同步实现
-  `mark_valid` 会导致每次 OTA 后都回滚。
-- 日志通道：拔掉 USB 后 `ESP_LOGI` 无人接收。需要时可把 console 挪到
-  UART0（GPIO16/17）接 USB-TTL。
+- ~~**`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` 仍是关闭的**~~ ——
+  **已在 1.5.7 完成**：`sdkconfig.defaults` 打开开关，`main.c` 在 Zigbee
+  启动、任务建好之后调用 `esp_ota_mark_app_valid_cancel_rollback()`，
+  Wi-Fi OTA 已有安全网（当天实刷验证通过）。
+- **仍未做**：日志通道。拔掉 USB 后 `ESP_LOGI` 无人接收；需要时可把
+  console 挪到 UART0（GPIO16/17）接 USB-TTL。开 `log_on` 时驱动日志会混进
+  TCP 数据流污染 JSON，仅宜短时排查。
 
 详见 `WiFi传输通道.md`。
 
