@@ -40,3 +40,4 @@ backup/
 build*/
 sdkconfig.*
 !sdkconfig.defaults
+_commit_msg.tmp
