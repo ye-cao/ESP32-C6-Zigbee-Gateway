@@ -1849,11 +1849,23 @@ static uint16_t s_nd_addr = 0xFFFF;
 static void node_desc_cb(esp_zb_zdp_status_t status, uint16_t addr,
                          esp_zb_af_node_desc_t *nd, void *user_ctx) {
     (void)user_ctx;
-    char line[192];
+    char line[288];
     if (status != ESP_ZB_ZDP_STATUS_SUCCESS || nd == NULL) {
+        /* ★ 2026-11-07：这条回执以前只报一个 error=0x85，看起来和「设备离线」
+         *   一模一样 —— 我据此误判过一次「设备不在网」，转头去查入网，
+         *   实际上设备好好的（拓扑里能拿到它的邻居表、lqi 也正常）。
+         *   0x85(TIMEOUT) 有两种成因，而回执里必须说清是哪一种的可能：
+         *     ① 设备真的不在网；
+         *     ② 设备固件只实现了必需的 ZDO 子集，**不响应 Node_Desc_req**
+         *        （不少开关类设备如此），但 Mgmt_Lqi_Req 照样能回。
+         *   所以把「该怎么进一步判断」直接写进回执，别再让人猜。 */
+        const char *hint = ((unsigned)status == 0x85)
+            ? "超时不等于离线：设备可能不实现 Node_Desc_req；请用拓扑或 Mgmt_Lqi 交叉判断"
+            : "ZDO 请求失败";
         snprintf(line, sizeof(line),
-                 "{\"t\":\"node_desc\",\"addr\":\"0x%04x\",\"error\":\"0x%02x\"}",
-                 addr, (unsigned)status);
+                 "{\"t\":\"node_desc\",\"addr\":\"0x%04x\",\"error\":\"0x%02x\","
+                 "\"hint\":\"%s\"}",
+                 addr, (unsigned)status, hint);
         ha_mqtt_emit_raw(line);
         return;
     }

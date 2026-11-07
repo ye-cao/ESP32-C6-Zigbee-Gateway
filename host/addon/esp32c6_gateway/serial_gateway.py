@@ -5126,19 +5126,55 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        # ★★★ 2026-11-07：下面这三条以前走 mq_put(f"{BASE}/cmd/…")，
+        #   而 **C6 固件里根本没有 MQTT 订阅**（`ha_mqtt.c` 里既没有
+        #   `esp_mqtt_client_subscribe` 也没有 `MQTT_EVENT_DATA` 分支）——
+        #   PUBLISH 出去的消息没有任何接收方，按钮点了等于没点。
+        #   实测代价：为了排查设备在不在网，我在 Web 上开了 180 s 入网窗口，
+        #   其实一条命令都没到芯片上，白等了三分钟还误判了一次。
+        #   现在统一走 ser.write()，和 /api/wifi_scan、/api/ota 一样。
         if path == "/api/permit_join":
-            secs = params.get("secs", ["0"])[0]
-            mq_put(f"{BASE}/cmd/permit_join", secs, qos=1)
-            print(f"[Web] permit_join {secs}s")
+            secs = params.get("secs", ["0"])[0].strip() or "0"
+            try:
+                secs_i = int(secs)
+            except ValueError:
+                secs_i = 0
+            ser.write(_js({"cmd": "permit_join", "secs": secs_i}).encode())
+            print(f"[Web] permit_join {secs_i}s（已下发到通道）")
 
         elif path == "/api/tx_power":
             dbm = params.get("dbm", [""])[0].strip()
-            mq_put(f"{BASE}/cmd/set_tx_power", dbm, qos=1)
-            print(f"[Web] set_tx_power {dbm} dBm（回读值稍后给出）")
+            body = {"cmd": "set_tx_power", "dbm": dbm}
+            try:
+                body["dbm"] = int(dbm)
+            except ValueError:
+                pass                      # 让 C6 自己判非法值并回错误
+            ser.write(_js(body).encode())
+            print(f"[Web] set_tx_power {dbm} dBm（已下发，回读值稍后给出）")
 
         elif path == "/api/lqi":
-            mq_put(f"{BASE}/cmd/lqi", "", qos=1)
-            print("[Web] 已请求一次 LQI 快照")
+            ser.write(b'{"cmd":"lqi"}\n')
+            print("[Web] 已请求一次 LQI 快照（已下发到通道）")
+
+        elif path == "/api/cmd":
+            # 通用命令透传：把一条 JSON 原样写进当前通道。
+            #   curl -X POST -d '{"cmd":"probe","addr":"0x8e4e","ep":1}' \
+            #        http://<addon>:8082/api/cmd
+            # 为什么需要它：Web UI 只硬编码了少数几个按钮，而 C6 支持的命令
+            # 有几十条（node_desc / probe / topo / read_onoff / dev_remove …）。
+            # 以前每查一次就得改一次脚本、重建一次镜像；有了这个口子，
+            # 排查时不用再动代码。
+            body = (params.get("json", [""])[0].strip()
+                    or raw.decode("utf-8", errors="replace").strip())
+            if body:
+                try:
+                    obj = json.loads(body)
+                    ser.write(_js(obj).encode())
+                    print(f"[Web] 命令透传 → {body}")
+                except (ValueError, TypeError) as e:
+                    print(f"[Web] /api/cmd JSON 解析失败：{e}；收到的是 {body[:120]}")
+            else:
+                print("[Web] /api/cmd 没收到内容（需要在 body 里给一条 JSON）")
 
         elif path == "/api/fw_ota":
             if ctype.startswith("multipart/form-data"):
