@@ -62,6 +62,16 @@ $ErrorActionPreference = "Continue"
 . "$IdfPath/export.ps1"
 $ErrorActionPreference = $prevErrPref
 
+# ★★ ccache：直接禁用（2026-11-07 实测）。
+#   原来保留 IDF 默认（启用 ccache）。但只要 sdkconfig 一动，所有编译参数就变，
+#   ccache 全部 miss —— 此时它不但不省时间，还要为每个文件算 hash、查/写缓存，
+#   实测降到 **3 个文件/分钟**（1066 个目标要 5 小时）。关掉后 ccache.exe 变成
+#   纯透传，开销可忽略。
+#   正常增量改代码时 ccache 是有用的，但那种场景本来只要几分钟，得失不敏感；
+#   而全量重编（改 sdkconfig / 换 IDF 版本）才是真痛的地方。
+#   要恢复：把下面这行注释掉即可。
+$env:CCACHE_DISABLE = "1"
+
 # ccache 保持 IDF 默认行为：不改 CCACHE_SLOPPINESS、不改缓存 hash 规则。
 # 这样并行与否只影响调度顺序，不改变任何编译输入 → 产物字节一致。
 # 只固定缓存目录，避免不同终端会话落到不同默认路径而白白 miss。
@@ -79,6 +89,25 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 #   成败一律由下面的 $LASTEXITCODE 判定，不靠这个开关。
 $prevEapBuild = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
+
+# ★★ 构建期间摘掉代理变量。
+#   本机 shell 里常驻 HTTP_PROXY/HTTPS_PROXY=127.0.0.1:<port>（WorkBuddy 的
+#   本地代理）。CMake 的组件管理器（idf_component_manager）在配置阶段会去
+#   联网检查依赖，走这个代理就会**死等**——现象是 "-- Configuring done"
+#   之后十几分钟一个字都不输出、build.ninja 一个字节都不更新，ninja 进程
+#   在但只用了 0.2 s CPU。2026-11-07 就是这样白等了 19 分钟。
+#   依赖早已在 managed_components/ 里，构建根本不需要网络，摘掉最稳。
+#   同时关掉生成期的组件在线检查（IDF_COMPONENT_CHECK_ON_BUILD），
+#   双保险。
+$__savedProxy = @{}
+foreach ($n in @("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","ALL_PROXY","all_proxy")) {
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($null -ne $v) {
+        $__savedProxy[$n] = $v
+        [Environment]::SetEnvironmentVariable($n, $null)
+    }
+}
+$env:IDF_COMPONENT_CHECK_ON_BUILD = "0"
 try {
     # ── 3. 只做一次配置 + 构建 ──────────────────────────────────────────
     # cmake --build 会自己处理 build.ninja 里的 RERUN_CMAKE 目标，
@@ -134,5 +163,9 @@ try {
 }
 finally {
     $ErrorActionPreference = $prevEapBuild
+    # 还原代理变量，别污染这个 shell 后续的联网命令
+    foreach ($k in $__savedProxy.Keys) {
+        [Environment]::SetEnvironmentVariable($k, $__savedProxy[$k])
+    }
     Pop-Location
 }

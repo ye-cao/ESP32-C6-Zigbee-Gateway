@@ -29,6 +29,18 @@ void ha_mqtt_set_cmd_cb(mqtt_cmd_cb_t cb);
  *   命令解析只允许存在一份，否则「两处只改一处」的老毛病会立刻回来。 */
 void ha_mqtt_handle_line(char *buf);
 
+/* ── 通道跟随（2026-11-07）───────────────────────────────────────────────
+ * 两条通道同时在线，但**只往 add-on 实际挂着的那条发**：
+ * 哪个通道最近收到过命令，就往哪个发；两边都没动静（或开机还没收到过）
+ * 才退回双发。这样 add-on 用 --link serial 还是 tcp 都不需要改 C6 任何配置，
+ * 切换后最多一个心跳周期（5 s）就自动跟上。
+ *
+ * 每个接收点解析出一整行之前调一次 note_link，标注这行是从哪来的：
+ *   · net_link.c 的 TCP 收包循环 → NET_LINK_TCP
+ *   · ha_mqtt.c 的 rx_task（USB-Serial-JTAG）→ NET_LINK_UART
+ * 注意这些值要和 net_link.h 的 NET_LINK_* 一致（0/1）。 */
+void ha_mqtt_note_link(uint8_t link);
+
 void ha_mqtt_publish_zigbee(uint16_t addr,
                              const char *subtopic,
                              const char *payload);

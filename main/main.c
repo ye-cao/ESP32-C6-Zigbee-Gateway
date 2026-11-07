@@ -409,18 +409,38 @@ void app_main(void) {
      * 会把新镜像标成 PENDING_VERIFY。开了 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
      * 之后，如果应用不在这里确认，下次启动 bootloader 就会回滚到旧镜像 ——
      * 表现是「OTA 明明成功了，重启又变回旧固件」。
-     * 放在 app_main 末尾：Zigbee 已启动、心跳和按键任务都建起来了，说明这份
-     * 镜像至少能正常跑到主流程末尾，可以确认健康。 */
+     *
+     * ★ 2026-11-07：判据按通道分开，别再一律认定「跑到这里就算健康」。
+     *   Wi-Fi OTA 最需要回滚救的恰恰是「固件能启动、但网络不通」这一类：
+     *   那种情况下设备既不能被远程访问，也不会自己退回去，只能拆机插 USB。
+     *   · tr=TCP（Wi-Fi 通道）：必须**真的连上 add-on** 才标记有效，最多等 60 s；
+     *     等不到就不标记 —— 下次重启 bootloader 自动回滚到旧镜像。
+     *   · tr=UART（串口通道）：没有网络可依赖，跑到这里就算健康，直接标记。
+     *     （不能也等网络，否则串口模式永远不标记，每次重启都白回滚一遍。） */
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
     if (running &&
         esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
         ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-        esp_err_t mr = esp_ota_mark_app_valid_cancel_rollback();
-        if (mr != ESP_OK) {
-            ESP_LOGE(TAG, "首启自检：标记镜像有效失败 %s", esp_err_to_name(mr));
-        } else {
-            ESP_LOGI(TAG, "首启自检通过：镜像已标记有效，取消 OTA 回滚");
+        bool healthy = true;
+        if (net_link_transport() == NET_LINK_TCP) {
+            healthy = false;
+            for (int i = 0; i < 120; i++) {          /* 120 × 500 ms = 60 s */
+                if (net_link_ready()) { healthy = true; break; }
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (!healthy) {
+                ESP_LOGE(TAG, "首启自检失败：60 s 内没连上 add-on（tr=TCP）"
+                              " → 不标记有效，下次重启将回滚到旧镜像");
+            }
+        }
+        if (healthy) {
+            esp_err_t mr = esp_ota_mark_app_valid_cancel_rollback();
+            if (mr != ESP_OK) {
+                ESP_LOGE(TAG, "首启自检：标记镜像有效失败 %s", esp_err_to_name(mr));
+            } else {
+                ESP_LOGI(TAG, "首启自检通过：镜像已标记有效，取消 OTA 回滚");
+            }
         }
     }
 }

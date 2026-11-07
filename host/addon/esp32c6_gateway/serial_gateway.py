@@ -187,6 +187,11 @@ def _state_view() -> dict:
         s["status"] = "offline"
     s["c6_age_s"] = (round(time.monotonic() - _last_c6_ts, 1)
                      if _last_c6_ts > 0 else None)
+    # 通道跟随的可观测性：link_echo 是 C6 自报「把命令归到了哪条通道」，
+    # 也就是它接下来会把上报往哪发；hb_age_s 太久说明心跳没到（通道断了）。
+    s["link_echo"] = _hb_link_echo
+    s["hb_age_s"] = (round(time.monotonic() - _hb_last_pong, 1)
+                     if _hb_last_pong > 0 else None)
     return s
 
 
@@ -270,6 +275,42 @@ _fw_ota_off  = 0
 _gw_boot_ts = 0.0
 _GW_BOOT_COOLDOWN = 8.0
 _fw_ota_restarts = 0
+
+# ── 通道心跳：C6 的「通道跟随」靠它定位 ────────────────────────────────────
+# C6 的规则是「哪个通道最近收到过命令，就把上报往哪个通道发」（20 s 窗口）。
+# add-on 每 5 s 说一句 {"cmd":"ping"}，就能把当前通道一直钉住 —— 于是
+# `--link serial` 和 `--link tcp` 都不用改 C6 的 NVS，切换后最多一个周期
+# 就自动跟上，不会出现「换了端口、数据还往老通道发」这种哑火。
+_HB_INTERVAL_S = 5.0
+_hb_last_pong  = 0.0     # time.monotonic()；0 = 本次启动以来还没收到过
+_hb_link_echo  = ""      # C6 回执里报的通道：uart / tcp
+_hb_sent       = 0
+_hb_started    = False
+
+
+def _hb_loop():
+    global _hb_sent
+    while True:
+        time.sleep(_HB_INTERVAL_S)
+        try:
+            # OTA 传输期间不插话：那边每批都有 st="write" 回执，通道已经明确，
+            # 再挤一行只会白占带宽、还可能插进 fw_ota_data 中间。
+            if _fw_ota_file is not None:
+                continue
+            ser.write(b'{"cmd":"ping"}\n')
+            _hb_sent += 1
+        except Exception:                  # noqa: BLE001
+            pass                           # 通道断着就等下一轮，不刷屏
+
+
+def _hb_start():
+    global _hb_started
+    if _hb_started:
+        return
+    _hb_started = True
+    threading.Thread(target=_hb_loop, daemon=True).start()
+    print(f"[HB] 通道心跳已启动：每 {_HB_INTERVAL_S:.0f} s 一次"
+          f"（C6 据此选择上报通道）")
 
 
 def _env_int(name, default, lo, hi):
@@ -3874,6 +3915,14 @@ def dispatch(line: str):
                   f"({_fw_ota_restarts}/3): {fw['bin_path']}")
             threading.Timer(4.0, _fw_ota_start, (fw["bin_path"],)).start()
 
+    elif t == "pong":
+        # C6 对心跳的回执。`link` 说明它把这条命令归到了哪条通道 ——
+        # 也就是它之后会把上报往哪条发。切过通道 5 s 内这里就会跟着变。
+        global _hb_last_pong, _hb_link_echo
+        _hb_last_pong = time.monotonic()
+        _hb_link_echo = msg.get("link", "?")
+        return
+
     elif t == "vitals":
         p = msg.get("p")
         if p:
@@ -4199,18 +4248,18 @@ def dispatch(line: str):
             written = msg.get("written")
             if isinstance(written, int) and written != _fw_ota_size:
                 print(f"[OTA] 警告：已写 {written} B，文件 {_fw_ota_size} B "
-                      f"(Differenz {written - _fw_ota_size:+d} B)")
+                      f"（差 {written - _fw_ota_size:+d} B）")
             print("[OTA] 协调器：更新完成 —— 重启中 …")
             with _state_lock:
                 _state["fw_ota"]["status"] = "done"
             _fw_ota_close()
         elif st == "error":
             why = msg.get("why")
-            print(f"[OTA] coordinator 出错：{why}")
+            print(f"[OTA] 协调器出错：{why}")
             if why == "busy":
-                print("[OTA] C6 里还卡着一个中断的传输 "
-                      "（s_active=true）。必须重启 C6，"
-                      "才能再试一次。")
+                print("[OTA] C6 那边还有一个没结束的会话（s_active=true）。"
+                      "新固件会在断流 120 s 后自动接管旧会话，等一下再点一次即可；"
+                      "老固件只能重启 C6。")
             with _state_lock:
                 _state["fw_ota"]["status"] = "error"
             _fw_ota_close()
@@ -5190,6 +5239,9 @@ mq.connect(args.broker, args.mqport, keepalive=60)
 mq.loop_start()
 
 threading.Thread(target=_run_web, daemon=True).start()
+# 通道心跳：C6 靠「最近从哪条通道收到命令」决定上报往哪发。
+# 没有它，C6 在两条通道都静默时就只能双发；有了它，一条通道双向都能用。
+_hb_start()
 # 型号补读：入网那次没读到 Basic 的设备，定期补问（指数退避，读到就停）
 threading.Thread(target=_model_backfill_task, daemon=True).start()
 # 拓扑自动采集：让拓扑页像 HA 的 BLE 图那样自己更新，不用手点刷新

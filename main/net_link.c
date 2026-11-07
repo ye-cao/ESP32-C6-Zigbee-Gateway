@@ -428,7 +428,11 @@ static void feed_bytes(const char *data, int len, char *acc, size_t *acc_len) {
                 acc[--(*acc_len)] = '\0';
             }
             acc[*acc_len] = '\0';
-            if (*acc_len) ha_mqtt_handle_line(acc);
+            if (*acc_len) {
+                /* 标注来源：这一行是从 TCP 来的 ⇒ 以后就往 TCP 发（通道跟随）。 */
+                ha_mqtt_note_link(NET_LINK_TCP);
+                ha_mqtt_handle_line(acc);
+            }
             *acc_len = 0;
         } else if (*acc_len < MAX_LINE - 1) {
             acc[(*acc_len)++] = c;

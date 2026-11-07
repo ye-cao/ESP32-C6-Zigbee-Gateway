@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/usb_serial_jtag.h"
 #include "ha_mqtt.h"
 #include "net_link.h"
@@ -44,6 +45,24 @@ static mqtt_cmd_cb_t     s_cmd_cb   = NULL;
 static QueueHandle_t     s_tx_q      = NULL;
 static volatile uint32_t s_tx_drop   = 0;
 
+/* ★★★ 2026-11-07：输出改为「通道跟随」，不再看 tr 配置二选一。
+ *
+ * 原实现是：transport == TCP 时只写 socket，写成功就一个字都不发串口。
+ * 于是 add-on 切到 TCP 之后，USB 那根线只剩供电 —— 设备连不上 Wi-Fi 时
+ * 连个能看的通道都没有，而 OTA 恰恰最需要这条保底通道。
+ *
+ * 现在两条通道同时保持在线，但**只往 add-on 实际挂着的那条发**：
+ * 记住最近一次「从哪条通道收到命令」，就往那条发。add-on 每 5 s 一次心跳
+ * 就能把这个判断钉死；切换通道后最多一个心跳周期就自动跟上。
+ * 两边都超时（或开机还没收到过任何命令）→ 退回双发，宁可多一份也不漏。
+ *
+ * 为什么不靠 usb_serial_jtag_is_connected() 判断串口：它只能说明 USB 主机
+ * 插着（SOF 包），说明不了「有没有进程在读」。插着线却没人读时，阻塞写会
+ * 把 tx_task 永久卡死（VFS 的 tx timeout 是 portMAX_DELAY）。 */
+#define LINK_FOLLOW_US   (20LL * 1000 * 1000)   /* 20 s 内有输入才算活跃 */
+static volatile uint8_t s_rx_link    = 0xFF;   /* 0xFF = 还不知道 */
+static volatile int64_t s_rx_link_us = 0;
+
 static int null_vprintf(const char *fmt, va_list args) {
     (void)fmt; (void)args;
     return 0;
@@ -66,6 +85,24 @@ void ha_mqtt_log_verbose(bool on) {
     }
 }
 
+/* 标注「这一行是从哪条通道来的」。TCP 收包循环和串口 rx_task 各自调用。 */
+void ha_mqtt_note_link(uint8_t link) {
+    if (link > NET_LINK_TCP) return;
+    s_rx_link    = link;
+    s_rx_link_us = esp_timer_get_time();
+}
+
+/* 当前该往哪条通道发：返回 NET_LINK_UART / NET_LINK_TCP；0xFF 表示
+ * 「不确定，两条都发」。 */
+static uint8_t active_link(void) {
+    uint8_t l = s_rx_link;
+    if (l > NET_LINK_TCP) return 0xFF;                    /* 还没收到过任何命令 */
+    if (esp_timer_get_time() - s_rx_link_us > LINK_FOLLOW_US) {
+        return 0xFF;                                       /* 两条都静了：双发保底 */
+    }
+    return l;
+}
+
 static void tx_task(void *arg) {
     (void)arg;
     char *line = NULL;
@@ -73,25 +110,27 @@ static void tx_task(void *arg) {
         if (xQueueReceive(s_tx_q, &line, portMAX_DELAY) != pdTRUE) continue;
         if (!line) continue;
 
-        /* 先试 Wi-Fi（TCP）。没配 Wi-Fi、或者恰好在断线重连，都会返回非 OK。 */
-        bool sent = false;
-        if (net_link_transport() == NET_LINK_TCP) {
-            sent = (net_link_send_line(line) == ESP_OK);
+        uint8_t link = active_link();
+
+        /* ① Wi-Fi/TCP：能发就发，失败（未连接/正在重连）不再触发串口回退 —— */
+        /*    两条通道是并存关系，走哪条由 link 决定。 */
+        if ((link == NET_LINK_TCP || link == 0xFF) &&
+            net_link_transport() == NET_LINK_TCP) {
+            (void)net_link_send_line(line);
         }
 
-        if (!sent) {
-            /* ★★ 串口回退必须带 is_connected() 判断。
-             * USB-Serial-JTAG 的 VFS 写路径在没有主机时是
-             *     timeout = s_ctx.non_blocking ? 0 : portMAX_DELAY;
-             * 也就是**永久阻塞**——FIFO 满了以后再也排不出去。
-             * 拔掉 USB 之后如果还无脑 fputs()，tx_task 就会永久卡死，
-             * 整条上报链路静默失效（表现是「拔线后网页全空，但设备还在
-             * 联网」）。is_connected() 靠 SOF 包判断主机在不在，正好治这个。 */
-            if (usb_serial_jtag_is_connected()) {
-                fputs(line, stdout);
-                fputc('\n', stdout);
-                fflush(stdout);
-            }
+        /* ② 串口。★ 必须带 is_connected()：USB-Serial-JTAG 的 VFS 写路径在没有
+         *    主机时是 portMAX_DELAY 永久阻塞（usb_serial_jtag_vfs.c 里那行
+         *    `timeout = s_ctx.non_blocking ? 0 : portMAX_DELAY`），FIFO 一满
+         *    tx_task 就永久卡死，整条上报链路静默失效 —— 历史上表现成
+         *    「拔线后网页全空，但设备还在联网」。
+         *    这里只在「add-on 明确挂着串口」或「两条都静默」时才写，
+         *    所以正常情况下不会往一个没人读的串口白写。 */
+        if ((link == NET_LINK_UART || link == 0xFF) &&
+            usb_serial_jtag_is_connected()) {
+            fputs(line, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
         }
         free(line);
     }
@@ -172,6 +211,8 @@ static void rx_task(void *arg) {
             acc_len = 0;
         }
         if (n == 0) continue;
+        /* 标注来源：这一行是从串口来的 ⇒ 以后就往串口发（通道跟随）。 */
+        ha_mqtt_note_link(NET_LINK_UART);
         ha_mqtt_handle_line(buf);
     }
 }
@@ -229,6 +270,22 @@ void ha_mqtt_handle_line(char *buf) {
         }
         payload[pos] = '\0';
         s_cmd_cb("net_cfg", payload, (int)pos);
+        return;
+    }
+    /* 心跳：add-on 每 5 s 发一次 {"cmd":"ping"}，用来钉住「它到底挂在哪条
+     * 通道上」—— 这就是通道跟随的判据来源。
+     * ★ 必须排在 net_cfg 之后：net_cfg 的载荷是用户填的 SSID/密码，完全可能
+     *   含上面那四个字母，让它先认才不会把配置命令劫持成心跳。
+     * ★ 用带引号的 "ping" 匹配，不用裸 ping：命令链里大量无引号 strstr，
+     *   裸关键字太容易误伤（比如以后加个 "pingpong" 之类的字段）。
+     * 回 {"t":"pong","link":…} 让 add-on 能确认跟随是否生效。 */
+    if (strstr(buf, "\"ping\"")) {
+        char out[96];
+        snprintf(out, sizeof(out),
+                 "{\"t\":\"pong\",\"link\":\"%s\",\"up\":%lu}",
+                 (s_rx_link == NET_LINK_TCP) ? "tcp" : "uart",
+                 (unsigned long)(esp_timer_get_time() / 1000000));
+        ha_mqtt_emit_raw(out);
         return;
     }
     if (strstr(buf, "net_status")) {

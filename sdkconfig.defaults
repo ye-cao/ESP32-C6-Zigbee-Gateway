@@ -39,11 +39,13 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 # 后，应用必须在首启确认健康，否则 bootloader 会回滚回旧镜像。
 # main.c::app_main() 末尾已经实现首启自检（仅在 PENDING_VERIFY 时调用
 # esp_ota_mark_app_valid_cancel_rollback()），代码与开关解耦，随时可以启用。
-# ★ 2026-11-07 暂不开启的原因：改 sdkconfig 会让 IDF 重新生成 sdkconfig.h，
-#   触发 1030 个 obj 的全量重编译；本机 Windows Defender 实时扫描下实测
-#   20 分钟只推进 19 个 obj，构建不可控。等能关掉实时防护或换构建机再启用。
-#   启用前请确认 bootloader.bin 也一起重新刷写，否则只有应用侧逻辑生效。
-# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# ★ 2026-11-07 启用。原先暂缓的理由是「改 sdkconfig 会触发全量重编、本机不可控」，
+#   现在编译慢的真凶已修掉（depfile 阻塞 + 脚本假失败），增量实测 3.6 s/目标，
+#   而 Wi-Fi OTA 要成为常规升级方式，**必须有回滚兜底**：
+#   没有它，新镜像只要「能通过校验但起不来」，就再没有远程通道，只能拆机插 USB。
+# ★ 启用后 bootloader 行为也变，必须把 bootloader.bin 一起刷到 0x0，
+#   只做 App 级 OTA 不会更新 bootloader，回滚逻辑就不会生效。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 
