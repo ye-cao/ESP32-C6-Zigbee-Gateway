@@ -44,7 +44,12 @@ $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ── 1. 并行度 ────────────────────────────────────────────────────────────
 $cores = [Environment]::ProcessorCount
-if ($Jobs -le 0) { $Jobs = [Math]::Min($cores, 8) }
+# ★ 2026-11-07：上限从 8 提到 16（= 逻辑核数）。
+#   原先保守取 8，理由是「多个 gcc 同时删 .obj.d 会撞瞬时文件锁」——但那个
+#   问题已经被两件事消掉了：① ninja 的 `deps = gcc` 规则已移除（不再删
+#   depfile）；② ccache 已禁用（不再多一层文件操作）。
+#   实测 16 并行下全量编译稳定，产物与 -j 8 完全一致（只影响调度顺序）。
+if ($Jobs -le 0) { $Jobs = [Math]::Min($cores, 16) }
 if ($Jobs -gt $cores) {
     Write-Warning "并行数 $Jobs 超过逻辑核数 $cores，可能引起调度争抢；建议 <= $cores"
 }

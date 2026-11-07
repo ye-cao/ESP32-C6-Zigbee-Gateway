@@ -20,9 +20,10 @@ CONFIG_ESP_COEX_ENABLED=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_LWIP_MAX_SOCKETS=10
-# ★ 原来的 CONFIG_ESP_WIFI_SW_COEXIST_ENABLE 是旧符号，IDF 会提示
-#   "was replaced with CONFIG_ESP_COEX_SW_COEXIST_ENABLE"，5.5.2 起已不存在，
-#   保留只会产生无意义的警告，故删除（效果由上面那一项覆盖）。
+# ★ 旧符号 ESP_WIFI_SW_COEXIST 已于 5.5.2 移除，效果由上面
+#   CONFIG_ESP_COEX_SW_COEXIST_ENABLE 覆盖。
+#   （这里刻意不写出旧符号的完整名字：kconfig 扫描本文件时会把注释里的
+#    符号名也当成一条配置，于是每次配置都刷一句 "was replaced with …"。）
 
 # ★★★ WPA3-SAE 必须显式编进来，而且必须写在这个文件里。
 #   sdkconfig 是 .gitignore 掉的，只在本地有效 —— 换台机器干净构建就会丢掉

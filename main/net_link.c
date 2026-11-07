@@ -76,6 +76,8 @@ static SemaphoreHandle_t s_lock;   /* 保护 s_sock / s_tcp_up */
 static EventGroupHandle_t s_ev;
 
 static volatile bool     s_tcp_up = false;
+/* 连续 send 失败计数 —— 单次失败只可能是瞬时拥塞，累计到阈值才判定断链。 */
+static volatile int      s_send_fail = 0;
 static int               s_sock   = -1;
 static char              s_ip[20] = "0.0.0.0";
 static volatile uint32_t s_cfg_gen = 0;   /* 配置代次：变了就重新下发 */
@@ -414,13 +416,20 @@ static int tcp_connect(const char *host, uint16_t port) {
         }
     }
 
-    /* 恢复阻塞；但给写操作 200 ms 上限 —— tx_task 里绝不能无限等 */
+    /* 恢复阻塞；但给写操作 800 ms 上限 —— tx_task 里绝不能无限等。
+     * ★ 2026-11-07：原来只有 200 ms。实测 RSSI -54~-63（信号很好）却每
+     *   15~100 秒断一次、端口号一直变，因为 add-on 主循环每收到一行都要
+     *   print + MQTT publish，稍慢一点就把 socket 缓冲填满，send 在 200 ms
+     *   内发不完 → 被当成链路故障 → shutdown 重连。命令正好赶在断连那一下
+     *   发出就丢了（用户报的"操作设备回报有时候上报不了"）。
+     *   800 ms 给对端留出余地，配合下面 net_link_send_line 的失败计数。 */
     fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    struct timeval snd = { .tv_sec = 0, .tv_usec = 200000 };
+    struct timeval snd = { .tv_sec = 0, .tv_usec = 800000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
+    s_send_fail = 0;      /* 新连接：把上一次的失败计数清掉 */
     return fd;
 }
 
@@ -638,10 +647,22 @@ esp_err_t net_link_send_line(const char *line) {
             r = ESP_OK;
         }
         if (r != ESP_OK) {
-            /* 写坏了（对端没了 / 主机重启）：立刻 shutdown 把 recv 也唤醒，
-             * 让 net_task 走重连流程，而不是干等 60 s 的心跳超时。 */
-            s_tcp_up = false;
-            shutdown(fd, SHUT_RDWR);
+            /* ★★ 2026-11-07：一次 send 失败**不再**立刻判定链路死了。
+             *   原来的写法是失败就 s_tcp_up=false + shutdown，把瞬时拥塞
+             *   （对端读得慢、Wi-Fi 抖动）当成了断线。后果：
+             *     · 每 15~100 秒断一次，源端口号一直变；
+             *     · 每次重连都补发 {"t":"boot"}，add-on 以为设备反复重启；
+             *     · 正好在断连瞬间发出的命令直接丢失 —— 这就是"操作设备
+             *       回报有时候上报不了"的真正原因。
+             *   现在改成连续多次失败才认定链路坏了；单次失败只计数。
+             *   真断线时 send 会持续失败，几次之内还是会断开重连，不会僵着。 */
+            if (++s_send_fail >= 8) {
+                s_send_fail = 0;
+                s_tcp_up = false;
+                shutdown(fd, SHUT_RDWR);
+            }
+        } else {
+            s_send_fail = 0;
         }
     }
     xSemaphoreGive(s_lock);
