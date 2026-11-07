@@ -71,6 +71,14 @@ if (-not $env:CCACHE_DIR) {
 
 Push-Location $projectDir
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+# ★ 整个构建段内必须把 ErrorActionPreference 降成 Continue：
+#   PowerShell 5.1 会把原生命令写到 stderr 的**任何**一行包装成
+#   NativeCommandError，在 Stop 下直接终止脚本。而 cmake/ninja 经常往
+#   stderr 打正常提示（典型："Symbol ZB_ENABLED defined in multiple
+#   locations" 这类 INFO），于是出现「构建立刻失败、其实一步都没编」。
+#   成败一律由下面的 $LASTEXITCODE 判定，不靠这个开关。
+$prevEapBuild = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 try {
     # ── 3. 只做一次配置 + 构建 ──────────────────────────────────────────
     # cmake --build 会自己处理 build.ninja 里的 RERUN_CMAKE 目标，
@@ -93,13 +101,21 @@ try {
     # ── 4. 一致性校验：再跑一次必须 no-op ─────────────────────────────
     # 若这里还有目标被重编，说明依赖图被并发破坏或出现了重复编译。
     Write-Host "`n[2/2] 增量一致性校验（期望 no work to do）…"
-    $verify = & cmake --build $BuildDir --parallel $Jobs 2>&1
-    $verify | ForEach-Object { Write-Host $_ }
+    # 不要用 `2>&1` 捕获：在 5.1 下它会把 stderr 行转成 ErrorRecord，
+    # 既污染输出，也会让 $LASTEXITCODE 的语义变得难以确认。
+    & cmake --build $BuildDir --parallel $Jobs
     $vrc = $LASTEXITCODE
     if ($vrc -ne 0) { throw "一致性校验构建失败，退出码 $vrc" }
 
     $sw.Stop()
-    $bin = Join-Path $projectDir "$BuildDir/zigbee-vital-sensor.bin"
+    # ★ BuildDir 可能是绝对路径（例如 -BuildDir C:/Temp/b552x）。
+    #   Join-Path 遇到绝对的第二段会把它当成相对路径拼到 $projectDir 后面，
+    #   于是打印出 "…\esp32c6-zigbee\C:\Temp\b552x\…" 这种不存在的路径，
+    #   编译明明成功了却报「找不到产物」。先判一次是否已是绝对路径。
+    $bin = "$BuildDir/zigbee-vital-sensor.bin"
+    if (-not [System.IO.Path]::IsPathRooted($bin)) {
+        $bin = Join-Path $projectDir $bin
+    }
     Write-Host "`n耗时 : $([Math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
     if (Test-Path $bin) {
         $f = Get-Item $bin
@@ -108,11 +124,15 @@ try {
         throw "构建结束但找不到产物 $bin"
     }
 
-    $elf = Join-Path $projectDir "$BuildDir/zigbee-vital-sensor.elf"
+    $elf = "$BuildDir/zigbee-vital-sensor.elf"
+    if (-not [System.IO.Path]::IsPathRooted($elf)) {
+        $elf = Join-Path $projectDir $elf
+    }
     if (Test-Path $elf) {
         Write-Host "ELF  : $elf"
     }
 }
 finally {
+    $ErrorActionPreference = $prevEapBuild
     Pop-Location
 }

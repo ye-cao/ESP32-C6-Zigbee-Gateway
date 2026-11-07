@@ -28,11 +28,22 @@
   但串口模式 `tr=0` 下 `net_task` 根本没启动 ⇒ 实测 `why=8`（ASSOC_LEAVE）、
   ARP 消失、网关离线。现改为：已关联时只扫当前 AP 信道（短驻留、不断开），
   未关联时保持全信道扫描；回执新增 `"attached"` 说明扫的是哪一种。
+- **OTA 会话断流后会永久卡在 `busy`。** `serial_ota.c` 的 `s_active` 原本没有任何
+  超时，Wi‑Fi/TCP 通道一旦中途断开（对端掉线、add-on 重启、路由器踢客），
+  `esp_ota` 句柄就一直挂着，之后所有 `fw_ota_start` 都回 `{"why":"busy"}`，
+  只能重启 C6 才能再刷。现在记录最后一次成功写入的时刻 `s_last_us`，新会话到来时
+  若已断流超过 120 s（`FW_STALE_US`）就直接 `esp_ota_abort()` 接管旧会话 ——
+  不需要再重启设备。
 - **OTA 后可能回滚。** `serial_ota.c` 用标准 `esp_ota_*`，
-  `esp_ota_set_boot_partition()` 会把新镜像标成 `PENDING_VERIFY`；此前未开启
-  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`，也没有首启确认逻辑。现在开启该配置，
-  并在 `app_main()` 末尾（Zigbee 已启动、任务已建）确认健康后调用
-  `esp_ota_mark_app_valid_cancel_rollback()`，避免「OTA 成功但重启回旧固件」。
+  `esp_ota_set_boot_partition()` 会把新镜像标成 `PENDING_VERIFY`；
+  `app_main()` 末尾已补上首启确认逻辑（Zigbee 已启动、任务已建之后调用
+  `esp_ota_mark_app_valid_cancel_rollback()`），避免「OTA 成功但重启回旧固件」。
+  ⚠ **但 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` 目前仍是注释状态**（`sdkconfig`
+  里为 `is not set`），所以 bootloader 并不会真的回滚 —— 那段 mark_valid 代码
+  实际是 no-op。启用它需要重编 bootloader 并重刷 `0x0`，还要让 app 全量重编
+  （sdkconfig 一变就全废），代价不小，故留作**走 Wi‑Fi OTA 之前必须先做的一步**。
+  在开关打开之前，Wi‑Fi OTA 若遇到「镜像校验通过但起不来」的情况没有回滚保护，
+  只能插 USB 救回。
 
 ### 变更 – 构建（**IDF 5.5.1 → 5.5.2，根因的最后一块**）
 
@@ -82,6 +93,21 @@
   ninja 判定全部目标重编、多个 ninja 实例抢 `.ninja_lock`、以及 `deps = gcc`
   让 ninja 编译后删除 depfile 时被文件监控拦住（`Access is denied`）。
   全量 1066 目标最终耗时约 86 分钟。
+- **修掉 `build.ps1` 两个会「假失败」的缺陷**（都是实测踩到的，不是理论问题）：
+  ① **cmake 往 stderr 打一行 INFO 就被当成致命异常。** PowerShell 5.1 会把原生命令
+  的 stderr 包装成 `NativeCommandError`，在外层 `$ErrorActionPreference=Stop` 下直接
+  终止脚本 —— 现象是「运行 6 分 46 秒后失败，其实一个文件都没编」。cmake 的
+  `Symbol ZB_ENABLED defined in multiple locations` 正好是这种 INFO。
+  现在整个构建段内降级为 `Continue`，成败只看 `$LASTEXITCODE`（脚本本来就这么判断的）。
+  ② **`-BuildDir` 传绝对路径时，最后那句产物检查必然失败。** `Join-Path` 会把
+  `C:/Temp/b552x/...` 当成相对路径拼到项目目录后面，于是打印
+  `…\esp32c6-zigbee\C:\Temp\b552x\zigbee-vital-sensor.bin` 这种不存在的路径，
+  编译成功却报「找不到产物」。现在先判 `IsPathRooted` 再拼。
+- **本次实测（增量，只改了 `serial_ota.c/.h`）**：43 个目标 → **13.6 分钟**
+  （其中 bootloader reconfigure 占 106 秒）；随后 `-VerifyOnly` 校验 **3 秒零重编**。
+  镜像 `1331168 B`，分区 `0x1c0000`，剩余 `0x7b020`（27%）。
+  bootloader 也已重编为 5.5.2 版本（`0x5840 B`），此前一直是「5.5.1 bootloader +
+  5.5.2 app」的混搭。
 
 ### 运维 – Zigbee 网络凭据的备份与恢复（实测可用）
 

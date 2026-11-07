@@ -158,6 +158,38 @@ try:
 except Exception as _e:
     print(f"[HA] 警告：device_db.json 载入失败（{_e}）—— 只用通用 Discovery")
 
+# ── C6 链路存活判定 ────────────────────────────────────────────────────────
+# ★ 2026-11-07 修复：以前 _state["status"] 只在收到 boot / heartbeat 时被置
+#   "online"，从此再也不会变回 "offline" —— 结果 Web 页上「协调器在线」那个
+#   徽标只要连过一次就永远是绿的：拔掉串口、TCP 断开、C6 断电，它照样显示
+#   在线。排查时非常误导（会让人误以为链路没问题，转头去怀疑射频）。
+#   现在改用「最近一次收到 C6 消息的时刻」做判据：C6 每 60 s 发一次心跳，
+#   超过 2 个周期（130 s）没消息就判离线；链路断开的地方还会立即置一次，
+#   不必干等超时。
+_last_c6_ts = 0.0          # time.monotonic()；0 = 本次启动以来还没收到过
+C6_STALE_S  = 130.0        # 心跳 60 s × 2 + 10 s 余量
+
+
+def _c6_alive() -> bool:
+    """C6 是否还在正常说话（收到过消息，且没超过 2 个心跳周期）。"""
+    return _last_c6_ts > 0 and (time.monotonic() - _last_c6_ts) < C6_STALE_S
+
+
+def _state_view() -> dict:
+    """给页面和 /api/state 用的状态快照。
+
+    只修正 status 并补一个 c6_age_s，**不改 _state 本身** —— 免得跟
+    dispatch() 里的写入互相打架。
+    """
+    with _state_lock:
+        s = json.loads(json.dumps(_state))
+    if s.get("status") == "online" and not _c6_alive():
+        s["status"] = "offline"
+    s["c6_age_s"] = (round(time.monotonic() - _last_c6_ts, 1)
+                     if _last_c6_ts > 0 else None)
+    return s
+
+
 # ── In-Memory State ────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 _state = {
@@ -376,7 +408,7 @@ def _fw_ota_watchdog():
                           "解析不了 fw_ota_data。那就只能 "
                           "用 esptool 走 USB 了。")
                 else:
-                    print("[OTA] Vermutlich BUF_SIZE=256 im laufenden Build: "
+                    print("[OTA] 多半是运行中的固件里 BUF_SIZE=256："
                           f"一帧是 {FW_CHUNK} B ≈ {2*FW_CHUNK+50} 个字符。"
                           "把加载项选项 'fw_chunk' 设成 80 再重启。")
         else:
@@ -384,7 +416,11 @@ def _fw_ota_watchdog():
 
 
 def _fw_ota_start(bin_path: str):
-    """通过 USB 串口刷协调器固件（esp_ota）。"""
+    """让 C6 自己写另一个 ota 分区（App 级在线升级，esp_ota）。
+
+    走的是当前通道（--link serial 或 tcp），不经 esptool、不需要 USB。
+    与 flash_apply() 的区别：那个是 bootloader 级直刷，必须物理接触。
+    """
     global _fw_ota_file, _fw_ota_size, _fw_ota_off
     import os as _os
     if not bin_path:
@@ -404,10 +440,13 @@ def _fw_ota_start(bin_path: str):
             "size": _fw_ota_size, "off": 0,
         })
     ser.write(_j({"cmd": "fw_ota_start", "size": _fw_ota_size}))
-    frames  = -(-_fw_ota_size // FW_CHUNK)          # aufrunden
+    frames  = -(-_fw_ota_size // FW_CHUNK)          # 向上取整
     batches = -(-frames // FW_BATCH)
+    # ★ 估算公式按**串口 115200**标定（每批约 0.55 s，实测约 920 B/s）。
+    #   TCP 通道下瓶颈变成 C6 写 flash + 每帧 hex 解码，实际会明显快于这个
+    #   数字 —— 所以这里算出来的是**上界**，偏大不是 bug。
     est_s   = batches * 0.55 + frames * 0.004
-    print(f"[OTA] Coordinator-Update: {bin_path} size={_fw_ota_size}")
+    print(f"[OTA] 协调器在线升级：{bin_path} size={_fw_ota_size}（通道 {args.link}）")
     print(f"[OTA] 计划：{frames} 帧 × {FW_CHUNK} B，每批 {FW_BATCH} 帧 ⇒ "
           f"{batches} 批，预计 {est_s/60:.1f} 分钟")
     threading.Thread(target=_fw_ota_watchdog, daemon=True).start()
@@ -1266,6 +1305,10 @@ class CoordinatorTcp:
                 c.close()
             except Exception:                           # noqa: BLE001
                 pass
+        # ★ TCP 一断就立刻把状态置离线，不用干等 130 s 心跳超时。
+        #   C6 重连后会补发 {"t":"boot"}，那时又会置回 online。
+        with _state_lock:
+            _state["status"] = "offline"
 
     # -- 与串口一致的接口 ---------------------------------------------------
     def read(self, n):
@@ -3802,6 +3845,11 @@ def dispatch(line: str):
     if not t:
         return
 
+    # ★ 任何一条 C6 消息都算「链路还活着」—— 心跳、属性上报、命令回执都算。
+    #   统一在这里更新，比在每个分支里各写一次可靠，也不会漏掉新加的消息类型。
+    global _last_c6_ts
+    _last_c6_ts = time.monotonic()
+
     if t == "boot":
         global _gw_boot_ts, _fw_ota_restarts
         _gw_boot_ts = time.monotonic()
@@ -4412,8 +4460,9 @@ def _autoreload_js(secs: int) -> str:
 
 
 def _html():
-    with _state_lock:
-        s = json.loads(json.dumps(_state))   # deep copy
+    # 用 _state_view()：它会按「C6 最近有没有说话」把 status 修正成
+    # online / offline，避免徽标只要连过一次就永远显示在线。
+    s = _state_view()
 
     online = s["status"] == "online"
     badge  = ("online" if online else "offline")
@@ -4432,13 +4481,38 @@ def _html():
         if _tx.get("ts"):
             tx_txt += f" · {_tx['ts']}"
 
-    # 裸机时长估算：每批 0.55 s（含 UART 传输 + ACK 往返）
-    _frames  = -(-789760 // FW_CHUNK)
+    import os as _os
+
+    # 时长估算：每批 0.55 s（含传输 + ACK 往返）。
+    # ★ 0.55 s/批 是按 **UART 115200** 实测标定的（约 920 B/s）。TCP 通道下
+    #   瓶颈变成 C6 写 flash，实际比这快 —— 所以这里给的是**上界**。
+    #   镜像尺寸优先取固件目录里的实际文件，取不到再退回上版观测值。
+    _img_candidates = [
+        _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                      "firmware", "zigbee-vital-sensor.bin"),
+        "/share/zigbee-vital-sensor.bin",
+    ]
+    _img_size = 1330896
+    for _p in _img_candidates:
+        try:
+            if _os.path.isfile(_p):
+                _img_size = _os.path.getsize(_p)
+                break
+        except OSError:
+            pass
+    _frames  = -(-_img_size // FW_CHUNK)
     _batches = -(-_frames // FW_BATCH)
     _est_min = _batches * 0.55 / 60
     _flash   = flash_status()
 
-    import os as _os
+    # TCP 通道下 esptool 直刷必然失败：它要走 USB-Serial-JTAG 进下载模式。
+    # 事先在页面上说清楚，省得用户点了之后以为是固件坏了。
+    _tcp_warn = ""
+    if args.link == "tcp":
+        _tcp_warn = ('<p style="font-size:.85em;color:#ff7a7a">⚠ 当前通道是 TCP：'
+                     'esptool 必须经 USB-Serial-JTAG 进下载模式，网络够不着芯片，'
+                     '这个按钮会直接失败并打印原因。请改用上面的在线 OTA。</p>')
+
     default_bin = _os.path.join(
         _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
         "client", "build", "zigbee-client.bin"
@@ -4567,10 +4641,11 @@ def _html():
            style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
     <button type="submit">⬆ 按路径开始 OTA</button>
   </form>
-  <h3>协调器固件升级（串口 OTA）</h3>
+  <h3>协调器固件升级（在线 OTA，走当前通道）</h3>
   <p style="font-size:.85em;color:#888">帧 {FW_CHUNK} B ≈ {2*FW_CHUNK+50} 字符/行
      （旧固件 256 字节缓冲也能装下）· {FW_BATCH} 帧/批 = {FW_CHUNK*FW_BATCH} B
-     · 789 KB 预计约 {_est_min:.0f} 分钟</p>
+     · 镜像 {_img_size/1048576:.1f} MB 预计约 {_est_min:.0f} 分钟
+     （按串口 115200 标定；TCP 通道更快，实际更短）</p>
   <form method="POST" action="/api/fw_ota" enctype="multipart/form-data">
     <input type="file" name="file" accept=".bin"
            style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
@@ -4589,6 +4664,7 @@ def _html():
   <p style="font-size:.85em;color:#ffcc66">绕过应用层 OTA，直接用 Bootloader 通过 USB
      写入 <code>{APP_OFFSET}</code>（ota_0）。刷写期间串口会被独占、桥接暂停，
      完成后自动重开。适用于旧固件收不到 <code>fw_ota_data</code>（一直停在 1280 字节）的情况。</p>
+  {_tcp_warn}
   <form method="POST" action="/api/fw_flash" enctype="multipart/form-data">
     <input type="file" name="file" accept=".bin"
            style="background:#2a2a4a;color:#e0e0e0;border:1px solid #555;padding:.25em .4em">
@@ -4885,8 +4961,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(404, "text/html; charset=utf-8",
                            f"<h2>设备 {addr} 不存在</h2><a href='/'>← 返回</a>")
         elif path == "/api/state":
-            with _state_lock:
-                self._send(200, "application/json", json.dumps(_state, indent=2))
+            # 也走 _state_view()：JSON 里的 status 必须和页面徽标一致，否则
+            # 「页面说离线、API 说在线」又得多排查一轮。
+            self._send(200, "application/json",
+                       json.dumps(_state_view(), indent=2))
         elif path in ("/topology", "/topo"):
             self._send(200, "text/html; charset=utf-8", _topo_html())
         elif path == "/api/topo":
