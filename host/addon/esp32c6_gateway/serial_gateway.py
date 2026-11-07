@@ -135,7 +135,7 @@ DB_MAC = BASE.split("/")[-1][:8]
 
 # 必须跟 config.json 里的版本号一致。它出现在启动横幅和网页上 ——
 # 这样一眼就能看出容器是不是真的在跑新代码。
-GW_VERSION = "1.5.5"
+GW_VERSION = "1.5.6"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
 # 每个 Zigbee 设备/端点都会在第一条数据帧到达时自动注册成 HA 实体 ——
