@@ -2,8 +2,17 @@
 """从 Zigbee2MQTT 的转换器定义（zigbee-herdsman-converters）生成
 给 HA 自动 discovery 用的紧凑型号库。
 
-Quelle:  .zhc/src/devices/*.ts   (GitLab-Mirror, Tag v16.7.0)
-Ziel:    host/addon/esp32c6_gateway/device_db.json
+源：   --src 指定的 src/devices/*.ts
+       （默认 .zhc/src/devices，是旧的 v16.7.0 镜像）
+输出： --out 指定的文件
+       （默认 host/addon/esp32c6_gateway/device_db.json）
+
+更新到最新 Z2M：
+    python gen_device_db.py --src /path/to/zigbee-herdsman-converters/src/devices
+
+★ 默认保留"旧库里有、新版本里没有"的键：Z2M 偶尔会给设备换 ModelID，
+  直接覆盖会让这些设备当场变成未知型号。确需完全重建时加 --no-keep-old。
+★ MANUAL_EXTRA 收录 Z2M 没有、但现场已确认过的型号，每次生成都会补回去。
 
 键 = ZCL Basic 属性 0x0005（ModelIdentifier）—— 正是协调器在配对时读的那个。
 有了它，网关就能把刚入网的设备立刻归类正确（端点名、实体类型），
@@ -196,6 +205,39 @@ HA_COMP = {
     "cover": "cover", "lock": "lock", "power": "sensor",
 }
 
+# ── Z2M 未收录、但现场已确认过的型号 ────────────────────────────────────
+# 这些不是猜的，是设备自己通过 Basic 簇报上来的 ModelIdentifier。
+# 每次生成都会补进数据库，免得重新提取一次就丢。
+# ★ 定义要保守：caps/description 只用于 _db_kind_of() 判设备类型，
+#   components 目前没有被消费，endpoints 留空可避免错误的端点映射。
+MANUAL_EXTRA = {
+    # 0xc01b 情景面板：实报 mfr="Feibit CO.,LTD"、model="FTB56+ZSN18ZY1.1"，
+    # 另有 battery(0x0035) 和 ep2 按键上报；Z2M 只收录了同族的
+    # FTB56+ZSN15HG1.0 / FTB56+ZSN16HG1.0，没有这一款。
+    "FTB56+ZSN18ZY1.1": {
+        "model": "FTB56+ZSN18ZY1.1",
+        "vendor": "Feibit",
+        "description": "Smart scene wall switch",
+        "caps": ["action", "battery"],
+        "components": ["sensor"],
+        "endpoints": {},
+        "src": "manual",
+    },
+    # 本项目自己的中继器（router/）：实报 mfr="Espressif"、
+    # model="ESP32-C6-Repeater"，node_desc 为 router+mains+rx_idle。
+    # ★ caps 必须留空：它是纯路由，没有任何开关/灯/传感器实体，
+    #   乱填 caps 会让 _db_kind_of() 把它误判成开关或面板。
+    "ESP32-C6-Repeater": {
+        "model": "ESP32-C6-Repeater",
+        "vendor": "Espressif",
+        "description": "Zigbee router / repeater",
+        "caps": [],
+        "components": [],
+        "endpoints": {},
+        "src": "manual",
+    },
+}
+
 
 def parse_endpoints(block, caps):
     """onOff({endpoints:{top:16,center:17}}) → {"top":16,...}"""
@@ -217,13 +259,25 @@ def parse_endpoints(block, caps):
 
 
 def main():
-    if not os.path.isdir(SRC_DIR):
-        sys.exit(f"源目录不存在：{SRC_DIR}")
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="从 zigbee-herdsman-converters 生成 device_db.json")
+    ap.add_argument("--src", default=SRC_DIR,
+                    help=f"Z2M 设备定义目录（默认 {SRC_DIR}）")
+    ap.add_argument("--out", default=OUT,
+                    help=f"输出文件（默认 {OUT}）")
+    ap.add_argument("--no-keep-old", action="store_true",
+                    help="不保留旧库独有的键（完全重建，慎用）")
+    a = ap.parse_args()
+    src_dir, out_path = a.src, a.out
+
+    if not os.path.isdir(src_dir):
+        sys.exit(f"源目录不存在：{src_dir}")
 
     db = {}
     stats = {"files": 0, "blocks": 0, "keys": 0, "no_model": 0, "bin_id": 0}
 
-    for path in sorted(glob.glob(os.path.join(SRC_DIR, "*.ts"))):
+    for path in sorted(glob.glob(os.path.join(src_dir, "*.ts"))):
         stats["files"] += 1
         txt = open(path, encoding="utf-8", errors="replace").read()
         for m in BLOCK.finditer(txt):
@@ -263,17 +317,39 @@ def main():
                 db.setdefault(i, entry)
                 stats["keys"] += 1
 
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
+    # ① 保留旧库独有键（Z2M 改 ModelID 时不能让老设备突然变未知）
+    kept = 0
+    if not a.no_keep_old and os.path.isfile(out_path):
+        try:
+            with open(out_path, encoding="utf-8") as old_f:
+                old_db = json.load(old_f)
+            for k, v in old_db.items():
+                if k not in db:
+                    db[k] = v
+                    kept += 1
+        except (OSError, ValueError) as e:
+            print(f"警告：旧库读不出来（{e}），本次不保留旧键")
+
+    # ② 人工补充的型号，永远以这里为准
+    manual_n = 0
+    for k, v in MANUAL_EXTRA.items():
+        if k not in db:
+            manual_n += 1
+        db[k] = v
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=0, sort_keys=True)
 
-    size = os.path.getsize(OUT)
-    print(f"Dateien        : {stats['files']}")
-    print(f"Definitionen   : {stats['blocks']}")
+    size = os.path.getsize(out_path)
+    print(f"源文件         : {stats['files']}")
+    print(f"设备定义       : {stats['blocks']}")
     print(f"条目           : {len(db)}  （含别名的键：{stats['keys']}）")
+    print(f"保留旧库独有   : {kept}")
+    print(f"人工补充       : {manual_n}")
     print(f"没有 ModelID   : {stats['no_model']}")
     print(f"丢掉二进制 ID  : {stats['bin_id']}  （ModelID 里有控制字符）")
-    print(f"Ausgabe        : {OUT}  ({size/1024:.0f} KiB)")
+    print(f"输出           : {out_path}  ({size/1024:.0f} KiB)")
     return db
 
 

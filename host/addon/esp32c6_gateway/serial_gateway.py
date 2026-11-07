@@ -135,7 +135,7 @@ DB_MAC = BASE.split("/")[-1][:8]
 
 # 必须跟 config.json 里的版本号一致。它出现在启动横幅和网页上 ——
 # 这样一眼就能看出容器是不是真的在跑新代码。
-GW_VERSION = "1.5.6"
+GW_VERSION = "1.5.7"
 
 # ── Home Assistant MQTT Auto-Discovery ────────────────────────────────────
 # 每个 Zigbee 设备/端点都会在第一条数据帧到达时自动注册成 HA 实体 ——
@@ -149,12 +149,27 @@ DEVICE_AVAIL = os.getenv("DEVICE_AVAIL", "1").lower() not in ("0", "no", "off", 
 # 型号数据库，来自 Zigbee2MQTT 的 converter（由 gen_device_db.py 生成）。
 # 键 = ZCL Basic 0x0005（ModelIdentifier）。有了它，刚入网设备的端点
 # 和能力立刻就能判对。
+#
+# ★ 免重建通道：run.sh 本来就会用 /share/serial_gateway.py 覆盖镜像副本，
+#   所以这里也优先读 /share/device_db.json —— 以后 Z2M 出了新型号，
+#   只要把新库拷到 /share 再重启 add-on 即可，不必重建整个镜像。
+#   校验过是「非空字典」才采用；半截文件或手滑写坏就安静地回退到镜像内版本。
 _ha_db = {}
+_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "device_db.json")
+_share_db_path = "/share/device_db.json"
 try:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "device_db.json"), encoding="utf-8") as _f:
+    if os.path.isfile(_share_db_path):
+        with open(_share_db_path, encoding="utf-8") as _sf:
+            _probe_db = json.load(_sf)
+        if isinstance(_probe_db, dict) and _probe_db:
+            _db_path = _share_db_path
+except Exception:
+    pass                      # /share 那份坏掉就当它不存在
+try:
+    with open(_db_path, encoding="utf-8") as _f:
         _ha_db = json.load(_f)
-    print(f"[HA] 设备数据库：已载入 {len(_ha_db)} 个型号")
+    print(f"[HA] 设备数据库：已载入 {len(_ha_db)} 个型号（{_db_path}）")
 except Exception as _e:
     print(f"[HA] 警告：device_db.json 载入失败（{_e}）—— 只用通用 Discovery")
 
@@ -2509,7 +2524,7 @@ def _ha_publish(addr, sub, p):
         _disc_send(comp, node, obj_id, cfg, addr)
 
 def _db_kind_of(entry):
-    """'panel' | 'maybe' | 'switch' | None – Einordnung eines DB-Eintrags."""
+    """按设备库的 caps/description 归类：'panel' | 'maybe' | 'switch' | None。"""
     caps = entry.get("caps") or []
     desc = (entry.get("description") or "").lower()
     if ("scene" in desc or "selector" in desc) and ("switch" in caps or "action" in caps):

@@ -4014,6 +4014,19 @@
 "src": "third_reality.ts",
 "vendor": "Third Reality"
 },
+"3RCB1097Z": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Smart Color Bulb ZL1",
+"endpoints": {},
+"model": "3RCB01057Z",
+"src": "third_reality.ts",
+"vendor": "Third Reality"
+},
 "3RDP01072Z": {
 "caps": [
 "switch"
@@ -4117,6 +4130,19 @@
 "model": "3RPS01083Z",
 "src": "third_reality.ts",
 "vendor": "Third Reality"
+},
+"3RRE0194Z": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "Smart Outdoor Repeater",
+"endpoints": {},
+"model": "3RRE0194Z",
+"src": "third_reality.ts",
+"vendor": "Third Reality, Inc"
 },
 "3RSB01085Z": {
 "caps": [],
@@ -5979,6 +6005,39 @@
 "description": "Simplify thermostat",
 "endpoints": {},
 "model": "4512795",
+"src": "namron.ts",
+"vendor": "Namron"
+},
+"4512797": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Simplify wireless rotary dimmer",
+"endpoints": {},
+"model": "4512797",
+"src": "namron.ts",
+"vendor": "Namron"
+},
+"4512797_98": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Simplify wireless rotary dimmer",
+"endpoints": {},
+"model": "4512797",
+"src": "namron.ts",
+"vendor": "Namron"
+},
+"4512798": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Simplify wireless rotary dimmer",
+"endpoints": {},
+"model": "4512797",
 "src": "namron.ts",
 "vendor": "Namron"
 },
@@ -8033,6 +8092,102 @@
 "model": "7099930PH",
 "src": "philips.ts",
 "vendor": "Philips"
+},
+"70E838TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 1-gang smart switch (neutral)",
+"endpoints": {
+"switch": 1
+},
+"model": "70E838TY",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"70E839TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 2-gang smart switch (neutral)",
+"endpoints": {
+"left": 1,
+"right": 2
+},
+"model": "70E839TY",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"70E840TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 3-gang smart switch (neutral)",
+"endpoints": {
+"left": 1,
+"middle": 2,
+"right": 3
+},
+"model": "70E840TY",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"70E850TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 1-gang smart switch (no neutral)",
+"endpoints": {
+"switch": 1
+},
+"model": "70E850TY",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"70E851TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 2-gang smart switch (no neutral)",
+"endpoints": {
+"left": 1,
+"right": 2
+},
+"model": "70E851TY",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"70E852TY": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 3-gang smart switch (no neutral)",
+"endpoints": {
+"left": 1,
+"middle": 2,
+"right": 3
+},
+"model": "70E852TY",
+"src": "simon.ts",
+"vendor": "SIMON"
 },
 "71a0b275d9ba4895afdaf400bc7e3a0d": {
 "caps": [
@@ -14831,6 +14986,19 @@
 "src": "acuity_brands_lighting.ts",
 "vendor": "Acuity Brands Lighting (ABL)"
 },
+"ABL-LIGHTSENSOR-Z-001": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Lithonia CPX Connect 2x4 smart tunable white LED troffer with integrated motion sensor",
+"endpoints": {},
+"model": "CPXC 2X4 TUWH",
+"src": "acuity_brands_lighting.ts",
+"vendor": "Acuity Brands Lighting (ABL)"
+},
 "AC201": {
 "caps": [],
 "components": [],
@@ -15508,6 +15676,20 @@
 "src": "hobeian.ts",
 "vendor": "HOBEIAN"
 },
+"AY-223Z": {
+"caps": [
+"illuminance",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Rainwater detection sensor",
+"endpoints": {},
+"model": "ZG-223Z",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
 "AY-302Z": {
 "caps": [
 "temperature",
@@ -15746,6 +15928,15 @@
 "model": "mTouch_Air_Sensor",
 "src": "ctm.ts",
 "vendor": "CTM Lyng"
+},
+"AirBee": {
+"caps": [],
+"components": [],
+"description": "Air quality sensor (CO2, temperature, humidity, pressure)",
+"endpoints": {},
+"model": "AirBee",
+"src": "sensy_one.ts",
+"vendor": "Sensy-One"
 },
 "AirCube": {
 "caps": [],
@@ -16093,6 +16284,19 @@
 "description": "BLU Button Tough 1 ZB",
 "endpoints": {},
 "model": "SBBT-102C",
+"src": "shelly.ts",
+"vendor": "Shelly"
+},
+"BLU DoorWindow Mini ZB": {
+"caps": [
+"contact"
+],
+"components": [
+"binary_sensor"
+],
+"description": "BLU DoorWindow Mini ZB",
+"endpoints": {},
+"model": "SBDW-203C",
 "src": "shelly.ts",
 "vendor": "Shelly"
 },
@@ -17379,7 +17583,7 @@
 "CGDK2-bz": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor Lite (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor Lite (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGDK2",
 "src": "zigbeetlc.ts",
@@ -17388,7 +17592,7 @@
 "CGDK2-z": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor Lite (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor Lite (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGDK2",
 "src": "zigbeetlc.ts",
@@ -17397,7 +17601,7 @@
 "CGG1-bz": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGG1",
 "src": "zigbeetlc.ts",
@@ -17406,7 +17610,7 @@
 "CGG1-z": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGG1",
 "src": "zigbeetlc.ts",
@@ -17415,7 +17619,7 @@
 "CGG1N-bz": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGG1",
 "src": "zigbeetlc.ts",
@@ -17424,7 +17628,7 @@
 "CGG1N-z": {
 "caps": [],
 "components": [],
-"description": "Temp & RH Monitor (pvxx/ZigbeeTLc)",
+"description": "Temp & RH Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "CGG1",
 "src": "zigbeetlc.ts",
@@ -18453,6 +18657,19 @@
 "src": "yookee.ts",
 "vendor": "Yookee"
 },
+"D726-ZG": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Zigbee smart plug dimmer 150W",
+"endpoints": {},
+"model": "4512788",
+"src": "namron.ts",
+"vendor": "Namron"
+},
 "DCH-B112": {
 "caps": [
 "contact",
@@ -19397,6 +19614,15 @@
 "src": "custom_devices_diy.ts",
 "vendor": "Silabs"
 },
+"Dongle-MP10_ZBRouter": {
+"caps": [],
+"components": [],
+"description": "Dongle Max CC2674P10 (CC2674P10) with router firmware",
+"endpoints": {},
+"model": "Dongle-MP10",
+"src": "sonoff.ts",
+"vendor": "SONOFF"
+},
 "Dongle-M_ZBRouter": {
 "caps": [],
 "components": [],
@@ -20322,12 +20548,9 @@
 "components": [
 "light"
 ],
-"description": "ROVITO-Z ceiling light (separated CCT panel and RGB ring)",
-"endpoints": {
-"rgb": 3,
-"white": 1
-},
-"model": "901471",
+"description": "ROVITO-Z ceiling light (variant without separate RGB endpoint)",
+"endpoints": {},
+"model": "901471_1",
 "src": "eglo.ts",
 "vendor": "EGLO"
 },
@@ -20702,7 +20925,7 @@
 "EFEKTA_PWS": {
 "caps": [],
 "components": [],
-"description": "[Plant Wattering Sensor, CR2450, CR2477 batteries, temperature ]",
+"description": "[Plant Watering Sensor, CR2450, CR2477 batteries, temperature ]",
 "endpoints": {},
 "model": "EFEKTA_PWS",
 "src": "efekta.ts",
@@ -20945,7 +21168,7 @@
 "EFEKTA_eFlora": {
 "caps": [],
 "components": [],
-"description": "Plant Wattering Sensor with e-ink display 1.02",
+"description": "Plant Watering Sensor with e-ink display 1.02",
 "endpoints": {},
 "model": "EFEKTA_eFlora",
 "src": "efekta.ts",
@@ -20954,7 +21177,7 @@
 "EFEKTA_eFlora_Max_Pro": {
 "caps": [],
 "components": [],
-"description": "Plant Wattering Sensor with e-ink display 2.13 with signal amplifier",
+"description": "Plant Watering Sensor with e-ink display 2.13 with signal amplifier",
 "endpoints": {},
 "model": "EFEKTA_eFlora_Max_Pro",
 "src": "efekta.ts",
@@ -20963,7 +21186,7 @@
 "EFEKTA_eFlora_Pro": {
 "caps": [],
 "components": [],
-"description": "Plant Wattering Sensor with e-ink display 2.13",
+"description": "Plant Watering Sensor with e-ink display 2.13",
 "endpoints": {},
 "model": "EFEKTA_eFlora_Pro",
 "src": "efekta.ts",
@@ -20972,7 +21195,7 @@
 "EFEKTA_eFlower_Pro": {
 "caps": [],
 "components": [],
-"description": "Plant Wattering Sensor with e-ink display 2.13",
+"description": "Plant Watering Sensor with e-ink display 2.13",
 "endpoints": {},
 "model": "EFEKTA_eFlower_Pro",
 "src": "efekta.ts",
@@ -21053,7 +21276,7 @@
 "EFEKTA_ePWS": {
 "caps": [],
 "components": [],
-"description": "Plant wattering sensor with e-ink display",
+"description": "Plant watering sensor with e-ink display",
 "endpoints": {},
 "model": "EFEKTA_ePWS",
 "src": "efekta.ts",
@@ -21197,7 +21420,7 @@
 "EFEKTA_miniPWS": {
 "caps": [],
 "components": [],
-"description": "Mini plant wattering sensor",
+"description": "Mini plant watering sensor",
 "endpoints": {},
 "model": "EFEKTA_miniPWS",
 "src": "efekta.ts",
@@ -21481,6 +21704,15 @@
 "model": "33943/33944/33946",
 "src": "awox.ts",
 "vendor": "AwoX"
+},
+"ESP32-C6-Repeater": {
+"caps": [],
+"components": [],
+"description": "Zigbee router / repeater",
+"endpoints": {},
+"model": "ESP32-C6-Repeater",
+"src": "manual",
+"vendor": "Espressif"
 },
 "ETI 12-in Puff light": {
 "caps": [
@@ -23290,6 +23522,20 @@
 "model": "HGZB-02S",
 "src": "nue_3a.ts",
 "vendor": "Nue / 3A"
+},
+"FTB56+ZSN18ZY1.1": {
+"caps": [
+"action",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Smart scene wall switch",
+"endpoints": {},
+"model": "FTB56+ZSN18ZY1.1",
+"src": "manual",
+"vendor": "Feibit"
 },
 "FWA60Bulb50AU": {
 "caps": [
@@ -25205,6 +25451,15 @@
 "src": "ubisys.ts",
 "vendor": "Ubisys"
 },
+"H2-ZB-SW-V1": {
+"caps": [],
+"components": [],
+"description": "Four-channel switch",
+"endpoints": {},
+"model": "H2-ZB-SW-V1",
+"src": "coselig.ts",
+"vendor": "Coselig"
+},
 "H34450BA00-00007": {
 "caps": [
 "contact",
@@ -26631,6 +26886,88 @@
 "src": "heiman.ts",
 "vendor": "Heiman"
 },
+"HS204ZL": {
+"caps": [
+"illuminance",
+"occupancy",
+"battery"
+],
+"components": [
+"binary_sensor",
+"sensor"
+],
+"description": "Luminance motion sensor",
+"endpoints": {},
+"model": "ZG-204ZL",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"HS204ZV": {
+"caps": [
+"temperature",
+"humidity",
+"illuminance",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Millimeter wave motion detection",
+"endpoints": {},
+"model": "ZG-204ZV",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"HS204ZX": {
+"caps": [
+"temperature",
+"humidity",
+"illuminance",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "24Ghz millimeter wave and T&H sensor",
+"endpoints": {},
+"model": "ZG-204ZX",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"HS206Z": {
+"caps": [
+"occupancy",
+"battery"
+],
+"components": [
+"binary_sensor",
+"sensor"
+],
+"description": "PIR motion and human presence sensor",
+"endpoints": {},
+"model": "HS206Z",
+"src": "tuya.ts",
+"vendor": "HYSYIOT"
+},
+"HS207Z": {
+"caps": [
+"vibration",
+"temperature",
+"humidity",
+"illuminance",
+"occupancy",
+"battery"
+],
+"components": [
+"binary_sensor",
+"sensor"
+],
+"description": "5-in-1 PIR motion, illuminance, vibration, temperature and humidity sensor",
+"endpoints": {},
+"model": "HS207Z",
+"src": "tuya.ts",
+"vendor": "HYSYIOT"
+},
 "HS208Z": {
 "caps": [
 "vibration",
@@ -26649,6 +26986,36 @@
 "model": "HS208Z",
 "src": "tuya.ts",
 "vendor": "HYSYIOT"
+},
+"HS209Z": {
+"caps": [
+"occupancy",
+"battery"
+],
+"components": [
+"binary_sensor",
+"sensor"
+],
+"description": "PIR and millimeter-wave radar human presence sensor",
+"endpoints": {},
+"model": "HS209Z",
+"src": "tuya.ts",
+"vendor": "HYSYIOT"
+},
+"HS222Z": {
+"caps": [
+"moisture",
+"battery"
+],
+"components": [
+"binary_sensor",
+"sensor"
+],
+"description": "Water leak detector",
+"endpoints": {},
+"model": "TS0207_water_leak_detector",
+"src": "tuya.ts",
+"vendor": "Tuya"
 },
 "HS2AQ-EF-3.0": {
 "caps": [
@@ -26952,6 +27319,50 @@
 "src": "heiman.ts",
 "vendor": "Heiman"
 },
+"HS300TF": {
+"caps": [
+"temperature",
+"humidity",
+"illuminance",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Solar soil moisture, temperature, humidity, illuminance and fertility sensor",
+"endpoints": {},
+"model": "HS300TF",
+"src": "tuya.ts",
+"vendor": "HYSYIOT"
+},
+"HS303Z": {
+"caps": [
+"temperature",
+"humidity",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Soil moisture sensor",
+"endpoints": {},
+"model": "ZG-303Z",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"HS308Z": {
+"caps": [
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Water valve",
+"endpoints": {},
+"model": "ZG-308Z",
+"src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
 "HS3AQ-EFA-3.0": {
 "caps": [
 "temperature",
@@ -27059,6 +27470,15 @@
 "model": "HS2SW3A/HS2SW3A-N",
 "src": "heiman.ts",
 "vendor": "Heiman"
+},
+"HS807Z": {
+"caps": [],
+"components": [],
+"description": "USB router",
+"endpoints": {},
+"model": "CK-BL702-ROUTER-01(7018)",
+"src": "ewelink.ts",
+"vendor": "eWeLink"
 },
 "HS8DS-EF2-3.0": {
 "caps": [],
@@ -28136,6 +28556,15 @@
 "model": "L2207",
 "src": "ikea.ts",
 "vendor": "IKEA"
+},
+"JM720ES-EF-3.0": {
+"caps": [],
+"components": [],
+"description": "Smart carbon monoxide alarm",
+"endpoints": {},
+"model": "HS-720ES-ZB",
+"src": "heiman.ts",
+"vendor": "Heiman"
 },
 "JORMLIEN door WS 40x80": {
 "caps": [],
@@ -30293,6 +30722,19 @@
 "src": "philips.ts",
 "vendor": "Philips"
 },
+"LCX049": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Hue Festavia curtain lights (1.35 x 2 meter with 250 LEDs)",
+"endpoints": {},
+"model": "929004456604",
+"src": "philips.ts",
+"vendor": "Philips"
+},
 "LCY001": {
 "caps": [
 "light"
@@ -31070,7 +31512,7 @@
 "LKTMZL02-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "LKTMZL02-z",
 "src": "zigbeetlc.ts",
@@ -34183,7 +34625,7 @@
 "LYWSD03MMC-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "LYWSD03MMC-z",
 "src": "zigbeetlc.ts",
@@ -34192,7 +34634,7 @@
 "LYWSD03MMC-z": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "LYWSD03MMC-z",
 "src": "zigbeetlc.ts",
@@ -34423,7 +34865,7 @@
 "MC-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MC-z",
 "src": "zigbeetlc.ts",
@@ -34594,7 +35036,7 @@
 "MHO-C122-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C122",
 "src": "zigbeetlc.ts",
@@ -34603,7 +35045,7 @@
 "MHO-C122-z": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C122",
 "src": "zigbeetlc.ts",
@@ -34612,7 +35054,7 @@
 "MHO-C401-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C401",
 "src": "zigbeetlc.ts",
@@ -34621,7 +35063,7 @@
 "MHO-C401-z": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C401",
 "src": "zigbeetlc.ts",
@@ -34639,7 +35081,7 @@
 "MHO-C401N-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C401",
 "src": "zigbeetlc.ts",
@@ -34648,7 +35090,7 @@
 "MHO-C401N-z": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MHO-C401",
 "src": "zigbeetlc.ts",
@@ -34868,7 +35310,7 @@
 "MJWSD06MMC-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor 3 Mini (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor 3 Mini (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MJWSD06MMC",
 "src": "zigbeetlc.ts",
@@ -34877,7 +35319,7 @@
 "MJWSD06MMC-z": {
 "caps": [],
 "components": [],
-"description": "Temperature and Humidity Monitor 3 Mini (pvxx/ZigbeeTLc)",
+"description": "Temperature and Humidity Monitor 3 Mini (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MJWSD06MMC",
 "src": "zigbeetlc.ts",
@@ -35646,6 +36088,19 @@
 "model": "57005000",
 "src": "insta.ts",
 "vendor": "Insta"
+},
+"NGC001": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Hue wall light module for Nanoleaf Shapes",
+"endpoints": {},
+"model": "929004440102",
+"src": "philips.ts",
+"vendor": "Philips"
 },
 "NHMOTION/DIMMER/1": {
 "caps": [
@@ -40659,6 +41114,22 @@
 "src": "robb.ts",
 "vendor": "ROBB"
 },
+"ROB_200-012-0": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Dual Zigbee AC phase-cut dimmer",
+"endpoints": {
+"l1": 1,
+"l2": 2
+},
+"model": "ROB_200-012-0",
+"src": "robb.ts",
+"vendor": "ROBB"
+},
 "ROB_200-014-0": {
 "caps": [
 "light"
@@ -40944,6 +41415,15 @@
 "description": "4-button wireless Zigbee switch",
 "endpoints": {},
 "model": "ROB_200-081-0",
+"src": "robb.ts",
+"vendor": "ROBB"
+},
+"ROB_200-082-0": {
+"caps": [],
+"components": [],
+"description": "4-button wireless Zigbee switch",
+"endpoints": {},
+"model": "ROB_200-082-0",
 "src": "robb.ts",
 "vendor": "ROBB"
 },
@@ -41322,6 +41802,15 @@
 "src": "philips.ts",
 "vendor": "Philips"
 },
+"Ramses_esp32c6": {
+"caps": [],
+"components": [],
+"description": "RAMSES II RF-to-Zigbee bridge (ESP32-C6)",
+"endpoints": {},
+"model": "Ramses_esp32c6",
+"src": "custom_devices_diy.ts",
+"vendor": "ELECRAM"
+},
 "RelayModule-EF-3.0": {
 "caps": [
 "switch"
@@ -41696,6 +42185,54 @@
 "model": "S2",
 "src": "ubisys.ts",
 "vendor": "Ubisys"
+},
+"S2100-1001": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 1-gang smart switch (pairing)",
+"endpoints": {
+"switch": 1
+},
+"model": "S2100-1001",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"S2100-1002": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 2-gang smart switch (pairing)",
+"endpoints": {
+"left": 1,
+"right": 2
+},
+"model": "S2100-1002",
+"src": "simon.ts",
+"vendor": "SIMON"
+},
+"S2100-1003": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "i7 3-gang smart switch (pairing)",
+"endpoints": {
+"left": 1,
+"middle": 2,
+"right": 3
+},
+"model": "S2100-1003",
+"src": "simon.ts",
+"vendor": "SIMON"
 },
 "S24013": {
 "caps": [
@@ -42496,6 +43033,19 @@
 "description": "Smart energy monitor for 1P+N system",
 "endpoints": {},
 "model": "SDM01B-U01",
+"src": "bituo_technik.ts",
+"vendor": "BITUO TECHNIK"
+},
+"SDM01G2W": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "Smart energy monitor for 3P+N system",
+"endpoints": {},
+"model": "SDM01W-U01",
 "src": "bituo_technik.ts",
 "vendor": "BITUO TECHNIK"
 },
@@ -45000,6 +45550,20 @@
 "src": "eurotronic.ts",
 "vendor": "Eurotronic"
 },
+"SQ610RFNH": {
+"caps": [
+"humidity",
+"battery"
+],
+"components": [
+"sensor"
+],
+"description": "Quantum wireless thermostat",
+"endpoints": {},
+"model": "SQ610RFNH",
+"src": "salus_controls.ts",
+"vendor": "Salus Controls"
+},
 "SQM300Z1": {
 "caps": [
 "switch"
@@ -46982,6 +47546,15 @@
 "src": "osram.ts",
 "vendor": "OSRAM"
 },
+"T000R_ZG": {
+"caps": [],
+"components": [],
+"description": "Thermostat",
+"endpoints": {},
+"model": "T000R_ZG",
+"src": "hzc_electric.ts",
+"vendor": "HZC Electric"
+},
 "TAFFETAS2 D1.00P1.03Z1.00": {
 "caps": [
 "occupancy"
@@ -47088,12 +47661,10 @@
 "TERNCY-PP01": {
 "caps": [
 "occupancy",
-"battery",
 "action"
 ],
 "components": [
-"binary_sensor",
-"sensor"
+"binary_sensor"
 ],
 "description": "Awareness switch",
 "endpoints": {},
@@ -47275,7 +47846,7 @@
 "TH01-2-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MC-z",
 "src": "zigbeetlc.ts",
@@ -47284,7 +47855,7 @@
 "TH01-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "MC-z",
 "src": "zigbeetlc.ts",
@@ -47293,7 +47864,7 @@
 "TH03Z-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -47302,7 +47873,7 @@
 "TH03Z-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -47715,6 +48286,22 @@
 "src": "allesin.ts",
 "vendor": "Allesin"
 },
+"TOFSMYGGA plug outdoor": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "TOFSMYGGA 2-gang outdoor plug (Matter)",
+"endpoints": {
+"1": 1,
+"2": 2
+},
+"model": "E2435-NA",
+"src": "ikea.ts",
+"vendor": "IKEA"
+},
 "TP-WGZBA": {
 "caps": [],
 "components": [],
@@ -47833,7 +48420,7 @@
 "TRADFRI bulb E12 CWS opal 600lm": {
 "caps": [],
 "components": [],
-"description": "TRADFRI bulb E12/E14/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
 "endpoints": {},
 "model": "LED1624G9",
 "src": "ikea.ts",
@@ -47914,7 +48501,7 @@
 "TRADFRI bulb E14 CWS opal 600lm": {
 "caps": [],
 "components": [],
-"description": "TRADFRI bulb E12/E14/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
 "endpoints": {},
 "model": "LED1624G9",
 "src": "ikea.ts",
@@ -47989,6 +48576,15 @@
 "description": "TRADFRI bulb E12/E14/E17, color/white spectrum, globe, opal, 800/806/810 lm",
 "endpoints": {},
 "model": "LED2111G6",
+"src": "ikea.ts",
+"vendor": "IKEA"
+},
+"TRADFRI bulb E17 CWS opal 600lm": {
+"caps": [],
+"components": [],
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"endpoints": {},
+"model": "LED1624G9",
 "src": "ikea.ts",
 "vendor": "IKEA"
 },
@@ -48094,7 +48690,7 @@
 "TRADFRI bulb E26 CWS opal 600lm": {
 "caps": [],
 "components": [],
-"description": "TRADFRI bulb E12/E14/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
 "endpoints": {},
 "model": "LED1624G9",
 "src": "ikea.ts",
@@ -48265,7 +48861,7 @@
 "TRADFRI bulb E27 C/WS opal 600": {
 "caps": [],
 "components": [],
-"description": "TRADFRI bulb E12/E14/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
 "endpoints": {},
 "model": "LED1624G9",
 "src": "ikea.ts",
@@ -48292,7 +48888,7 @@
 "TRADFRI bulb E27 CWS opal 600lm": {
 "caps": [],
 "components": [],
-"description": "TRADFRI bulb E12/E14/E26/E27, color/white spectrum, globe, opal, 600 lm",
+"description": "TRADFRI bulb E12/E14/E17/E26/E27, color/white spectrum, globe, opal, 600 lm",
 "endpoints": {},
 "model": "LED1624G9",
 "src": "ikea.ts",
@@ -49450,7 +50046,7 @@
 "TS0201-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -49459,7 +50055,7 @@
 "TS0201-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -51885,6 +52481,28 @@
 "src": "vimar.ts",
 "vendor": "Vimar"
 },
+"Wired master SW Home / Away": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Wired home & away switch",
+"endpoints": {},
+"model": "WNRL34",
+"src": "legrand.ts",
+"vendor": "Legrand"
+},
+"Wired remote on / off switch": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Wired remote smart switch with Netatmo",
+"endpoints": {},
+"model": "WNRL24",
+"src": "legrand.ts",
+"vendor": "Legrand"
+},
 "X2SK11": {
 "caps": [
 "switch"
@@ -52294,8 +52912,12 @@
 "vendor": "Yale"
 },
 "YRD430 PB": {
-"caps": [],
-"components": [],
+"caps": [
+"lock"
+],
+"components": [
+"lock"
+],
 "description": "Assure lock 2",
 "endpoints": {},
 "model": "YRD430-BLE",
@@ -52303,8 +52925,12 @@
 "vendor": "Yale"
 },
 "YRD430 TS": {
-"caps": [],
-"components": [],
+"caps": [
+"lock"
+],
+"components": [
+"lock"
+],
 "description": "Assure lock 2",
 "endpoints": {},
 "model": "YRD430-BLE",
@@ -52420,6 +53046,15 @@
 "vendor": "Somfy"
 },
 "Ysia 5 HP Zigbee": {
+"caps": [],
+"components": [],
+"description": "Ysia 5 channel blinds remote",
+"endpoints": {},
+"model": "1871154",
+"src": "somfy.ts",
+"vendor": "Somfy"
+},
+"Ysia 5 Zigbee Europe": {
 "caps": [],
 "components": [],
 "description": "Ysia 5 channel blinds remote",
@@ -53638,6 +54273,15 @@
 "src": "smartenit.ts",
 "vendor": "Smartenit"
 },
+"ZBM-MG21": {
+"caps": [],
+"components": [],
+"description": "Silabs series 2 adapter with router firmware",
+"endpoints": {},
+"model": "Silabs series 2 router",
+"src": "custom_devices_diy.ts",
+"vendor": "Silabs"
+},
 "ZBM-MG24": {
 "caps": [],
 "components": [],
@@ -54686,13 +55330,17 @@
 "vendor": "HOBEIAN"
 },
 "ZG-204ZL-z": {
-"caps": [],
-"components": [],
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
 "description": "Luminance motion sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "ZG-204ZL-z",
-"src": "custom_devices_diy.ts",
-"vendor": "Custom devices (DiY)"
+"src": "zigbeetlc.ts",
+"vendor": "HOBEIAN"
 },
 "ZG-204ZM": {
 "caps": [
@@ -54705,6 +55353,15 @@
 "endpoints": {},
 "model": "ZG-204ZM",
 "src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"ZG-204ZM-z": {
+"caps": [],
+"components": [],
+"description": "Dual PIR and mmWave radar presence and luminance sensor (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZS-z",
+"src": "zigbeetlc.ts",
 "vendor": "HOBEIAN"
 },
 "ZG-204ZQ": {
@@ -54723,6 +55380,15 @@
 "src": "hobeian.ts",
 "vendor": "HOBEIAN"
 },
+"ZG-204ZS-z": {
+"caps": [],
+"components": [],
+"description": "Dual PIR and mmWave radar presence and luminance sensor (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZS-z",
+"src": "zigbeetlc.ts",
+"vendor": "HOBEIAN"
+},
 "ZG-204ZV": {
 "caps": [
 "temperature",
@@ -54737,6 +55403,42 @@
 "endpoints": {},
 "model": "ZG-204ZV",
 "src": "hobeian.ts",
+"vendor": "HOBEIAN"
+},
+"ZG-204ZV-z": {
+"caps": [],
+"components": [],
+"description": "Millimeter wave motion sensor with temperature and humidity (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZV-z",
+"src": "zigbeetlc.ts",
+"vendor": "HOBEIAN"
+},
+"ZG-204ZV1-z": {
+"caps": [],
+"components": [],
+"description": "Millimeter wave motion sensor (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZV1-z",
+"src": "zigbeetlc.ts",
+"vendor": "HOBEIAN"
+},
+"ZG-204ZV2-TH-z": {
+"caps": [],
+"components": [],
+"description": "Millimeter wave motion sensor v2 with temperature and humidity (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZV2-TH-z",
+"src": "zigbeetlc.ts",
+"vendor": "HOBEIAN"
+},
+"ZG-204ZV2-z": {
+"caps": [],
+"components": [],
+"description": "Millimeter wave motion sensor v2 (pvvx/ZigbeeTLc)",
+"endpoints": {},
+"model": "ZG-204ZV2-z",
+"src": "zigbeetlc.ts",
 "vendor": "HOBEIAN"
 },
 "ZG-204ZX": {
@@ -54876,7 +55578,7 @@
 "ZG-227Z-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & humidity sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & humidity sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "ZG-227Z-z",
 "src": "zigbeetlc.ts",
@@ -55865,6 +56567,19 @@
 "src": "sunricher.ts",
 "vendor": "Sunricher"
 },
+"ZIGBEE_ERL": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "Linky meter TIC interface",
+"endpoints": {},
+"model": "ZIGBEE_ERL",
+"src": "edflab.ts",
+"vendor": "EDFLab"
+},
 "ZL1-EN": {
 "caps": [
 "moisture"
@@ -56029,6 +56744,15 @@
 "src": "imou.ts",
 "vendor": "IMOU"
 },
+"ZREL": {
+"caps": [],
+"components": [],
+"description": "Zigbee-Ethernet router",
+"endpoints": {},
+"model": "ZREL",
+"src": "smlight.ts",
+"vendor": "SMLIGHT"
+},
 "ZS-304Z": {
 "caps": [
 "temperature",
@@ -56075,7 +56799,7 @@
 "ZTH01-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -56084,7 +56808,7 @@
 "ZTH01-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -56093,7 +56817,7 @@
 "ZTH02-bz": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -56102,7 +56826,7 @@
 "ZTH02-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -56149,7 +56873,7 @@
 "ZY-ZTH02-z": {
 "caps": [],
 "components": [],
-"description": "Temperature & Humidity Sensor (pvxx/ZigbeeTLc)",
+"description": "Temperature & Humidity Sensor (pvvx/ZigbeeTLc)",
 "endpoints": {},
 "model": "TS0201-z",
 "src": "zigbeetlc.ts",
@@ -56708,6 +57432,17 @@
 "description": "MixSwitch 3 gangs",
 "endpoints": {},
 "model": "T20S3Z",
+"src": "orvibo.ts",
+"vendor": "ORVIBO"
+},
+"d0d2422bbf3a4982b31ea843bfedb559": {
+"caps": [
+"action"
+],
+"components": [],
+"description": "Three-button Zigbee scene switch",
+"endpoints": {},
+"model": "T30S3Z",
 "src": "orvibo.ts",
 "vendor": "ORVIBO"
 },
@@ -58192,6 +58927,24 @@
 "description": "Wall outlet H2 UK",
 "endpoints": {},
 "model": "WP-P09D",
+"src": "lumi.ts",
+"vendor": "Aqara"
+},
+"lumi.plug.aeu005": {
+"caps": [],
+"components": [],
+"description": "Power plug H2 EU (RGB)",
+"endpoints": {},
+"model": "SP-P05D",
+"src": "lumi.ts",
+"vendor": "Aqara"
+},
+"lumi.plug.aeu006": {
+"caps": [],
+"components": [],
+"description": "Outdoor plug H2 EU",
+"endpoints": {},
+"model": "SP-P06E",
 "src": "lumi.ts",
 "vendor": "Aqara"
 },
@@ -59918,6 +60671,23 @@
 "src": "ctm.ts",
 "vendor": "CTM Lyng"
 },
+"micro-duo": {
+"caps": [
+"switch"
+],
+"components": [
+"switch"
+],
+"description": "Pilot wire controller with relay, energy metering and Bluetooth OTA",
+"endpoints": {
+"ble_ota": 11,
+"pilot_wire": 1,
+"relay": 10
+},
+"model": "micro-duo",
+"src": "heatzy.ts",
+"vendor": "Heatzy"
+},
 "moisturev4": {
 "caps": [
 "moisture",
@@ -60276,6 +61046,19 @@
 "model": "ZSTY-SM-11ZG-US-W",
 "src": "somgoms.ts",
 "vendor": "Somgoms"
+},
+"teelicht-c6": {
+"caps": [
+"light"
+],
+"components": [
+"light"
+],
+"description": "Rechargeable tealight that flickers like a real candle",
+"endpoints": {},
+"model": "teelicht",
+"src": "teelicht.ts",
+"vendor": "teelicht"
 },
 "ti.router": {
 "caps": [],

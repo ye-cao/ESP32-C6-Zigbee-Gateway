@@ -82,6 +82,21 @@ else
   echo "[addon] CODE: 使用镜像内版本（改动需要重建）"
 fi
 
+# 型号库同样支持 /share 覆盖：Z2M 每隔一阵就新增设备定义，
+# 为了加几条型号就重建整个镜像太不划算。校验 JSON 合法后才替换，
+# 免得一个手滑的半截文件把网关的设备识别全搞挂。
+if [ -f /share/device_db.json ]; then
+  if /opt/venv/bin/python -c \
+      "import json; json.load(open('/share/device_db.json', encoding='utf-8'))" 2>/dev/null; then
+    cp /share/device_db.json /device_db.json
+    echo "[addon] DB: 已采用 /share/device_db.json（无需重建）"
+  else
+    echo "[addon] DB: 警告 —— /share/device_db.json 不是合法 JSON，沿用镜像内版本"
+  fi
+else
+  echo "[addon] DB: 使用镜像内版本"
+fi
+
 echo "[addon] 通道=$LINK 串口=$SERIAL tcp=$TCP_PORT broker=$MQTT_HOST:$MQTT_PORT base=$BASE web=$WEB_PORT"
 # -u：不缓冲 stdout/stderr。否则 add-on 日志会长时间空着
 #（Python 在 stdout 是管道/容器日志时默认块缓冲）。
