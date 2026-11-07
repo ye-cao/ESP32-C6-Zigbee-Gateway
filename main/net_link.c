@@ -460,6 +460,15 @@ static void feed_bytes(const char *data, int len, char *acc, size_t *acc_len) {
     }
 }
 
+/* 上一次 TCP 断开的原因。
+ *
+ * 断连是偶发的（几十秒到几分钟一次），用 log_on 现场抓很难碰到；
+ * 而驱动日志一旦打开，IDF 的日志行会混进 TCP 数据流污染 JSON。
+ * 所以改成「记下来，下次连上时通过正常通道补报」——
+ * 一条 {"t":"tcp_prev_down","why":…} 就能回答"到底是谁先断的"，
+ * 不用再开驱动日志、也不用守着看。 */
+static char s_down_why[40];
+
 static void tcp_rx_loop(int fd) {
     static char acc[MAX_LINE];
     char  buf[RX_CHUNK];
@@ -474,12 +483,19 @@ static void tcp_rx_loop(int fd) {
         if (rc == 0) continue;                 /* 超时：回去再看一眼连接状态 */
         if (rc < 0) {
             if (errno == EINTR) continue;
+            snprintf(s_down_why, sizeof(s_down_why), "select_errno_%d", errno);
             return;
         }
         int n = recv(fd, buf, sizeof(buf), 0);
-        if (n == 0) return;                    /* 对端关闭 */
+        if (n == 0) {                          /* 对端关闭（发了 FIN） */
+            strcpy(s_down_why, "peer_fin");
+            return;
+        }
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            /* recv_errno_104 = ECONNRESET（对端或中间设备发了 RST），
+             * 104 之外的值基本就是本机 lwIP 的内部错误。 */
+            snprintf(s_down_why, sizeof(s_down_why), "recv_errno_%d", errno);
             return;
         }
         feed_bytes(buf, n, acc, &acc_len);
@@ -587,6 +603,17 @@ static void net_task(void *arg) {
          *    （固件不持久化 TX 功率，见 zb_gateway 那边的说明）。
          *    每次重连都补发是安全的 —— add-on 的 boot 处理是幂等的。 */
         ha_mqtt_emit_raw("{\"t\":\"boot\"}");
+
+        /* 上一轮为什么断的 —— 补报一条，然后清空。
+         * 有了它就不用开驱动日志守在现场了：断连是偶发的，
+         * 而这条消息每次重连都会把上次的原因带上来。 */
+        if (s_down_why[0]) {
+            char dl[96];
+            snprintf(dl, sizeof(dl),
+                     "{\"t\":\"tcp_prev_down\",\"why\":\"%s\"}", s_down_why);
+            ha_mqtt_emit_raw(dl);
+            s_down_why[0] = '\0';
+        }
         announce(true);
 
         tcp_rx_loop(fd);
