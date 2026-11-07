@@ -83,6 +83,24 @@
   让 ninja 编译后删除 depfile 时被文件监控拦住（`Access is denied`）。
   全量 1066 目标最终耗时约 86 分钟。
 
+### 运维 – Zigbee 网络凭据的备份与恢复（实测可用）
+
+- `backup/zb_storage-restore-20261106.bin`（32768 B）保存的是原网络的凭据区。
+  刷入 ESPHome 或任何会覆盖 `zb_storage@0x3A0000` 的固件后，写回它再重启即可
+  恢复原网络，**设备不需要重新配对**：
+
+  ```
+  esptool --chip esp32c6 --port COMx --baud 460800 write_flash \
+          0x3A0000 backup/zb_storage-restore-20261106.bin
+  ```
+
+- 2026‑11‑07 08:5x 实测：刷入前 Coordinator 误建了新网（`PAN 0xd13e`、`dev:[]`），
+  写回后启动心跳变为 `ch=20 pan=0xa311`，add-on `/api/state` 显示
+  `channel=20、pan=0xa311、devices=1 ['0x8e4e']`，中继自动回网（`lqi=35`），
+  `ping -n 40` **0% 丢包**（RTT min 4 / avg 144 ms）。
+- `zb_fct@0x3A8000` 不在此备份内，但 ESPHome 的镜像只写到 `0x11xxxx`，
+  不会覆盖它，无需处理。
+
 ### 变更 – 固件
 
 - `net_status` 回执新增 `"coex":<int>`；`wifi_scan` 回执新增 `"attached":0|1`。

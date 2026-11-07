@@ -764,15 +764,31 @@ Gateway ===`，**无 panic / 无 assert**。
 | `wifi_scan`（已关联） | `why=8` 掉线、ARP 消失 | **`attached:1 n:1 aps=[yecao -56 ch6 a7]`，扫完仍在线** |
 | TCP 通道 | 未验证 | **add-on 日志 `state=tcp_up`、`[HB] uptime=… ch=20 pan=0xd13e`、12345 可连** |
 
-### 15.4 Zigbee 侧的变化（**必须知情**）
+### 15.4 Zigbee 侧：凭据被覆盖，但**可以用备份恢复**（已实测）
 
 刷 ESPHome 时它的 NVS 分区（`0x370000+0x70000`）覆盖了本项目的
-`zb_storage@0x3A0000`，Zigbee 网络凭据丢失：
+`zb_storage@0x3A0000`，Zigbee 网络凭据丢失。刷回本项目固件后第一次启动，
+Coordinator **重建了一个新网络**：`ch=20`、`PAN 0xd13e`（原 `0xa311`）、
+`lqi dev:[]`。
 
-- 刷回后 Coordinator **重建了新网络**：`ch=20`、`PAN 0xd13e`（原 `0xa311`）；
-- `lqi` 回执 `dev:[]` —— **原设备全部掉线，需要重新入网**（按 Boot 键开 180 s
-  配网，或在 HA 里点 permit_join）。
-- 这是刷 ESPHome 的必然代价，不是 5.5.2 固件的问题。
+**恢复办法（已实测成功）**：把 2026‑11‑06 17:37 全片备份里提取的凭据区写回：
+
+```
+write_flash 0x3A0000 backup/zb_storage-restore-20261106.bin   # 32768 B
+```
+
+写入后重启（`Hash of data verified`），结果：
+
+| 项目 | 恢复前（误建的新网） | **恢复后** |
+|---|---|---|
+| 启动心跳 | `pan 0xd13e` | **`pan 0xa311`**（原网络） |
+| `lqi` 设备列表 | `dev:[]` | —— |
+| add-on `/api/state` | `channel=0`、`pan=–`、`devices=0` | **`channel=20`、`pan=0xa311`、`devices=1 ['0x8e4e']`** |
+| `0x8e4e` 中继 | 掉线 | **自动回到网络，`lqi=35`** |
+| `ping -n 40` | —— | **0% 丢包**（RTT min 4 / avg 144 ms） |
+
+⇒ **不需要重新配对设备**，原网络与设备表都回来了。
+注意：`zb_fct@0x3A8000` 不在该备份内（ESPHome 也没写到那么远），无需处理。
 
 ### 15.5 仍未闭环
 
