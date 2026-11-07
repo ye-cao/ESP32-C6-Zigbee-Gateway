@@ -297,7 +297,10 @@ def _hb_loop():
             # 再挤一行只会白占带宽、还可能插进 fw_ota_data 中间。
             if _fw_ota_file is not None:
                 continue
-            ser.write(b'{"cmd":"ping"}\n')
+            # ★ 必须带 who="addon"：C6 只认带身份的心跳做通道归属。
+            #   不带的话它仍会回 pong，但不会把上报切到这条通道 ——
+            #   这样插着 USB 调试时，正走 TCP 的 add-on 不会被抢走。
+            ser.write(b'{"cmd":"ping","who":"addon"}\n')
             _hb_sent += 1
         except Exception:                  # noqa: BLE001
             pass                           # 通道断着就等下一轮，不刷屏

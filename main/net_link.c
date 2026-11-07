@@ -300,22 +300,26 @@ static void wifi_apply_cfg(void) {
     memset(&wc, 0, sizeof(wc));
     strncpy((char *)wc.sta.ssid,     s_cfg.ssid, sizeof(wc.sta.ssid) - 1);
     strncpy((char *)wc.sta.password, s_cfg.pass, sizeof(wc.sta.password) - 1);
-    /* ★★★ 认证方式必须显式打开 WPA3-SAE，不能只写 WPA2_PSK。
+    /* ★★★ 2026-11-07：门限从 WPA2_WPA3_PSK(7) 降到 WPA2_PSK(3)。
      *
-     *   原来的写法是「有密码就 WIFI_AUTH_WPA2_PSK」，对普通 WPA2 路由器没
-     *   问题，但遇上**纯 WPA3-个人（SAE）**的 AP 就永远关联不上 —— 不报错，
-     *   只是反复 STA_DISCONNECTED，net_status 里一直是 ip=0.0.0.0 / rssi=0，
-     *   看上去和"密码错了"、"信号太弱"完全一样。
-     *   2026-11-06 实测：家里的 'yecao' 就是 WPA3-个人（netsh 里显示
-     *   「身份验证: WPA3 - 个人」），改成 WPA2_WPA3_PSK 之后一次连通。
+     *   这是**扫描阶段的过滤门限**（「最弱可接受的认证等级」），驱动判据是
+     *   `AP.authmode >= threshold`，不是「连接用的认证方式」。而 authmode
+     *   枚举是递增的：
+     *       0 OPEN  1 WEP  2 WPA  3 WPA2  4 WPA/WPA2  5 WPA2_ENT  6 WPA3  7 WPA2/WPA3
+     *   所以写 7 的真实含义是「AP 必须**同时**支持 WPA2 和 WPA3」——
+     *   纯 WPA2(3) 和纯 WPA3(6) 全部在扫描阶段就被滤掉，
+     *   `wifi_join` 于是直接回 why=211（NO_AP_FOUND_IN_AUTHMODE_THRESHOLD）。
      *
-     *   WPA2_WPA3_PSK = 「WPA2 与 WPA3 都接受」，比单选 WPA3_PSK 更保险：
-     *   同一个 SSID 换个只支持 WPA2 的老路由器也还能用。
+     *   写成 3 才是「WPA2 或 WPA3 任意一种都接受」：
+     *       WPA2(3) 通过、WPA/WPA2(4) 通过、WPA3(6) 通过、WPA2/WPA3(7) 通过；
+     *       同时把 WPA(2)/WEP(1)/开放(0) 挡在候选之外。
      *
-     *   空密码 ⇒ 开放网络，这条保持原样（否则连开放 AP 会一直 AUTH_EXPIRE）。
+     *   现场依据（2026-11-07）：同一位置有多个 'yecao' AP，信号好差都有；
+     *   扫描只看到 1 个（-72 dBm, authmode 7），连上后 rssi -64，
+     *   断开重连却报 211。门限放宽后所有 WPA2/WPA3 的 AP 都会进候选，
+     *   再由 sort_method 按信号排序挑最强的那台。
      */
-    wc.sta.threshold.authmode = s_cfg.pass[0] ? WIFI_AUTH_WPA2_WPA3_PSK
-                                              : WIFI_AUTH_OPEN;
+    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     /* PMF（管理帧保护）是 WPA3 的硬性要求。capable=true / required=false
      * 表示"能谈就谈"，WPA2 的 AP 也不会因此被拒。 */
     wc.sta.pmf_cfg.capable  = true;
@@ -344,6 +348,11 @@ static void wifi_apply_cfg(void) {
     wc.sta.threshold.rssi  = -127;
     wc.sta.scan_method     = WIFI_ALL_CHANNEL_SCAN;
     wc.sta.listen_interval = 0;
+    /* ★ 2026-11-07：显式声明「按信号从强到弱挑 AP」。
+     *   同 SSID 有多个 AP（Mesh / 多路由）时这一项才是"连最好的那台"的开关。
+     *   枚举值 0 恰好就是 BY_SIGNAL，所以 memset 之后其实也是对的 —— 但那属于
+     *   "碰巧正确"，依赖枚举的实现顺序。写出来，以后谁改默认值都不会踩。 */
+    wc.sta.sort_method     = WIFI_CONNECT_AP_BY_SIGNAL;
 
     esp_err_t r = esp_wifi_set_config(WIFI_IF_STA, &wc);
     if (r != ESP_OK) ESP_LOGE(TAG, "set_config 失败：%s", esp_err_to_name(r));
@@ -854,7 +863,25 @@ esp_err_t net_link_join_json(char *out, size_t out_len) {
     /* 等 STA_START：在它之前 connect 是无效的（见 net_link_scan_early 的注释） */
     xEventGroupWaitBits(s_ev, BIT_STARTED, pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
 
-    /* 先把旧状态清掉，保证接下来等到的 BIT_IP 是这一次的 */
+    /* ★★★ 已经连着就直报现状，**绝不**断开重连。
+     *   这条命令的语义是「诊断 Wi-Fi 通不通」，不是「强制重连」。
+     *   旧实现无条件 esp_wifi_disconnect()，会把一条正常工作的连接踢断；
+     *   而重连时若附近恰好有弱 AP，驱动就可能挑到它 —— 2026-11-07 实测：
+     *   本来 rssi=-64、TCP 已 up，执行一次 wifi_join 后直接 run->init
+     *   （原因码 8 = ASSOC_LEAVE），重连失败 why=211，白掉一次线。 */
+    {
+        wifi_ap_record_t cur;
+        if (s_ip[0] && strcmp(s_ip, "0.0.0.0") != 0 &&
+            esp_wifi_sta_get_ap_info(&cur) == ESP_OK) {
+            snprintf(out, out_len,
+                     "{\"t\":\"wifi_join\",\"ok\":1,\"conn\":\"already\","
+                     "\"ip\":\"%s\",\"rssi\":%d,\"ch\":%d,\"why\":0}",
+                     s_ip, (int)cur.rssi, cur.primary);
+            return ESP_OK;
+        }
+    }
+
+    /* 没连上才走真正的连接流程 */
     xEventGroupClearBits(s_ev, BIT_IP);
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(200));

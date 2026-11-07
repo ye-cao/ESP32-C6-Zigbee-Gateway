@@ -88,6 +88,41 @@
 - ⚠ **启用后 bootloader 行为也变**：必须把 `bootloader.bin` 一起刷到 `0x0`。
   只做 App 级 OTA 不会更新 bootloader，回滚逻辑不会生效。
 
+### 修复 – Wi‑Fi 认证门限把同 SSID 的多个 AP 全滤掉了（真机定位）
+
+- `threshold.authmode` 写的是 `WIFI_AUTH_WPA2_WPA3_PSK(7)`。这一项是**扫描阶段的
+  过滤门限**（语义是「最弱可接受」，判据 `AP.authmode >= threshold`），不是连接
+  用的认证方式。而 authmode 枚举是递增的：
+  `0 OPEN / 1 WEP / 2 WPA / 3 WPA2 / 4 WPA_WPA2 / 5 WPA2_ENT / 6 WPA3 / 7 WPA2_WPA3`。
+  所以写 7 的真实含义是「AP 必须**同时**支持 WPA2 和 WPA3」——
+  纯 WPA2(3) 和纯 WPA3(6) 全部在扫描阶段就被滤掉。
+- **现场症状**：同一位置有多个同名 `yecao` AP（信号好差都有），C6 只看到 1 个
+  （-72 dBm / ch6 / authmode 7），`wifi_join` 直接回
+  `why=211`（`NO_AP_FOUND_IN_AUTHMODE_THRESHOLD`）—— 看起来和「信号弱」「密码错」
+  完全一样，极难定位。
+- 改成 `WIFI_AUTH_WPA2_PSK(3)`：WPA2、WPA/WPA2、WPA3、WPA2/WPA3 都能进候选，
+  同时把 WPA/WEP/开放挡在外面。配合显式写出
+  `sort_method = WIFI_CONNECT_AP_BY_SIGNAL`（原本靠枚举值 0 碰巧正确，
+  依赖实现顺序）。
+- **实测（同一块板、同一位置）**：刷入后 `rssi` 从 -64~-66 变成 **-59**，
+  `ap_ch` 从 6 变成 **1**（自动换到了更强的那台 AP），`why=0` 一次连上，
+  不再出现 211。
+- 顺带修 `wifi_join`：它原本无条件 `esp_wifi_disconnect()`，会把一条正常工作的
+  连接踢断 —— 实测 rssi=-64、TCP 已 up 时执行一次，立刻 `run -> init`、
+  原因码 8（ASSOC_LEAVE），重连还撞上 211，白掉一次线。现在已连接时直接回
+  `{"conn":"already"}`，不再碰连接。
+
+### 变更 – 心跳增加身份标识（避免调试时抢走通道）
+
+- 心跳从 `{"cmd":"ping"}` 改为 `{"cmd":"ping","who":"addon"}`。
+  原因：通道跟随原先只按「最近哪条通道收到过命令」判断，任何人在任何通道说一句话
+  都会改写通道选择 —— 板子插在电脑上、调试脚本随手发一条命令，正走 TCP 的 add-on
+  就被"抢"到串口去了。
+- C6 侧改为两级判据：先看 `s_addon_link`（只有带 `who:"addon"` 的心跳才更新），
+  没有它才退回 `s_rx_link`。pong 里回 `who` 字段说明这次被认成什么。
+- 实测：带 who 的回 `{"t":"pong","link":"uart","who":"addon"}`；
+  不带 who 的回 `who:"other"`，且**不影响**通道归属。
+
 ### 变更 – 构建（**IDF 5.5.1 → 5.5.2，根因的最后一块**）
 
 - `esp_coex_wifi_i154_enable()` 在 IDF **5.5.1 里是半成品**：实现只有

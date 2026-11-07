@@ -63,6 +63,16 @@ static volatile uint32_t s_tx_drop   = 0;
 static volatile uint8_t s_rx_link    = 0xFF;   /* 0xFF = 还不知道 */
 static volatile int64_t s_rx_link_us = 0;
 
+/* ★★★ 「谁在说话」和「add-on 在哪条通道」是两件事，必须分开记。
+ *
+ *   只按 s_rx_link 判断的话，任何人在任何通道上说一句话都会改写通道选择 ——
+ *   最典型的坏情况：板子插在电脑上，调试脚本/串口终端随手发一条命令，正走
+ *   TCP 的 add-on 就被"抢"到串口去了，上报于是全打进一个没人要的串口。
+ *   所以再加一层：只有**带身份的心跳**（{"cmd":"ping","who":"addon"}）
+ *   才代表 add-on 的归属，它是第一判据；没有它时才退回 s_rx_link。 */
+static volatile uint8_t s_addon_link = 0xFF;   /* add-on 最近一次心跳来自哪条 */
+static volatile int64_t s_addon_us   = 0;
+
 static int null_vprintf(const char *fmt, va_list args) {
     (void)fmt; (void)args;
     return 0;
@@ -95,8 +105,18 @@ void ha_mqtt_note_link(uint8_t link) {
 /* 当前该往哪条通道发：返回 NET_LINK_UART / NET_LINK_TCP；0xFF 表示
  * 「不确定，两条都发」。 */
 static uint8_t active_link(void) {
+    /* ① 第一判据：add-on 自己的心跳。它才是「谁在收上报」的权威答案，
+     *    调试脚本、串口终端发的命令一律不能覆盖它。 */
+    uint8_t al = s_addon_link;
+    if (al <= NET_LINK_TCP &&
+        esp_timer_get_time() - s_addon_us <= LINK_FOLLOW_US) {
+        return al;
+    }
+
+    /* ② 没有 add-on 心跳（老版本 add-on / 刚上电还没发）⇒ 退一步：
+     *    哪条通道最近有输入就认为它在哪。这保证纯脚本调试时也能正常收数据。 */
     uint8_t l = s_rx_link;
-    if (l > NET_LINK_TCP) return 0xFF;                    /* 还没收到过任何命令 */
+    if (l > NET_LINK_TCP) return 0xFF;                     /* 还没收到过任何命令 */
     if (esp_timer_get_time() - s_rx_link_us > LINK_FOLLOW_US) {
         return 0xFF;                                       /* 两条都静了：双发保底 */
     }
@@ -280,10 +300,22 @@ void ha_mqtt_handle_line(char *buf) {
      *   裸关键字太容易误伤（比如以后加个 "pingpong" 之类的字段）。
      * 回 {"t":"pong","link":…} 让 add-on 能确认跟随是否生效。 */
     if (strstr(buf, "\"ping\"")) {
-        char out[96];
+        /* ★★ 只有带身份的心跳才登记「add-on 挂在哪条通道」。
+         *    add-on 发 {"cmd":"ping","who":"addon"}；
+         *    诊断脚本 / 串口终端发不带 who 的 ping，照样回 pong，但**不改写
+         *    归属** —— 否则插上 USB 调试一下，正走 TCP 的 add-on 就被抢到
+         *    串口去了，上报全打进一个没人要的口。
+         *    pong 里的 who 字段把这次判定也回给对方，便于确认谁被认作 add-on。 */
+        bool is_addon = (strstr(buf, "\"addon\"") != NULL);
+        if (is_addon) {
+            s_addon_link = s_rx_link;
+            s_addon_us   = esp_timer_get_time();
+        }
+        char out[128];
         snprintf(out, sizeof(out),
-                 "{\"t\":\"pong\",\"link\":\"%s\",\"up\":%lu}",
+                 "{\"t\":\"pong\",\"link\":\"%s\",\"who\":\"%s\",\"up\":%lu}",
                  (s_rx_link == NET_LINK_TCP) ? "tcp" : "uart",
+                 is_addon ? "addon" : "other",
                  (unsigned long)(esp_timer_get_time() / 1000000));
         ha_mqtt_emit_raw(out);
         return;
